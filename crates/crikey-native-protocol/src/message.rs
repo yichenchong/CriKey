@@ -410,7 +410,7 @@ fn finish(mut out: Vec<u8>, unknown: &UnknownFields) -> Vec<u8> {
 // `Default` is the proto3 zero envelope, matching what every message in this
 // module gets from `impl_simple!`: a producer setting one field should not
 // have to spell out the zeros of the rest.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Envelope {
     pub connection_id: u64,
     pub request_id: u64,
@@ -420,7 +420,7 @@ pub struct Envelope {
     pub unknown: UnknownFields,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Payload {
     Handshake(Handshake),
     HandshakeAck(HandshakeAck),
@@ -449,6 +449,8 @@ pub enum Payload {
     PreviewResponse(PreviewResponse),
     CommandsRequest(CommandsRequest),
     CommandsResponse(CommandsResponse),
+    TypedExecuteRequest(TypedExecuteRequest),
+    TypedExecuteResponse(TypedExecuteResponse),
     // Host-to-host web surface traffic. Never sent to or by a plugin.
     OpenSurface(OpenSurface),
     RawInput(RawInput),
@@ -492,6 +494,8 @@ impl Payload {
             Self::PreviewResponse(_) => "preview_response",
             Self::CommandsRequest(_) => "commands_request",
             Self::CommandsResponse(_) => "commands_response",
+            Self::TypedExecuteRequest(_) => "typed_execute_request",
+            Self::TypedExecuteResponse(_) => "typed_execute_response",
             Self::OpenSurface(_) => "open_surface",
             Self::RawInput(_) => "raw_input",
             Self::ImeEvent(_) => "ime_event",
@@ -506,9 +510,27 @@ impl Payload {
     }
 }
 
+impl Envelope {
+    /// Decode diagnostics under the physical incarnation's monotonic latch.
+    pub fn decode_with_diagnostics(
+        bytes: &[u8],
+        sensitive: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, ProtocolError> {
+        ensure_message_size(bytes)?;
+        Self::decode_with_budget(bytes, &mut DecodeBudget::with_diagnostics(sensitive))
+    }
+}
+
 impl Message for Envelope {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let capacity = match &self.payload {
+            Some(Payload::TypedExecuteRequest(request)) => request
+                .encoded_len()
+                .saturating_add(64)
+                .saturating_add(self.unknown.as_bytes().len()),
+            _ => 0,
+        };
+        let mut out = Vec::with_capacity(capacity);
         if self.connection_id != 0 {
             put_varint(1, self.connection_id, &mut out);
         }
@@ -560,6 +582,12 @@ impl Message for Envelope {
                 Payload::PreviewResponse(value) => put_message(44, value, &mut out),
                 Payload::CommandsRequest(value) => put_message(45, value, &mut out),
                 Payload::CommandsResponse(value) => put_message(46, value, &mut out),
+                Payload::TypedExecuteRequest(value) => {
+                    crate::wire::encode_key(47, WireType::Length, &mut out);
+                    crate::wire::encode_varint(value.encoded_len() as u64, &mut out);
+                    value.encode_into(&mut out);
+                }
+                Payload::TypedExecuteResponse(value) => put_message(48, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -646,6 +674,8 @@ impl DecodeWithBudget for Envelope {
                 44 => merge_web_payload!(&mut value.payload, PreviewResponse, field, budget),
                 45 => merge_web_payload!(&mut value.payload, CommandsRequest, field, budget),
                 46 => merge_web_payload!(&mut value.payload, CommandsResponse, field, budget),
+                47 => merge_web_payload!(&mut value.payload, TypedExecuteRequest, field, budget),
+                48 => merge_web_payload!(&mut value.payload, TypedExecuteResponse, field, budget),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 // PageFrame carries the plugin's web declaration, so merge
                 // both its envelope occurrences and its nested `web` fields.
@@ -741,7 +771,13 @@ macro_rules! impl_simple_impl {
                             }
                             $body
                         },)*
-                        _ => unknown(bytes, start, $field.end, &mut $value.unknown, $budget)?,
+                        _ => {
+                            if $budget.suppress_diagnostics() && matches!(stringify!($type), "LogRecord" | "StructuredError" | "PreviewResponse" | "CommandsResponse" | "HealthReport") {
+                                $budget.charge_discarded($field.raw.len())?;
+                            } else {
+                                unknown(bytes, start, $field.end, &mut $value.unknown, $budget)?;
+                            }
+                        },
                     }
                 }
                 Ok(())
@@ -749,6 +785,8 @@ macro_rules! impl_simple_impl {
         }
     };
 }
+
+include!("typed_wire.rs");
 
 impl_simple!(Handshake {
     protocol_version: u32 = 0,
@@ -820,6 +858,25 @@ fn preview_bytes(field: crate::wire::Field<'_>, budget: &mut DecodeBudget) -> Re
     decode_bytes(field, budget)
 }
 
+fn diagnostic_string(
+    field: crate::wire::Field<'_>,
+    budget: &mut DecodeBudget,
+    max: usize,
+) -> Result<String, ProtocolError> {
+    expect_wire(field, WireType::Length)?;
+    if field.value.len() > max {
+        return Err(ProtocolError::Malformed("diagnostic exceeds bounds".into()));
+    }
+    if budget.suppress_diagnostics() {
+        budget.charge_discarded(field.value.len())?;
+        std::str::from_utf8(field.value)
+            .map_err(|_| ProtocolError::Malformed("diagnostic is not UTF-8".into()))?;
+        Ok(String::new())
+    } else {
+        decode_string(field, budget)
+    }
+}
+
 impl_simple!(PreviewRequest {
     item_id: String = String::new()
 } repeated [] encode(this, out) {
@@ -866,7 +923,7 @@ impl_simple!(CommandsResponse {
         }
         push_decoded(&mut value.commands, nested(field, budget)?, budget)?;
     },
-    3 => value.detail = preview_string(field, budget, 8192)?,
+    3 => value.detail = diagnostic_string(field, budget, 8192)?,
 });
 
 impl_simple!(PreviewValue {
@@ -916,7 +973,7 @@ impl_simple!(PreviewResponse {
         }
         push_decoded(&mut value.values, nested(field, budget)?, budget)?;
     },
-    8 => value.detail = preview_string(field, budget, crikey_core::preview::MAX_PREVIEW_VALUE_BYTES)?,
+    8 => value.detail = diagnostic_string(field, budget, crikey_core::preview::MAX_PREVIEW_VALUE_BYTES)?,
     10 => value.encoded_png = preview_bytes(field, budget)?,
 });
 
@@ -954,17 +1011,20 @@ impl_simple!(CatalogBatch {
     items: Vec<Item> = Vec::new(),
     done: bool = false,
     sequence: u64 = 0,
-    error: Option<StructuredError> = None
+    error: Option<StructuredError> = None,
+    presentation: Option<ResultPresentation> = None
 } repeated [1] encode(this, out) {
     for item in &this.items { put_message(1, item, &mut out); }
     if this.done { put_varint(2, 1, &mut out); }
     if this.sequence != 0 { put_varint(3, this.sequence, &mut out); }
     if let Some(error) = &this.error { put_message(4, error, &mut out); }
+    if let Some(presentation) = &this.presentation { put_message(5, presentation, &mut out); }
 } decode(value, field, budget) {
     1 => push_decoded(&mut value.items, nested(field, budget)?, budget)?,
     2 => value.done = decode_field_varint(field)? != 0,
     3 => value.sequence = decode_field_varint(field)?,
     4 => value.error = Some(nested(field, budget)?),
+    5 => merge_optional(&mut value.presentation, field, budget)?,
 });
 
 // --- producer-side sizing -------------------------------------------------
@@ -1093,19 +1153,22 @@ impl_simple!(SuggestRequest {
     normalized_text: String = String::new(),
     selected_item_id: String = String::new(),
     max_items: u64 = 0,
-    max_batches: u64 = 0
+    max_batches: u64 = 0,
+    selected_scope_id: Option<String> = None
 } repeated [] encode(this, out) {
     if !this.text.is_empty() { put_string(1, &this.text, &mut out); }
     if !this.normalized_text.is_empty() { put_string(2, &this.normalized_text, &mut out); }
     if !this.selected_item_id.is_empty() { put_string(3, &this.selected_item_id, &mut out); }
     if this.max_items != 0 { put_varint(4, this.max_items, &mut out); }
     if this.max_batches != 0 { put_varint(5, this.max_batches, &mut out); }
+    if let Some(scope) = &this.selected_scope_id { put_string(6, scope, &mut out); }
 } decode(value, field, budget) {
     1 => value.text = decode_string(field, budget)?,
     2 => value.normalized_text = decode_string(field, budget)?,
     3 => value.selected_item_id = decode_string(field, budget)?,
     4 => value.max_items = decode_field_varint(field)?,
     5 => value.max_batches = decode_field_varint(field)?,
+    6 => value.selected_scope_id = Some(preview_string(field, budget, 256)?),
 });
 
 impl_simple!(Action {
@@ -1189,17 +1252,20 @@ impl_simple!(ResultBatch {
     state: BatchState = BatchState::StateUnspecified,
     items: Vec<Item> = Vec::new(),
     sequence: u64 = 0,
-    error: Option<StructuredError> = None
+    error: Option<StructuredError> = None,
+    presentation: Option<ResultPresentation> = None
 } repeated [2] encode(this, out) {
     if this.state.as_i32() != 0 { encode_enum(1, this.state.as_i32(), &mut out); }
     for item in &this.items { put_message(2, item, &mut out); }
     if this.sequence != 0 { put_varint(3, this.sequence, &mut out); }
     if let Some(error) = &this.error { put_message(4, error, &mut out); }
+    if let Some(presentation) = &this.presentation { put_message(5, presentation, &mut out); }
 } decode(value, field, budget) {
     1 => value.state = BatchState::from_i32(decode_i32(field)?),
     2 => push_decoded(&mut value.items, nested(field, budget)?, budget)?,
     3 => value.sequence = decode_field_varint(field)?,
     4 => value.error = Some(nested(field, budget)?),
+    5 => merge_optional(&mut value.presentation, field, budget)?,
 });
 
 impl_simple!(Cancel {
@@ -1778,7 +1844,7 @@ impl_simple!(LogRecord {
     if this.timestamp_ms != 0 { put_varint(3, this.timestamp_ms, &mut out); }
 } decode(value, field, budget) {
     1 => value.level = LogLevel::from_i32(decode_i32(field)?),
-    2 => value.message = decode_string(field, budget)?,
+    2 => value.message = diagnostic_string(field, budget, MAX_FRAME_BYTES)?,
     3 => value.timestamp_ms = decode_field_varint(field)?,
 });
 
@@ -1810,7 +1876,7 @@ impl_simple!(HealthReport {
     3 => value.memory_bytes = decode_field_varint(field)?,
     4 => value.queue_depth = decode_u32(field)?,
     5 => value.in_flight = decode_u32(field)?,
-    6 => value.detail = decode_string(field, budget)?,
+    6 => value.detail = diagnostic_string(field, budget, MAX_FRAME_BYTES)?,
 });
 
 impl_simple!(StructuredError {
@@ -1825,8 +1891,8 @@ impl_simple!(StructuredError {
     if this.request_id != 0 { put_varint(4, this.request_id, &mut out); }
 } decode(value, field, budget) {
     1 => value.code = ErrorCode::from_i32(decode_i32(field)?),
-    2 => value.message = decode_string(field, budget)?,
-    3 => value.detail = decode_string(field, budget)?,
+    2 => value.message = diagnostic_string(field, budget, MAX_FRAME_BYTES)?,
+    3 => value.detail = diagnostic_string(field, budget, MAX_FRAME_BYTES)?,
     4 => value.request_id = decode_field_varint(field)?,
 });
 

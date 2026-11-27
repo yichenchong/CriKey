@@ -17,7 +17,7 @@ use std::env;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,169 @@ use crate::{
     CancellationToken, CatalogSink, ExecuteOutcome, ExecuteRequest, LogLevel, PagePalette, PageRequest,
     Plugin, PluginContext, PluginEvent, PluginResource, Query, ResourceKind, SdkError, SuggestionSink,
 };
+use crikey_core::result_presentation::ResultPresentation;
+use crikey_core::structured_arguments::{ArgumentSchema, SubmissionFailureCode, SubmissionOutcome};
+
+static SENSITIVE: AtomicBool = AtomicBool::new(false);
+static DIAGNOSTICS: Mutex<()> = Mutex::new(());
+static PANIC_HOOK: Once = Once::new();
+
+fn install_panic_policy() {
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+            if !SENSITIVE.load(Ordering::Acquire) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn mark_sensitive() {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    SENSITIVE.store(true, Ordering::Release);
+}
+
+fn diagnostic_detail(detail: &impl fmt::Display) -> String {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    if SENSITIVE.load(Ordering::Acquire) {
+        "plugin callback failed".into()
+    } else {
+        detail.to_string()
+    }
+}
+
+fn diagnostic_context(prefix: &str, detail: &impl fmt::Display) -> String {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    if SENSITIVE.load(Ordering::Acquire) {
+        "plugin callback failed".into()
+    } else {
+        format!("{prefix}: {detail}")
+    }
+}
+
+#[derive(Debug, Default)]
+struct SchemaRegistry {
+    catalog: ResultPresentation,
+    suggestions: ResultPresentation,
+    catalog_primary: std::collections::BTreeMap<ItemId, ActionId>,
+    suggestion_primary: std::collections::BTreeMap<ItemId, ActionId>,
+}
+
+struct Publication {
+    metadata: ResultPresentation,
+    owner: PluginId,
+    items: std::collections::BTreeSet<crikey_core::structured_arguments::OwnedItem>,
+    executables: std::collections::BTreeSet<crikey_core::structured_arguments::ExecutableKey>,
+    primary: std::collections::BTreeMap<ItemId, ActionId>,
+}
+
+impl Default for Publication {
+    fn default() -> Self {
+        Self {
+            metadata: ResultPresentation::default(),
+            owner: PluginId(String::new()),
+            items: Default::default(),
+            executables: Default::default(),
+            primary: Default::default(),
+        }
+    }
+}
+
+impl Publication {
+    fn record(&mut self, items: &[Item]) {
+        use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+        for item in items {
+            if !self
+                .metadata
+                .items
+                .iter()
+                .any(|p| p.target.item == item.stable_id)
+                && !self
+                    .metadata
+                    .schemas
+                    .iter()
+                    .any(|b| b.executable.target.item == item.stable_id)
+            {
+                continue;
+            }
+            let target = OwnedItem {
+                owner: self.owner.clone(),
+                item: item.stable_id.clone(),
+            };
+            self.items.insert(target.clone());
+            if let Some(action) = item.actions.first() {
+                self.primary
+                    .insert(item.stable_id.clone(), action.action_id.clone());
+            }
+            if item.actions.is_empty() {
+                self.executables.insert(ExecutableKey { target, action: None });
+            } else {
+                for action in &item.actions {
+                    self.executables.insert(ExecutableKey {
+                        target: target.clone(),
+                        action: Some(action.action_id.clone()),
+                    });
+                }
+            }
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        self.metadata
+            .validate(&self.owner, &self.items, &self.executables)
+            .map_err(|_| CoreError::Invalid("invalid presentation binding".into()))
+    }
+}
+
+fn filtered_presentation(
+    presentation: &ResultPresentation,
+    typed: bool,
+    visual: bool,
+) -> Result<Option<message::ResultPresentation>, SdkError> {
+    use crikey_core::result_presentation::{MAX_PRESENTATION_ITEMS, MAX_SCOPES, MAX_SECTIONS};
+    if presentation.schemas.len() > MAX_PRESENTATION_ITEMS
+        || presentation.items.len() > MAX_PRESENTATION_ITEMS
+        || presentation.sections.len() > MAX_SECTIONS
+        || presentation.scopes.len() > MAX_SCOPES
+    {
+        return Err(SdkError::Protocol("presentation exceeds limits".into()));
+    }
+    for binding in &presentation.schemas {
+        binding
+            .schema
+            .validate()
+            .map_err(|_| SdkError::Protocol("invalid argument schema".into()))?;
+    }
+    if !typed && !visual {
+        return Ok(None);
+    }
+    let wire_presentation = ResultPresentation {
+        sections: if visual {
+            presentation.sections.clone()
+        } else {
+            Vec::new()
+        },
+        scopes: if visual {
+            presentation.scopes.clone()
+        } else {
+            Vec::new()
+        },
+        items: if visual {
+            presentation.items.clone()
+        } else {
+            Vec::new()
+        },
+        schemas: if typed {
+            presentation.schemas.clone()
+        } else {
+            Vec::new()
+        },
+    };
+    crikey_native_protocol::typed::to_presentation(wire_presentation)
+        .map(Some)
+        .map_err(SdkError::from)
+}
 
 /// Maximum number of decoded control frames retained while a plugin callback
 /// is busy.  A full queue deliberately blocks the reader, which pauses IPC
@@ -47,7 +210,20 @@ const MAX_LOG_BYTES_PER_REQUEST: usize = 64 * 1024;
 const MAX_LOG_MESSAGE_BYTES: usize = 8 * 1024;
 
 fn invoke_callback<T>(callback: impl FnOnce() -> Result<T>) -> std::result::Result<Result<T>, String> {
-    catch_unwind(AssertUnwindSafe(callback)).map_err(|panic| {
+    catch_unwind(AssertUnwindSafe(|| {
+        callback().map_err(|error| {
+            if SENSITIVE.load(Ordering::Acquire) {
+                CoreError::Invalid("plugin callback failed".into())
+            } else {
+                error
+            }
+        })
+    }))
+    .map_err(|panic| {
+        let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+        if SENSITIVE.load(Ordering::Acquire) {
+            return "plugin callback failed".to_owned();
+        }
         let detail = if let Some(message) = panic.downcast_ref::<&str>() {
             (*message).to_owned()
         } else if let Some(message) = panic.downcast_ref::<String>() {
@@ -189,6 +365,7 @@ pub fn serve_on(
     transport: Box<dyn Transport>,
     config: ServeConfig,
 ) -> Result<(), SdkError> {
+    install_panic_policy();
     let session_token = match config.session_token.clone() {
         Some(token) => token,
         None => env::var(crikey_native_protocol::ENV_SESSION_TOKEN).map_err(|_| {
@@ -205,6 +382,8 @@ pub fn serve_on(
         &session_token,
         plugin.supports_preview(),
         plugin.supports_commands(),
+        plugin.supports_typed_arguments(),
+        plugin.supports_result_presentation(),
     )?;
     let reader_transport = transport.try_clone_handle().ok();
     let transport = Arc::new(Mutex::new(transport));
@@ -234,11 +413,17 @@ pub fn serve_on(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             stop_reader(&reader_stop, reader);
-            return Err(SdkError::Protocol(format!("plugin start failed: {error}")));
+            return Err(SdkError::Protocol(diagnostic_context(
+                "plugin start failed",
+                &error,
+            )));
         }
         Err(detail) => {
             stop_reader(&reader_stop, reader);
-            return Err(SdkError::Protocol(format!("plugin start failed: {detail}")));
+            return Err(SdkError::Protocol(diagnostic_context(
+                "plugin start failed",
+                &detail,
+            )));
         }
     }
     if let Some(error) = context.take_log_error() {
@@ -255,6 +440,13 @@ pub fn serve_on(
             .host_capabilities
             .iter()
             .any(|name| name == crikey_core::command::COMMANDS_CAPABILITY);
+    let typed_negotiated =
+        plugin.supports_typed_arguments() && ack.host_capabilities.iter().any(|s| s == "typed_arguments_v1");
+    let presentation_negotiated = plugin.supports_result_presentation()
+        && ack
+            .host_capabilities
+            .iter()
+            .any(|s| s == "result_presentation_v1");
     let mut runtime = RequestRuntime {
         transport: &transport,
         input: &mut input,
@@ -262,6 +454,8 @@ pub fn serve_on(
         credits: &mut credits,
         context: &context,
         metrics: &metrics,
+        typed_negotiated,
+        presentation_negotiated,
     };
     let result = serve_requests(
         plugin,
@@ -279,6 +473,8 @@ fn handshake(
     session_token: &str,
     preview: bool,
     commands: bool,
+    typed: bool,
+    presentation: bool,
 ) -> Result<(message::HandshakeAck, u64), SdkError> {
     let handshake = message::Handshake {
         protocol_version: PROTOCOL_VERSION,
@@ -291,6 +487,12 @@ fn handshake(
             }
             if commands {
                 names.push(crikey_core::command::COMMANDS_CAPABILITY.to_owned());
+            }
+            if typed {
+                names.push("typed_arguments_v1".to_owned());
+            }
+            if presentation {
+                names.push("result_presentation_v1".to_owned());
             }
             names
         },
@@ -511,6 +713,9 @@ fn spawn_reader(
             };
             match received {
                 Ok(envelope) => {
+                    if matches!(&envelope.payload, Some(Payload::TypedExecuteRequest(_))) {
+                        mark_sensitive();
+                    }
                     if let Some(Payload::Cancel(_)) = envelope.payload {
                         cancellation.cancel((envelope.request_id, envelope.generation));
                     }
@@ -736,6 +941,7 @@ struct RuntimeContext {
     request_id: u64,
     generation: u64,
     log_state: Arc<Mutex<LogState>>,
+    schemas: Arc<Mutex<SchemaRegistry>>,
 }
 
 impl RuntimeContext {
@@ -755,6 +961,7 @@ impl RuntimeContext {
             request_id,
             generation,
             log_state: Arc::new(Mutex::new(LogState::default())),
+            schemas: Arc::new(Mutex::new(SchemaRegistry::default())),
         }
     }
 
@@ -767,6 +974,7 @@ impl RuntimeContext {
             request_id,
             generation,
             log_state: Arc::new(Mutex::new(LogState::default())),
+            schemas: Arc::clone(&self.schemas),
         }
     }
 
@@ -817,6 +1025,10 @@ impl PluginContext for RuntimeContext {
     }
 
     fn log(&self, level: LogLevel, message: &str) {
+        let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+        if SENSITIVE.load(Ordering::Acquire) {
+            return;
+        }
         let message = bounded_log_message(message);
         let Ok(mut state) = self.log_state.lock() else {
             return;
@@ -869,6 +1081,8 @@ fn serve_requests(
     let credits = &mut *runtime.credits;
     let context = runtime.context;
     let metrics = runtime.metrics;
+    let typed_negotiated = runtime.typed_negotiated;
+    let presentation_negotiated = runtime.presentation_negotiated;
     loop {
         let envelope = match input.next() {
             Ok(envelope) => envelope,
@@ -920,7 +1134,7 @@ fn serve_requests(
                 };
                 let result = match callback {
                     Ok(Ok(outcome)) => crikey_native_protocol::commands::to_response(outcome),
-                    Ok(Err(error)) => Err(error.to_string()),
+                    Ok(Err(error)) => Err(diagnostic_detail(&error)),
                     Err(detail) => Err(detail),
                 };
                 let mut response = result.unwrap_or_else(|detail| commands_failure(&detail));
@@ -967,9 +1181,9 @@ fn serve_requests(
                 let mut response = match callback {
                     Ok(Ok(outcome)) => match crikey_native_protocol::preview::to_response(outcome) {
                         Ok(response) => response,
-                        Err(error) => preview_failure(&error.to_string()),
+                        Err(error) => preview_failure(&diagnostic_detail(&error)),
                     },
-                    Ok(Err(error)) => preview_failure(&error.to_string()),
+                    Ok(Err(error)) => preview_failure(&diagnostic_detail(&error)),
                     Err(detail) => preview_failure(&detail),
                 };
                 if request_context.cancellation().is_cancelled() {
@@ -1004,6 +1218,8 @@ fn serve_requests(
                     credits,
                     context: &request_context,
                     metrics,
+                    typed_negotiated,
+                    presentation_negotiated,
                 };
                 handle_suggest(plugin, request, request_id, generation, deadline_ms, &mut runtime)?;
                 if let Some(error) = request_context.take_log_error() {
@@ -1018,11 +1234,21 @@ fn serve_requests(
                     credits,
                     context: &request_context,
                     metrics,
+                    typed_negotiated,
+                    presentation_negotiated,
                 };
                 handle_catalog(plugin, request_id, generation, request, &mut runtime)?;
                 if let Some(error) = request_context.take_log_error() {
                     return Err(error);
                 }
+            }
+            Payload::TypedExecuteRequest(request) => {
+                cancellation.begin(CancellationKey {
+                    request_id,
+                    generation,
+                });
+                handle_typed_execute(plugin, request, &request_context, metrics, typed_negotiated)?;
+                cancellation.end();
             }
             Payload::Execute(request) => {
                 handle_execute(
@@ -1062,7 +1288,7 @@ fn serve_requests(
                 }
                 let callback_error = match callback_result {
                     Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
+                    Ok(Err(error)) => Some(diagnostic_detail(&error)),
                     Err(detail) => Some(detail),
                 };
                 if let Some(error) = callback_error {
@@ -1071,7 +1297,7 @@ fn serve_requests(
                         request_context.connection_id,
                         request_id,
                         generation,
-                        &format!("configuration callback failed: {error}"),
+                        &diagnostic_context("configuration callback failed", &error),
                     )?;
                 }
             }
@@ -1090,7 +1316,7 @@ fn serve_requests(
                 }
                 let callback_error = match callback_result {
                     Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
+                    Ok(Err(error)) => Some(diagnostic_detail(&error)),
                     Err(detail) => Some(detail),
                 };
                 if let Some(error) = callback_error {
@@ -1099,7 +1325,7 @@ fn serve_requests(
                         request_context.connection_id,
                         request_id,
                         generation,
-                        &format!("event callback failed: {error}"),
+                        &diagnostic_context("event callback failed", &error),
                     )?;
                 }
             }
@@ -1116,7 +1342,10 @@ fn serve_requests(
                 };
                 let (ok, error) = match callback {
                     Ok(Ok(())) => (true, None),
-                    Ok(Err(error)) => (false, Some(structured_error(&error.to_string(), request_id))),
+                    Ok(Err(error)) => (
+                        false,
+                        Some(structured_error(&diagnostic_detail(&error), request_id)),
+                    ),
                     Err(detail) => (false, Some(structured_error(&detail, request_id))),
                 };
                 if let Some(log_error) = request_context.take_log_error() {
@@ -1180,7 +1409,10 @@ fn serve_requests(
                 // not already assume.
                 let (resource, error) = match callback_result {
                     Ok(Ok(resource)) => (resource, None),
-                    Ok(Err(error)) => (None, Some(structured_error(&error.to_string(), request_id))),
+                    Ok(Err(error)) => (
+                        None,
+                        Some(structured_error(&diagnostic_detail(&error), request_id)),
+                    ),
                     Err(detail) => (None, Some(structured_error(&detail, request_id))),
                 };
                 let (found, content, media_type) = match resource {
@@ -1230,9 +1462,17 @@ struct RequestRuntime<'a> {
     credits: &'a mut CreditState,
     context: &'a RuntimeContext,
     metrics: &'a RuntimeMetrics,
+    typed_negotiated: bool,
+    presentation_negotiated: bool,
 }
 
 fn commands_failure(detail: &str) -> message::CommandsResponse {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    let detail = if SENSITIVE.load(Ordering::Acquire) {
+        "plugin callback failed"
+    } else {
+        detail
+    };
     let mut end = detail.len().min(8192);
     while !detail.is_char_boundary(end) {
         end -= 1;
@@ -1245,6 +1485,12 @@ fn commands_failure(detail: &str) -> message::CommandsResponse {
 }
 
 fn preview_failure(detail: &str) -> message::PreviewResponse {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    let detail = if SENSITIVE.load(Ordering::Acquire) {
+        "plugin callback failed"
+    } else {
+        detail
+    };
     let mut end = detail.len().min(crikey_core::preview::MAX_PREVIEW_VALUE_BYTES);
     while !detail.is_char_boundary(end) {
         end -= 1;
@@ -1286,7 +1532,20 @@ fn handle_suggest(
         } else {
             Some(request.selected_item_id)
         },
+        selected_scope_id: if runtime.presentation_negotiated {
+            request.selected_scope_id
+        } else {
+            None
+        },
     };
+    {
+        let mut registry = context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
+        registry.suggestions = ResultPresentation::default();
+        registry.suggestion_primary.clear();
+    }
     let mut sink = SuggestionSinkImpl::new(
         context.connection_id,
         request_id,
@@ -1298,7 +1557,22 @@ fn handle_suggest(
     );
     let callback_result = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.suggest(query, context, &mut sink))
+        invoke_callback(|| {
+            let presentation = plugin.suggestion_presentation(&query, context)?;
+            let wire = filtered_presentation(
+                &presentation,
+                runtime.typed_negotiated,
+                runtime.presentation_negotiated,
+            )
+            .map_err(|_| CoreError::Invalid("invalid presentation".into()))?;
+            sink.publication = Publication {
+                metadata: presentation,
+                owner: context.plugin_id.clone(),
+                ..Default::default()
+            };
+            sink.presentation = wire;
+            plugin.suggest(query, context, &mut sink)
+        })
     };
     if sink.shutdown_received() {
         cancellation.end();
@@ -1308,9 +1582,10 @@ fn handle_suggest(
     let observed = cancellation.was_observed();
     let callback_error = match callback_result {
         Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
+        Ok(Err(error)) => Some(diagnostic_detail(&error)),
         Err(detail) => Some(detail),
     };
+    let succeeded = callback_error.is_none() && !observed && !cancelled_error;
     let result = if let Some(error) = sink.take_transport_error() {
         Err(error)
     } else if sink.terminal_sent() {
@@ -1330,6 +1605,18 @@ fn handle_suggest(
             SdkError::Protocol(format!("suggestion could not finish: {finish_error}"))
         })
     };
+    if result.is_ok() && succeeded && sink.publication.validate().is_ok() {
+        context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?
+            .suggestions = std::mem::take(&mut sink.publication.metadata);
+        context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?
+            .suggestion_primary = std::mem::take(&mut sink.publication.primary);
+    }
     let shutdown = sink.shutdown_received();
     cancellation.end();
     if shutdown {
@@ -1356,6 +1643,14 @@ fn handle_catalog(
         generation,
     };
     cancellation.begin(key);
+    {
+        let mut registry = context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
+        registry.catalog = ResultPresentation::default();
+        registry.catalog_primary.clear();
+    }
     let mut sink = CatalogSinkImpl::new(
         context.connection_id,
         request_id,
@@ -1367,7 +1662,22 @@ fn handle_catalog(
     );
     let callback_result = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.build_catalog(context, &mut sink))
+        invoke_callback(|| {
+            let presentation = plugin.catalog_presentation(context)?;
+            let wire = filtered_presentation(
+                &presentation,
+                runtime.typed_negotiated,
+                runtime.presentation_negotiated,
+            )
+            .map_err(|_| CoreError::Invalid("invalid presentation".into()))?;
+            sink.publication = Publication {
+                metadata: presentation,
+                owner: context.plugin_id.clone(),
+                ..Default::default()
+            };
+            sink.presentation = wire;
+            plugin.build_catalog(context, &mut sink)
+        })
     };
     if sink.shutdown_received() {
         cancellation.end();
@@ -1375,9 +1685,10 @@ fn handle_catalog(
     }
     let callback_error = match callback_result {
         Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
+        Ok(Err(error)) => Some(diagnostic_detail(&error)),
         Err(detail) => Some(detail),
     };
+    let succeeded = callback_error.is_none();
     let result = if let Some(error) = sink.take_transport_error() {
         Err(error)
     } else if sink.terminal_sent() {
@@ -1386,6 +1697,18 @@ fn handle_catalog(
         sink.finish(callback_error)
             .map_err(|error| SdkError::Protocol(format!("catalog could not finish: {error}")))
     };
+    if result.is_ok() && succeeded && sink.publication.validate().is_ok() {
+        context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?
+            .catalog = std::mem::take(&mut sink.publication.metadata);
+        context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?
+            .catalog_primary = std::mem::take(&mut sink.publication.primary);
+    }
     let shutdown = sink.shutdown_received();
     cancellation.end();
     if shutdown {
@@ -1393,6 +1716,102 @@ fn handle_catalog(
     } else {
         result
     }
+}
+
+fn handle_typed_execute(
+    plugin: &mut dyn Plugin,
+    request: message::TypedExecuteRequest,
+    context: &RuntimeContext,
+    metrics: &RuntimeMetrics,
+    negotiated: bool,
+) -> Result<(), SdkError> {
+    let request_id = context.request_id;
+    let generation = context.generation;
+    let transport = &context.transport;
+    mark_sensitive();
+    let schema = {
+        let registry = context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
+        let mut selected = None;
+        for binding in registry
+            .suggestions
+            .schemas
+            .iter()
+            .chain(&registry.catalog.schemas)
+        {
+            if binding.executable.target.owner == context.plugin_id
+                && binding.executable.target.item.0 == request.item_id
+                && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
+            {
+                // Both publications remain authoritative. Prefer the exact
+                // expected schema, not whichever inventory happens to be first.
+                let fingerprint = binding.schema.fingerprint().ok();
+                if fingerprint.as_ref().map(|v| v.as_slice()) == Some(request.expected_fingerprint.as_slice())
+                {
+                    selected = Some((binding, fingerprint));
+                    break;
+                }
+                selected.get_or_insert((binding, fingerprint));
+            }
+        }
+        selected.map(|(binding, fingerprint)| (Arc::clone(&binding.schema), fingerprint))
+    };
+    let empty = ArgumentSchema::default();
+    let outcome = if !negotiated || !plugin.supports_typed_arguments() {
+        SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
+    } else if let Some((schema, fingerprint)) = schema.as_ref() {
+        if fingerprint.as_ref().map(|v| v.as_slice()) != Some(request.expected_fingerprint.as_slice()) {
+            SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        } else if schema.validate_values(&request.values).is_err() {
+            SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation)
+        } else if context.cancellation().is_cancelled() {
+            SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
+        } else {
+            let expected_fingerprint =
+                fingerprint.ok_or_else(|| SdkError::Protocol("invalid schema".into()))?;
+            let _in_flight = metrics.enter();
+            let callback = invoke_callback(|| {
+                plugin.execute_typed(
+                    crate::TypedExecuteRequest {
+                        request: RequestId(request_id),
+                        item: ItemId(request.item_id),
+                        action: request.action_id.map(ActionId),
+                        expected_fingerprint,
+                        values: request.values,
+                    },
+                    context,
+                )
+            });
+            match callback {
+                _ if context.cancellation().is_cancelled() => {
+                    SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
+                }
+                Ok(Ok(outcome)) if outcome.validate(Some(schema)).is_ok() => outcome,
+                _ => SubmissionOutcome::Failed(SubmissionFailureCode::Failed),
+            }
+        }
+    } else {
+        SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+    };
+    let response_schema = schema
+        .as_ref()
+        .map(|(schema, _)| schema.as_ref())
+        .unwrap_or(&empty);
+    let response =
+        crikey_native_protocol::typed::to_response(outcome, response_schema).map_err(SdkError::from)?;
+    send_envelope(
+        transport,
+        Envelope {
+            connection_id: context.connection_id,
+            request_id,
+            generation,
+            deadline_ms: 0,
+            payload: Some(Payload::TypedExecuteResponse(response)),
+            unknown: Default::default(),
+        },
+    )
 }
 
 fn handle_execute(
@@ -1420,7 +1839,30 @@ fn handle_execute(
     };
     let callback = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.execute_outcome(plugin_request, context))
+        let guarded = context
+            .schemas
+            .lock()
+            .map_err(|_| CoreError::Invalid("schema registry unavailable".into()))
+            .map(|registry| {
+                let resolved = plugin_request
+                    .action
+                    .as_ref()
+                    .or_else(|| registry.suggestion_primary.get(&plugin_request.item))
+                    .or_else(|| registry.catalog_primary.get(&plugin_request.item));
+                registry
+                    .catalog
+                    .schemas
+                    .iter()
+                    .chain(&registry.suggestions.schemas)
+                    .any(|binding| {
+                        binding.executable.target.item == plugin_request.item
+                            && binding.executable.action.as_ref() == resolved
+                    })
+            });
+        match guarded {
+            Ok(false) => invoke_callback(|| plugin.execute_outcome(plugin_request, context)),
+            _ => Ok(Err(CoreError::Invalid("typed arguments required".into()))),
+        }
     };
     let (outcome, page_id, error) = match callback {
         Ok(Ok(ExecuteOutcome::Completed)) => (ExecuteOutcomeCode::from_i32(1), String::new(), None),
@@ -1432,7 +1874,7 @@ fn handle_execute(
         Ok(Err(error)) => (
             ExecuteOutcomeCode::from_i32(2),
             String::new(),
-            Some(structured_error(&error.to_string(), request_id)),
+            Some(structured_error(&diagnostic_detail(&error), request_id)),
         ),
         Err(detail) => (
             ExecuteOutcomeCode::from_i32(2),
@@ -1498,7 +1940,7 @@ fn handle_page(
     };
     let mut frame = match callback {
         Ok(Ok(frame)) => frame,
-        Ok(Err(error)) => closing_frame(context, page_generation, &error.to_string()),
+        Ok(Err(error)) => closing_frame(context, page_generation, &diagnostic_detail(&error)),
         Err(detail) => closing_frame(context, page_generation, &detail),
     };
     // The host drops a frame whose generation does not match the request it
@@ -1510,7 +1952,11 @@ fn handle_page(
     // only at the host that rejects them: the host knows the frame is invalid
     // but nothing about which line of plugin code produced it.
     if let Err(error) = frame.validate() {
-        frame = closing_frame(context, page_generation, &format!("invalid page frame: {error}"));
+        frame = closing_frame(
+            context,
+            page_generation,
+            &diagnostic_context("invalid page frame", &error),
+        );
     }
     send_envelope(
         transport,
@@ -1530,7 +1976,10 @@ fn handle_page(
 /// The frame a failed page answers with: nothing drawn, page closed, reason
 /// logged where the plugin author will see it.
 fn closing_frame(context: &RuntimeContext, generation: u64, detail: &str) -> PageFrame {
-    context.log(LogLevel::Error, &format!("page callback failed: {detail}"));
+    context.log(
+        LogLevel::Error,
+        &diagnostic_context("page callback failed", &detail),
+    );
     PageFrame {
         generation,
         close: true,
@@ -1559,6 +2008,12 @@ fn send_error(
 }
 
 fn structured_error(detail: &str, request_id: u64) -> StructuredError {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    let detail = if SENSITIVE.load(Ordering::Acquire) {
+        "plugin callback failed"
+    } else {
+        detail
+    };
     StructuredError {
         code: ErrorCode::from_i32(2),
         message: if detail.is_empty() {
@@ -1572,7 +2027,37 @@ fn structured_error(detail: &str, request_id: u64) -> StructuredError {
     }
 }
 
-fn send_envelope(transport: &Arc<Mutex<Box<dyn Transport>>>, envelope: Envelope) -> Result<(), SdkError> {
+fn send_envelope(transport: &Arc<Mutex<Box<dyn Transport>>>, mut envelope: Envelope) -> Result<(), SdkError> {
+    let _guard = DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    if SENSITIVE.load(Ordering::Acquire) {
+        let error = match envelope.payload.as_mut() {
+            Some(Payload::Log(_)) => return Ok(()),
+            Some(Payload::Error(error)) => Some(error),
+            Some(Payload::ExecuteResult(result)) => result.error.as_mut(),
+            Some(Payload::LifecycleAck(result)) => result.error.as_mut(),
+            Some(Payload::ResourceResponse(result)) => result.error.as_mut(),
+            Some(Payload::CatalogBatch(result)) => result.error.as_mut(),
+            Some(Payload::Results(result)) => result.error.as_mut(),
+            Some(Payload::CommandsResponse(result)) => {
+                if !result.detail.is_empty() {
+                    result.detail = "plugin callback failed".into();
+                }
+                None
+            }
+            Some(Payload::PreviewResponse(result)) => {
+                if !result.detail.is_empty() {
+                    result.detail = "plugin callback failed".into();
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            error.message = "plugin callback failed".into();
+            error.detail.clear();
+        }
+    }
+    message::validate_outbound(&envelope).map_err(SdkError::from)?;
     let mut locked = transport
         .lock()
         .map_err(|_| SdkError::Transport("transport lock poisoned".to_owned()))?;
@@ -1592,10 +2077,16 @@ fn stop_plugin(
     match callback {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
+            return Err(SdkError::Protocol(diagnostic_context(
+                "plugin stop failed",
+                &error,
+            )));
         }
         Err(detail) => {
-            return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
+            return Err(SdkError::Protocol(diagnostic_context(
+                "plugin stop failed",
+                &detail,
+            )));
         }
     }
     if propagate_log_error {
@@ -1619,6 +2110,8 @@ struct SuggestionSinkImpl<'a> {
     terminal: bool,
     transport_error: Option<SdkError>,
     cancelled_error: bool,
+    presentation: Option<message::ResultPresentation>,
+    publication: Publication,
 }
 
 impl<'a> SuggestionSinkImpl<'a> {
@@ -1643,6 +2136,8 @@ impl<'a> SuggestionSinkImpl<'a> {
             terminal: false,
             transport_error: None,
             cancelled_error: false,
+            presentation: None,
+            publication: Publication::default(),
         }
     }
 
@@ -1695,15 +2190,19 @@ impl<'a> SuggestionSinkImpl<'a> {
 
     /// `ResultBatch` carries the same repeated `Item` field as `CatalogBatch`
     /// and is bounded the same way: by what the receiver can decode, not by
-    /// `MAX_FRAME_BYTES`. A partial batch is therefore split into as many
-    /// decodable frames as it needs. Terminal states always carry no items,
-    /// so they are unaffected.
+    /// `MAX_FRAME_BYTES`. Pending presentation is sent as its own partial
+    /// frame before allocating item chunks: its independent cap does not fit
+    /// inside the item chunker's overhead reserve. Neither that frame nor an
+    /// item chunk grants authority before successful terminal validation.
     fn send_batch(
         &mut self,
         state: BatchState,
         items: Vec<Item>,
         error: Option<StructuredError>,
     ) -> Result<()> {
+        if !items.is_empty() && self.presentation.is_some() {
+            self.send_one(BatchState::from_i32(1), Vec::new(), None)?;
+        }
         let proto_items: Vec<message::Item> = items
             .iter()
             .map(crikey_native_protocol::convert::to_proto_item)
@@ -1751,6 +2250,7 @@ impl<'a> SuggestionSinkImpl<'a> {
                 items: proto_items,
                 sequence: self.sequence,
                 error,
+                presentation: self.presentation.take(),
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
@@ -1770,6 +2270,9 @@ impl<'a> SuggestionSinkImpl<'a> {
         }
         if self.shutdown_received() {
             return Ok(());
+        }
+        if self.publication.validate().is_err() {
+            return self.finish_failed("invalid presentation binding");
         }
         if let Err(error) = self.send_batch(BatchState::from_i32(2), Vec::new(), None) {
             if self.shutdown_received() {
@@ -1816,6 +2319,7 @@ impl<'a> SuggestionSinkImpl<'a> {
 
 impl SuggestionSink for SuggestionSinkImpl<'_> {
     fn emit_batch(&mut self, items: Vec<Item>) -> Result<()> {
+        self.publication.record(&items);
         self.send_batch(BatchState::from_i32(1), items, None)
     }
 
@@ -1843,6 +2347,8 @@ struct CatalogSinkImpl<'a> {
     sequence: u64,
     terminal: bool,
     transport_error: Option<SdkError>,
+    presentation: Option<message::ResultPresentation>,
+    publication: Publication,
 }
 
 impl<'a> CatalogSinkImpl<'a> {
@@ -1866,6 +2372,8 @@ impl<'a> CatalogSinkImpl<'a> {
             sequence: 0,
             terminal: false,
             transport_error: None,
+            presentation: None,
+            publication: Publication::default(),
         }
     }
 
@@ -1923,9 +2431,14 @@ impl<'a> CatalogSinkImpl<'a> {
     /// apart for repeated items; a plugin that handed the whole catalog to
     /// one frame would produce a frame the host accepts on the wire and then
     /// refuses while decoding, and would be disconnected for it.
-    /// `message::max_decodable_items` is the protocol's own answer to how
-    /// many fit, so the SDK asks rather than guesses.
+    /// Pending presentation is sent in a standalone nonterminal frame before
+    /// allocating item chunks, keeping its independent budget out of the item
+    /// chunker's overhead reserve. The ordinary credit and sequence accounting
+    /// applies, and publication authority still waits for terminal validation.
     fn send(&mut self, items: Vec<Item>, done: bool, error: Option<StructuredError>) -> Result<()> {
+        if !items.is_empty() && self.presentation.is_some() {
+            self.send_one(Vec::new(), false, None)?;
+        }
         let proto_items: Vec<message::Item> = items
             .iter()
             .map(crikey_native_protocol::convert::to_proto_item)
@@ -1968,6 +2481,7 @@ impl<'a> CatalogSinkImpl<'a> {
                 done,
                 sequence: self.sequence,
                 error,
+                presentation: self.presentation.take(),
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
@@ -1987,6 +2501,9 @@ impl<'a> CatalogSinkImpl<'a> {
         if self.terminal {
             return Ok(());
         }
+        if failure.is_none() {
+            self.publication.validate()?;
+        }
         let error = failure.map(|detail| structured_error(&detail, self.request_id));
         self.send(Vec::new(), true, error)?;
         self.terminal = true;
@@ -1996,6 +2513,7 @@ impl<'a> CatalogSinkImpl<'a> {
 
 impl CatalogSink for CatalogSinkImpl<'_> {
     fn emit_batch(&mut self, items: Vec<Item>) -> Result<()> {
+        self.publication.record(&items);
         self.send(items, false, None)
     }
 

@@ -11,6 +11,35 @@
 //! The bounds mirror the legacy worker exactly (`crikey-legacy-compat`): a
 //! plugin cannot make the host allocate without limit, and an over-long line is
 //! a named protocol failure rather than unbounded growth.
+//! PR7 JSON additions (protocol version remains 1):
+//! - Independently negotiate `typed_arguments_v1` and `result_presentation_v1`.
+//! - `typed_execute`: correlation `id`, the existing frozen `item` object,
+//!   optional/null `action_id`, lowercase 64-hex `schema_fingerprint`, and
+//!   `values: [{field_id, kind: text|password|dropdown, value: string}]`.
+//!   Any legacy `argument` member is forbidden, including null.
+//! - `typed_execute_result`: the same `id`; `status: completed`, or
+//!   `status: field_failures, failures: [{field_id, code}]`, or
+//!   `status: failed, code`. Field codes are required/too_short/too_long/
+//!   invalid_selection/rejected; global codes are unavailable/denied/cancelled/
+//!   timeout/unsupported/failed. Only unique current schema field IDs are valid.
+//!   No messages, traceback or navigation outcome belongs to this vocabulary.
+//! - Catalog/suggestion batches may carry `presentation` with `sections` and
+//!   `scopes` declarations `{id,label}`, memberships `{item_id,section,scopes}`,
+//!   and `schemas: [{item_id,action_id,schema:{fields:[...]}}]`. Schema fields
+//!   use id/label/required/placeholder/guidance/kind and min_bytes/max_bytes/
+//!   multiline/default/options as applicable; options use `{id,label}`.
+//!   Omitted/null optional text metadata normalizes to absence, not empty text.
+//!   Password defaults, even null, are invalid. Endpoint admission assigns owner.
+//!   Schema sidecars work without visual negotiation; visual-only negotiation
+//!   grants no typed execution. Publish only after complete-set validation.
+//! - Suggest adds optional `scope_id`, sent only to its capable selected owner.
+//!
+//! Existing callback lists, duplicate semantics and frame ceilings stay intact.
+//! New typed known-member/identity duplicates are refused. The host preflights
+//! depth 64, 64 fields, 256 options, 256-byte IDs, 8-KiB values, 256-KiB schemas
+//! and aggregate/intermediate allocations before controlled projection. Unknown
+//! additive content is traversed/charged, not retained. No secret-bearing JSON
+//! Value is constructed for outgoing typed input.
 
 use std::collections::BTreeMap;
 

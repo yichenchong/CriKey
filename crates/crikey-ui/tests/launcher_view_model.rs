@@ -3113,14 +3113,24 @@ fn recall_picker_selects_a_bounded_submission_without_executing_it() {
 fn reusable_restoration_keeps_logical_scope_and_excludes_argument_drafts() {
     let mut model = LauncherViewModel::new();
     model.activate();
+    let scope = crikey_ui::ScopeIdentity {
+        owner: PluginId("documents".into()),
+        id: crikey_core::result_presentation::ScopeId("documents".into()),
+        source: crikey_ui::PublicationIdentity::Catalog {
+            instance: 1,
+            generation: Generation::from_raw(1),
+            producer: 1,
+            publication: 1,
+        },
+    };
     model.restore_navigation_state(crikey_ui::NavigationRestoration {
         query: "root".into(),
-        scope: Some("documents".into()),
+        scope: Some(scope.clone()),
         ..Default::default()
     });
     model.open_settings(None);
     model.close_settings();
-    assert_eq!(model.navigation_restoration().scope.as_deref(), Some("documents"));
+    assert_eq!(model.navigation_restoration().scope.as_ref(), Some(&scope));
     model.begin_generation(Generation::from_raw(1));
     let mut argument = row("argument");
     argument.argument_hint = Some("argument required".into());

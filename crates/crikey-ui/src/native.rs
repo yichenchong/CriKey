@@ -224,7 +224,7 @@ impl fmt::Debug for NativeUiFrame {
 ///
 /// Not [`Eq`], because [`UiCommand`] is not: a page's pointer event carries
 /// float coordinates.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum NativeLauncherEvent {
     /// A platform activation request has reached the native event loop.
     ///
@@ -236,6 +236,10 @@ pub enum NativeLauncherEvent {
     /// `session` scopes effects such as hiding after a successful action. A
     /// late command from an older activation must never hide a newer one.
     Command { session: u64, command: UiCommand },
+    TypedInput {
+        session: u64,
+        submission: crate::TypedInputSubmission,
+    },
     /// A provider driver has an answer waiting for the UI thread to merge.
     ///
     /// Carries nothing: the answer itself lives in the driver the host will
@@ -293,7 +297,15 @@ pub fn release_launcher_textures(context: &egui::Context) -> Vec<egui::TextureId
 /// Ordered input and widget effects come from the first egui pass. Extra
 /// layout passes may refine the reported page size, but never replay input.
 pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &ViewModel) -> NativeUiFrame {
-    build_launcher_frame_with_transparency(context, input, model, false, false)
+    build_launcher_frame_with_transparency(
+        context,
+        input,
+        model,
+        false,
+        false,
+        &mut crate::typed_input::TypedEditor::default(),
+        &mut Vec::new(),
+    )
 }
 
 #[derive(Clone)]
@@ -301,6 +313,7 @@ struct DeferredActionInput {
     token: u64,
     source: Arc<crate::ActionInputCheckpoint>,
     focus_ready: bool,
+    typed_focus: Option<egui::Id>,
     events: Vec<egui::Event>,
 }
 
@@ -354,21 +367,25 @@ fn prepare_action_input(
         });
         let valid = focused
             && editor_owned
+            && (owner.typed.is_none()
+                || (owner.typed != pending.source.typed && !pending.focus_ready)
+                || context.memory(|memory| memory.focused() == pending.typed_focus))
             && receipt.is_none_or(|receipt| receipt.accepted)
-            && owner.matches(
-                model.view,
-                model.generation,
-                &model.query,
-                model.rows.get(model.selected),
-                model.action_panel.as_ref(),
-                (model.preview.focused, model.preview.detail),
-            );
+            && owner.matches(crate::CurrentInputState {
+                view: model.view,
+                generation: model.generation,
+                query: &model.query,
+                row: model.rows.get(model.selected),
+                panel: model.action_panel.as_ref(),
+                preview_focus: (model.preview.focused, model.preview.detail),
+                typed: model.navigation.inline_arguments.as_ref(),
+            });
         if valid {
             pending.events.append(&mut input.events);
-            if receipt.is_none()
-                || (model.settings_open && owner.view != pending.source.view && !pending.focus_ready)
-            {
-                // Establish a fresh Settings surface's ordinary editor focus
+            let new_editor = model.settings_open && owner.view != pending.source.view
+                || owner.typed.is_some() && owner.typed != pending.source.typed;
+            if receipt.is_none() || (new_editor && !pending.focus_ready) {
+                // Establish the replacement surface's ordinary editor focus
                 // once before delivering the retained stream.
                 let establish_focus = receipt.is_some();
                 pending.focus_ready |= establish_focus;
@@ -383,7 +400,11 @@ fn prepare_action_input(
             }
             if model.action_panel.is_some() {
                 context.memory_mut(|memory| memory.request_focus(editor));
-            } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+            } else if !model.settings_open
+                && model.navigation.inline_arguments.is_none()
+                && model.page.is_none()
+                && !model.preview.focused
+            {
                 context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
             }
             input.events = pending.events;
@@ -395,7 +416,11 @@ fn prepare_action_input(
             if resumed {
                 if model.action_panel.is_some() {
                     context.memory_mut(|memory| memory.request_focus(editor));
-                } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                } else if !model.settings_open
+                    && model.navigation.inline_arguments.is_none()
+                    && model.page.is_none()
+                    && !model.preview.focused
+                {
                     context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
                 }
             }
@@ -472,6 +497,11 @@ fn prepare_action_input(
                     token,
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
+                    typed_focus: model
+                        .navigation
+                        .inline_arguments
+                        .as_ref()
+                        .and_then(|_| context.memory(|memory| memory.focused())),
                     events,
                 }),
             );
@@ -486,6 +516,8 @@ fn build_launcher_frame_with_transparency(
     model: &ViewModel,
     transparent: bool,
     native_web_input: bool,
+    editor: &mut crate::typed_input::TypedEditor,
+    typed_submissions: &mut Vec<crate::TypedInputSubmission>,
 ) -> NativeUiFrame {
     if !native_web_input
         && model.page.as_ref().is_some_and(|page| {
@@ -509,7 +541,18 @@ fn build_launcher_frame_with_transparency(
     let mut first_pass = true;
     let output = context.run(input, |context| {
         pass_commands.clear();
-        draw_launcher(context, model, &mut pass_commands, transparent, native_web_input);
+        draw_launcher(
+            context,
+            model,
+            &mut pass_commands,
+            transparent,
+            TypedInputPass {
+                editor,
+                submissions: typed_submissions,
+                admit_input: first_pass,
+            },
+            native_web_input,
+        );
         if first_pass {
             // egui 0.29 drains RawInput events into the first pass only.
             // Preserve that pass's ordered effects, including equal events and
@@ -536,6 +579,19 @@ fn build_launcher_frame_with_transparency(
         }
     });
     if waiting_for_input {
+        if model.navigation.inline_arguments.is_some() {
+            let focused = context.memory(|memory| memory.focused());
+            context.data_mut(|data| {
+                if let Some(Some(mut pending)) =
+                    data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
+                {
+                    if pending.focus_ready {
+                        pending.typed_focus = focused;
+                    }
+                    data.insert_temp(action_input_queue(), Some(pending));
+                }
+            });
+        }
         commands.clear();
     } else {
         let host_boundary = action_boundary.is_some();
@@ -1629,6 +1685,11 @@ where
         let Some(frame) = self.take_frame(session, acknowledge_wake) else {
             return false;
         };
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics
+                .typed_editor
+                .retire_unless(frame.navigation.inline_arguments.as_ref());
+        }
         self.frame = Some(frame);
         let surface_id = self.web_surface_id();
         if self.ime.set_surface(surface_id) {
@@ -1677,10 +1738,34 @@ where
         self.consecutive_surface_retries = 0;
     }
 
+    fn flush_inline_input(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.navigation.inline_arguments.is_some())
+            && self
+                .graphics
+                .as_mut()
+                .is_some_and(|graphics| !graphics.egui_state.egui_input_mut().events.is_empty())
+        {
+            self.redraw(event_loop);
+        }
+    }
+
     fn dispatch_command(&mut self, event_loop: &ActiveEventLoop, command: UiCommand) {
         let Some(session) = self.active_session else {
             return;
         };
+        if matches!(
+            &command,
+            UiCommand::Dismiss
+                | UiCommand::Cancel
+                | UiCommand::Back
+                | UiCommand::OpenSettings
+                | UiCommand::SetScope(_)
+        ) {
+            self.flush_inline_input(event_loop);
+        }
         (self.on_event)(NativeLauncherEvent::Command { session, command });
         if self.accept_latest_frame(session, false) {
             self.request_redraw();
@@ -1746,6 +1831,11 @@ where
         }
         for command in draw.commands {
             self.dispatch_command(event_loop, command);
+        }
+        for submission in draw.typed_submissions {
+            if let Some(session) = self.active_session {
+                (self.on_event)(NativeLauncherEvent::TypedInput { session, submission });
+            }
         }
     }
 
@@ -2011,6 +2101,16 @@ where
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: NativeEvent) {
+        if matches!(
+            &event,
+            NativeEvent::Activate { .. }
+                | NativeEvent::Toggle { .. }
+                | NativeEvent::Hide { .. }
+                | NativeEvent::ProviderAnswer { .. }
+                | NativeEvent::ActionCompletion
+        ) {
+            self.flush_inline_input(event_loop);
+        }
         match event {
             NativeEvent::Activate {
                 session,
@@ -2120,6 +2220,9 @@ where
             // cancel recording, or dismiss before the queued global receipt.
             return;
         }
+        if matches!(&event, WindowEvent::Focused(false) | WindowEvent::CloseRequested) {
+            self.flush_inline_input(event_loop);
+        }
 
         // Touch must cross the same immediate ownership boundary as native
         // keys and mouse input. Deferring it until redraw reorders a tap before
@@ -2168,7 +2271,7 @@ where
                     && self.modifiers.alt_key()
                     || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
                         && (self.modifiers.control_key() || self.modifiers.super_key());
-                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some() || !frame.navigation.recall.is_empty())
+                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some() || !frame.navigation.recall.is_empty() || frame.navigation.inline_arguments.is_some())
                     && matches!(event.logical_key.as_ref(), Key::Named(
                         NamedKey::Enter | NamedKey::Escape | NamedKey::ArrowUp | NamedKey::ArrowDown
                         | NamedKey::PageUp | NamedKey::PageDown))
@@ -2369,6 +2472,7 @@ struct GraphicsState {
     renderer: Renderer,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
+    typed_editor: crate::typed_input::TypedEditor,
 }
 
 /// Whether this frame shows a result list at all.
@@ -2412,6 +2516,9 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
         || model.navigation.can_go_back
         || model.navigation.unavailable.is_some()
         || !model.navigation.recall.is_empty()
+        || model.navigation.inline_arguments.is_some()
+        || !model.navigation.scopes.is_empty()
+        || !model.navigation.section_headers.is_empty()
     {
         return expanded_height;
     }
@@ -2745,6 +2852,7 @@ impl GraphicsState {
         );
         let renderer = Renderer::new(&device, format, None, 1, false);
         Ok(Self {
+            typed_editor: crate::typed_input::TypedEditor::default(),
             window,
             transparent,
             shaped,
@@ -2828,6 +2936,7 @@ impl GraphicsState {
     }
 
     fn hide(&mut self) {
+        self.typed_editor.clear();
         clear_action_input(&self.egui_context);
         let _ = self.egui_state.take_egui_input(&self.window);
         self.window.set_ime_allowed(false);
@@ -2936,8 +3045,16 @@ impl GraphicsState {
         // The window's own shape follows the frame, because the preference
         // that decides it can be changed while the launcher is running.
         self.apply_window_rounding(model.rounded_corners);
-        let NativeUiFrame { output, commands } =
-            build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent, true);
+        let mut typed_submissions = Vec::new();
+        let NativeUiFrame { output, commands } = build_launcher_frame_with_transparency(
+            &self.egui_context,
+            input,
+            model,
+            self.transparent,
+            true,
+            &mut self.typed_editor,
+            &mut typed_submissions,
+        );
         let egui::FullOutput {
             platform_output,
             textures_delta,
@@ -2972,6 +3089,7 @@ impl GraphicsState {
                 }
                 return Ok(DrawResult {
                     commands,
+                    typed_submissions,
                     presented_at: None,
                     repaint_after,
                     retry: true,
@@ -2983,6 +3101,7 @@ impl GraphicsState {
                 }
                 return Ok(DrawResult {
                     commands,
+                    typed_submissions,
                     presented_at: None,
                     repaint_after,
                     retry: true,
@@ -3037,6 +3156,7 @@ impl GraphicsState {
 
         Ok(DrawResult {
             commands,
+            typed_submissions,
             presented_at: Some(presented_at),
             repaint_after,
             retry: false,
@@ -3046,6 +3166,7 @@ impl GraphicsState {
 
 struct DrawResult {
     commands: Vec<UiCommand>,
+    typed_submissions: Vec<crate::TypedInputSubmission>,
     presented_at: Option<Instant>,
     repaint_after: Duration,
     retry: bool,
@@ -3431,6 +3552,9 @@ fn translate_logical_key(
     if model.is_some_and(|model| model.settings_open) {
         return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
     }
+    if model.is_some_and(|model| model.navigation.inline_arguments.is_some()) {
+        return None;
+    }
     if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
         || matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
             && (modifiers.control_key() || modifiers.super_key())
@@ -3527,19 +3651,29 @@ fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
 /// short of where it thought it would.
 const BLOCK_GAP: f32 = theme::ITEM_SPACING_Y + theme::SPACE_3;
 
+/// Borrows the native editor and its move-only output for one egui pass.
+struct TypedInputPass<'a> {
+    editor: &'a mut crate::typed_input::TypedEditor,
+    submissions: &'a mut Vec<crate::TypedInputSubmission>,
+    admit_input: bool,
+}
+
 fn draw_launcher(
     context: &egui::Context,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
     transparent: bool,
+    typed: TypedInputPass<'_>,
     native_web_input: bool,
 ) {
     let colors = theme::palette();
     if model.page.is_some() || model.settings_open || !shows_results(model) {
         preview_render::release_texture(context);
     }
-    preview_render::keyboard(context, model, commands);
-    action_render::keyboard(context, model, commands);
+    if model.navigation.inline_arguments.is_none() {
+        preview_render::keyboard(context, model, commands);
+        action_render::keyboard(context, model, commands);
+    }
     let recall_composing = context.data(|data| {
         data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
             .unwrap_or(false)
@@ -3566,9 +3700,9 @@ fn draw_launcher(
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
     // window does, and so the query field never also receives the comma.
-    if model.page.as_ref().is_none_or(|page| page.frame.web.is_none())
-        && context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma))
-    {
+    let open_settings = model.page.as_ref().is_none_or(|page| page.frame.web.is_none())
+        && context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma));
+    if open_settings && model.navigation.inline_arguments.is_none() {
         commands.push(UiCommand::OpenSettings);
     }
     // Page rasters and an engine frame belong only to the page that supplied
@@ -3601,6 +3735,68 @@ fn draw_launcher(
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
+            if !model.settings_open
+                && model.page.is_none()
+                && (!model.navigation.scopes.is_empty() || model.navigation.selected_scope.is_some())
+            {
+                let selected = model.navigation.selected_scope.as_ref();
+                let available = selected.and_then(|identity| {
+                    model
+                        .navigation
+                        .scopes
+                        .iter()
+                        .find(|choice| &choice.identity == identity)
+                });
+                let unavailable = selected.is_some() && available.is_none();
+                ui.horizontal(|ui| {
+                    if unavailable {
+                        ui.label("Unavailable scope");
+                        if ui.button("All").clicked() {
+                            commands.push(UiCommand::SetScope(None));
+                        }
+                        if model.navigation.scopes.is_empty() {
+                            return;
+                        }
+                    }
+                    let label = if unavailable {
+                        "Choose scope"
+                    } else {
+                        available.map_or("All", |choice| choice.label.as_str())
+                    };
+                    egui::ComboBox::from_id_salt("root-scope")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(selected.is_none(), "All").clicked() {
+                                commands.push(UiCommand::SetScope(None));
+                            }
+                            for choice in model.navigation.scopes.iter() {
+                                if ui
+                                    .selectable_label(selected == Some(&choice.identity), &choice.label)
+                                    .clicked()
+                                {
+                                    commands.push(UiCommand::SetScope(Some(choice.identity.clone())));
+                                }
+                            }
+                        });
+                });
+            }
+            if !model.settings_open && model.page.is_none() && model.navigation.inline_arguments.is_some() {
+                egui::ScrollArea::vertical()
+                    .id_salt("inline-input")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        if let Some(submission) = typed.editor.draw(
+                            ui,
+                            model.navigation.inline_arguments.as_ref(),
+                            commands,
+                            typed.admit_input,
+                        ) {
+                            typed.submissions.push(submission);
+                        }
+                    });
+            } else {
+                typed.editor.clear();
+            }
             if !model.settings_open
                 && (model.navigation.can_go_back || model.navigation.unavailable.is_some())
             {
@@ -3668,6 +3864,9 @@ fn draw_launcher(
             ui.add_space(theme::SPACE_3);
             draw_status(ui, model, commands, colors);
         });
+    if open_settings && model.navigation.inline_arguments.is_some() {
+        commands.push(UiCommand::OpenSettings);
+    }
 }
 
 fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
@@ -3697,6 +3896,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
                         !model.settings_open
                             && model.page.is_none()
                             && model.action_panel.is_none()
+                            && model.navigation.inline_arguments.is_none()
                             && !(model.navigation.can_go_back && model.navigation.unavailable.is_some()),
                     )
                     .lock_focus(true),
@@ -3715,12 +3915,16 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             if model.page.is_some()
                 || model.preview.focused
                 || model.action_panel.is_some()
+                || model.navigation.inline_arguments.is_some()
                 || (model.navigation.can_go_back && model.navigation.unavailable.is_some())
             {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
-            } else if !model.settings_open && !model.preview.focused {
+            } else if !model.settings_open
+                && !model.preview.focused
+                && model.navigation.inline_arguments.is_none()
+            {
                 response.request_focus();
             }
             if response.changed() {
@@ -3851,6 +4055,14 @@ fn draw_results(
             let mut first_visible = None;
             let mut restoration_rect = None;
             for (index, row) in model.rows.iter().enumerate() {
+                if let Some(header) = model
+                    .navigation
+                    .section_headers
+                    .iter()
+                    .find(|header| header.row == index)
+                {
+                    ui.add_sized([ui.available_width(), 24.0], egui::Label::new(&header.label));
+                }
                 let response = draw_result_row(ui, row, model, index == model.selected, commands, colors);
                 if first_visible.is_none()
                     && response.rect.max.y > viewport.top()
@@ -3942,6 +4154,25 @@ mod preview_render;
 /// [`draw_results`] needs to decide whether the list should follow the
 /// selection. The row itself never scrolls: only the list knows whether the
 /// user has scrolled it since.
+fn actionless_primary(row: &ResultRow, model: &ViewModel) -> bool {
+    let crate::ActionTarget::Result { owner, item } = &row.target else {
+        return false;
+    };
+    model
+        .navigation
+        .actionless_targets
+        .iter()
+        .any(|target| &target.owner == owner && &target.item == item)
+}
+
+fn root_primary_command(row: &ResultRow, model: &ViewModel) -> Option<UiCommand> {
+    row.primary_command(model.generation, &model.query).or_else(|| {
+        actionless_primary(row, model).then(|| UiCommand::ActivateActionless {
+            target: row.target.clone(),
+        })
+    })
+}
+
 fn draw_result_row(
     ui: &mut egui::Ui,
     row: &ResultRow,
@@ -4025,13 +4256,15 @@ fn draw_result_row(
                         }
                     });
                 });
-                if selected && ui.max_rect().width() > 520.0 {
+                if selected && ui.max_rect().width() > 520.0 && model.navigation.inline_arguments.is_none() {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Actions").clicked() {
                             commands.push(UiCommand::ShowActions);
                         }
-                        if row.has_primary_action() && ui.button("Run  Enter").clicked() {
-                            if let Some(command) = row.primary_command(model.generation, &model.query) {
+                        if (row.has_primary_action() || actionless_primary(row, model))
+                            && ui.button("Run  Enter").clicked()
+                        {
+                            if let Some(command) = root_primary_command(row, model) {
                                 commands.push(command);
                             }
                         }
@@ -6120,7 +6353,11 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             if settings.clicked() {
                 commands.push(UiCommand::OpenSettings);
             }
-            if !model.settings_open && model.page.is_none() && !model.rows.is_empty() {
+            if !model.settings_open
+                && model.page.is_none()
+                && !model.rows.is_empty()
+                && model.navigation.inline_arguments.is_none()
+            {
                 let actions = ui
                     .add(
                         egui::Label::new(RichText::new("Actions  Ctrl/Cmd+K").small())
@@ -6131,7 +6368,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
                     commands.push(UiCommand::ShowActions);
                 }
                 if let Some(row) = model.rows.get(model.selected) {
-                    if row.has_primary_action() {
+                    if row.has_primary_action() || actionless_primary(row, model) {
                         let label = if matches!(row.target, crate::ActionTarget::Command(_)) {
                             "Invoke Command"
                         } else {
@@ -6148,7 +6385,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
                             )
                             .on_hover_text(label);
                         if primary.clicked() {
-                            if let Some(command) = row.primary_command(model.generation, &model.query) {
+                            if let Some(command) = root_primary_command(row, model) {
                                 commands.push(command);
                             }
                         }
@@ -6260,9 +6497,18 @@ mod transparency_tests {
             &model,
             false,
             false,
+            &mut crate::typed_input::TypedEditor::default(),
+            &mut Vec::new(),
         );
-        let transparent =
-            build_launcher_frame_with_transparency(&create_launcher_context(), input, &model, true, false);
+        let transparent = build_launcher_frame_with_transparency(
+            &create_launcher_context(),
+            input,
+            &model,
+            true,
+            false,
+            &mut crate::typed_input::TypedEditor::default(),
+            &mut Vec::new(),
+        );
         let colors = theme::palette();
 
         assert!(opaque
@@ -8207,7 +8453,15 @@ mod web_input_tests {
             events,
             ..Default::default()
         };
-        let _ = build_launcher_frame_with_transparency(&context, input(Vec::new()), &view, false, true);
+        let _ = build_launcher_frame_with_transparency(
+            &context,
+            input(Vec::new()),
+            &view,
+            false,
+            true,
+            &mut crate::typed_input::TypedEditor::default(),
+            &mut Vec::new(),
+        );
         let inside = web_page_geometry(&context).expect("measured page").rect.center();
         for events in [
             vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
@@ -8218,7 +8472,15 @@ mod web_input_tests {
                 egui::Event::PointerMoved(position) => Some(*position),
                 _ => None,
             });
-            let frame = build_launcher_frame_with_transparency(&context, input(events), &view, false, true);
+            let frame = build_launcher_frame_with_transparency(
+                &context,
+                input(events),
+                &view,
+                false,
+                true,
+                &mut crate::typed_input::TypedEditor::default(),
+                &mut Vec::new(),
+            );
             assert_eq!(context.input(|state| state.pointer.hover_pos()), expected);
             assert!(
                 !frame
@@ -8241,6 +8503,8 @@ mod web_input_tests {
                 &view,
                 false,
                 true,
+                &mut crate::typed_input::TypedEditor::default(),
+                &mut Vec::new(),
             );
             assert!(
                 frame.commands.is_empty(),
@@ -8413,7 +8677,15 @@ mod web_input_tests {
                 events,
                 ..Default::default()
             };
-            let _ = build_launcher_frame_with_transparency(&context, input(Vec::new()), &view, false, true);
+            let _ = build_launcher_frame_with_transparency(
+                &context,
+                input(Vec::new()),
+                &view,
+                false,
+                true,
+                &mut crate::typed_input::TypedEditor::default(),
+                &mut Vec::new(),
+            );
             let inside = web_page_geometry(&context).expect("measured page").rect.center();
             // These copies arrived while surface 41 was current, before the
             // next redraw accepted a replacement or pending declaration.
@@ -8444,7 +8716,15 @@ mod web_input_tests {
                     }
                 }),
             );
-            let frame = build_launcher_frame_with_transparency(&context, input(events), &view, false, true);
+            let frame = build_launcher_frame_with_transparency(
+                &context,
+                input(events),
+                &view,
+                false,
+                true,
+                &mut crate::typed_input::TypedEditor::default(),
+                &mut Vec::new(),
+            );
             assert!(
                 !frame
                     .commands

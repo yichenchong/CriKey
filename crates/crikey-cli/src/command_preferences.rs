@@ -1246,7 +1246,7 @@ mod layer_consumer_tests {
                 unreachable!();
             };
             worker
-                .submit(Request::Mutate(MutationRequest {
+                .submit_mutation(MutationRequest {
                     request_id,
                     config: current.config.take().unwrap(),
                     registry: Arc::clone(&registry),
@@ -1254,7 +1254,7 @@ mod layer_consumer_tests {
                     reference,
                     edit: semantic_edit,
                     session: false,
-                }))
+                })
                 .unwrap();
             current = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             let preferences = current.preferences.as_ref().expect("semantic edit must commit");
@@ -1312,7 +1312,7 @@ mod layer_consumer_tests {
         .enumerate()
         {
             worker
-                .submit(Request::Mutate(MutationRequest {
+                .submit_mutation(MutationRequest {
                     request_id: 100 + index as u64,
                     config: current.config.as_ref().unwrap().clone(),
                     registry: Arc::clone(&registry),
@@ -1320,7 +1320,7 @@ mod layer_consumer_tests {
                     reference: selected.clone(),
                     edit: edit.clone(),
                     session: false,
-                }))
+                })
                 .unwrap();
             let refused = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             let ack = refused.command_edit.unwrap();

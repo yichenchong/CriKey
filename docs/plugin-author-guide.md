@@ -1,10 +1,8 @@
 # CriKey plugin author guide
 
-CriKey is an independent project. A plugin may implement compatibility with the
-documented Keypirinha API, but must not present itself as an official
-Keypirinha component or imply an affiliation. Choose a modern Python plugin or
-a supervised native plugin for new work; use legacy compatibility only when
-porting an existing package.
+CriKey is an independent project. Choose a modern Python plugin or a supervised
+native plugin for new work; use legacy compatibility only when porting an
+existing package.
 
 ## Package and manifest
 
@@ -221,9 +219,11 @@ by commands targeting it, not command recents, preferences or query recall.
 Users can also assign command aliases and global shortcuts to the exact declared
 reference. Hidden declarations are excluded from alias discovery, not explicit
 shortcut invocation. Shortcut dispatch revalidates current canonical command
-authority and permissions. Optional arguments are omitted; Required commands open
-host input without invoking the callback. No alias-plus-space argument syntax or
-structured argument support is implied. Native `Plugin::execute_outcome` may return
+authority and permissions. Optional free-form arguments are omitted; Required
+free-form commands open host input without invoking the callback. A typed schema
+opens the shared inline editor instead; aliases and shortcuts do not infer
+positional fields or flatten structured values into text.
+Native `Plugin::execute_outcome` may return
 `ExecuteOutcome::ShowPage`; a hidden callback's page outcome presents only for a
 current, once-consumed deliberate shortcut intent. Late superseded outcomes never
 revive a dismissed launcher. Modern Python execution currently discards callback
@@ -241,7 +241,8 @@ retired preview producer cannot service deferred preview.
 
 Legacy, WASM and restricted C-ABI plugins do not gain a command callback through
 this transport. The host supplies alias/global-shortcut controls for explicit
-declarations; `commands_v1` does not add structured multi-field arguments.
+declarations; typed fields require independent `typed_arguments_v1` negotiation
+and an admitted executable schema, not `commands_v1` alone.
 
 Cancellation is cooperative, but display admission is not: a late suggestion
 from an obsolete query or dismissed launcher session is discarded even if its
@@ -253,6 +254,277 @@ not a delta. Declare configuration fields in the manifest's `[configuration]`
 section when schemas are supported, including type, default, validation,
 secret, restart, and platform metadata. Secrets are redacted by
 `crikey config`; never log them.
+
+## Typed root arguments and presentation
+
+PR7 extends the existing root list, not the custom-page protocol.
+`typed_arguments_v1` and `result_presentation_v1` are independently negotiated
+optional capabilities. `commands_v1` and `preview_v1` imply neither. Existing
+list-returning callbacks remain supported. Standard grid/detail/form routes
+and structured navigation are separate work; typed execution has no navigation
+outcome.
+
+Shared Core models live in `structured_arguments`, `result_presentation` and
+`content_accounting`. `ResultPresentation` carries sections, scopes, item
+memberships and `ExecutableSchemaBinding` values. One `ArgumentSchema` binds to
+an exact `ExecutableKey`: owner, item and optional action, not a label or
+arbitrary metadata. Resolve an omitted command action to its actual primary;
+`None` means genuinely actionless. Multiple commands may share that schema
+without sharing command identity.
+
+Catalog sidecars validate transactionally with the complete accepted owner
+catalog. Suggestion sidecars require the exact admitted generation and producing
+worker incarnation. Invalid references or duplicates grant no partial authority.
+Section headers are not executable rows. Presentation-only support does not
+authorize typed execution; schema bindings can exist without sections or scopes.
+The host owns selection and scope state. Its scope dropdown chooses All or one
+exact owner/source declaration; providers receive only their own selected scope.
+Scope changes retire old-generation publication before refresh, and other
+providers become nonapplicable without new Legacy callbacks. An unavailable
+restored scope remains unavailable until the user chooses another; it does not
+silently widen the query. Grouping stably partitions authoritative result order
+after command-alias prioritization and result limiting; headers never consume
+executable selection/scroll indexes.
+
+Submissions move live `ArgumentValues` through the existing foreground action
+queue/budgets, never flattening them into query, shell or legacy text. The
+expected canonical schema fingerprint must match the actual current physical
+worker before value delivery, including after healthy static-worker release.
+A mismatch is a fixed refusal. Dynamic targets require their original live
+producer; never regenerate suggestions to retarget an old submission. Keep SDK
+schema bindings even with an older host so schema-only targets refuse legacy
+execution rather than silently discarding fields.
+
+Catalog and suggestion bindings may coexist for the same executable with
+different schemas. Physical-worker admission checks the expected fingerprint
+against both current inventories; a suggestion does not shadow an exact
+canonical catalog binding.
+
+Python replaces catalog and suggestion execution inventories independently on
+successful terminal publication; unsuccessful publications grant no new authority.
+After a root schema is declared, legacy execution requires a currently
+published ordinary item/action. Retired typed targets cannot fall back to legacy
+execution. The 4,096-schema bound applies to current bindings, not every target
+ever seen by a worker.
+
+### Bounds, outcomes and privacy
+
+Schemas support Text, Password and Dropdown fields, required flags, placeholders
+and static validation guidance. Limits are 64 fields, 256 options per dropdown,
+8 KiB UTF-8 per text value, 256 bytes per identifier and a 256 KiB schema
+footprint. Presentation allows 128 sections, 128 scopes and 4,096 item
+memberships/schema bindings, within aggregate retention and existing transport
+limits. Decode budgets apply before allocation; post-construction validation
+alone is not allocation protection.
+
+`SubmissionOutcome` is `Completed`, `InvalidFields` or `Failed`. Field failures
+name unique current schema fields and only `Required`, `TooShort`, `TooLong`,
+`InvalidSelection` or `Rejected`. Guidance comes from the pre-submission schema,
+never callback text. Fixed global failures are `Unavailable`, `Denied`,
+`Cancelled`, `Timeout`, `Unsupported`, `Failed`, `SchemaMismatch`, `ResourceLimit`
+and `ProtocolViolation`.
+
+The Rust and Python runtimes skip typed callbacks whose request is already
+cancelled and report `Cancelled` if cancellation arrives during the callback,
+even if it returns normally. Cancellation does not roll back callback effects.
+
+Passwords have no representable defaults. They are masked live memory, excluded
+from nonsecret drafts, navigation snapshots, history, configuration and host
+diagnostics. Rust live values are move-only; ordinary buffer filling is best
+effort, not cryptographic erasure. Python immutable strings/runtime copies do
+not provide secure-memory guarantees. Do not log, return or retain values.
+
+Every typed submission marks its physical worker diagnostically sensitive before
+bytes enter a writer queue, even without password fields. The latch lasts until
+process exit: plugin logs, captured stdout/stderr, exception text, tracebacks and
+background diagnostics are suppressed, including later unrelated callbacks.
+Fixed-code host outcomes and cleanup remain. This is not a sandbox against
+deliberate file/network I/O or a promise about crash dumps/runtime erasure.
+
+| Runtime | Typed execution | Sections/scopes | Boundary |
+| --- | --- | --- | --- |
+| Native/Rust | Optional `typed_arguments_v1` | Optional `result_presentation_v1` | Independent capabilities; current source/schema check |
+| Modern Python | Optional `typed_arguments_v1` | Optional `result_presentation_v1` | Separate bounded JSON contract; frozen item submission |
+| Older Native/Modern | Only if negotiated | Only if negotiated | Ordinary operations remain; no synthetic fallback |
+| Legacy Python | No new callback | No new callback | Scheduling, arguments and textual aliases unchanged |
+| WASM | Not exposed | Not exposed | Native transport does not create a guest API |
+| Restricted C ABI | Not exposed | Not exposed | No ABI extension |
+
+Aliases and global shortcuts open the same inline schema; they do not map search
+text positionally. Typed commands cannot enroll as literal-query fallbacks;
+saved incompatible references remain manageable but unavailable. Typed execution
+never authorizes query-history collection. This matrix describes support, not
+graphical or cross-platform acceptance evidence.
+
+### Native author API and runnable worker
+
+Rust implements these `Plugin` methods (all callbacks run in the worker):
+
+```rust
+fn supports_typed_arguments(&self) -> bool;
+fn supports_result_presentation(&self) -> bool;
+fn catalog_presentation(
+    &mut self, context: &dyn PluginContext,
+) -> crikey_core::Result<crikey_core::result_presentation::ResultPresentation>;
+fn suggestion_presentation(
+    &mut self, query: &Query, context: &dyn PluginContext,
+) -> crikey_core::Result<crikey_core::result_presentation::ResultPresentation>;
+fn execute_typed(
+    &mut self, request: TypedExecuteRequest, context: &dyn PluginContext,
+) -> crikey_core::Result<SubmissionOutcome>;
+```
+
+Both support methods default to false. Presentation callbacks default to empty;
+typed execution defaults to Unsupported. Construct the shared Core structs;
+there is no separate typed-schema builder. `TypedExecuteRequest` owns `request`,
+`item`, optional `action`, `expected_fingerprint: [u8; 32]` and move-only `values`.
+`Query.selected_scope_id` is the optional exact scope ID. Presentation metadata
+callbacks precede the existing catalog/suggestion callbacks, including for old
+hosts so the SDK can refuse legacy execution of bound targets.
+
+The complete runnable implementation is
+[`crikey-conformance-plugin.rs`](../compatibility/native-conformance/src/bin/crikey-conformance-plugin.rs),
+mode `typed`. From the repository root, stage it on Linux as follows; these
+are author instructions, not a recorded execution:
+
+```sh
+cargo build --manifest-path compatibility/native-conformance/Cargo.toml \
+  --bin crikey-conformance-plugin
+demo=$(mktemp -d)
+mkdir -p "$demo/native/typed/bin"
+cp compatibility/native-conformance/target/debug/crikey-conformance-plugin \
+  "$demo/native/typed/bin/"
+printf 'typed\n' > "$demo/native/typed/conformance-mode"
+cat > "$demo/native/typed/crikey.toml" <<'TOML'
+manifest-version = 1
+[plugin]
+id = "dev.example.typed-native"
+name = "Typed Native Example"
+version = "1.0.0"
+runtime = "native"
+entrypoint.linux-x86_64 = "bin/crikey-conformance-plugin"
+api = ">=1.0,<2"
+TOML
+CRIKEY_NATIVE_PLUGIN_ROOTS="$demo/native" \
+CRIKEY_CONFIG_DIR="$demo/config" CRIKEY_STATE_DIR="$demo/state" \
+CRIKEY_DATA_DIR="$demo/data" CRIKEY_CACHE_DIR="$demo/cache" \
+cargo run -p crikey-cli --bin crikey-launcher
+```
+
+Use the matching entrypoint platform key/binary on another architecture.
+Search `Conformance secure login`. The catalog has actionless `typed-login`
+and `typed-action` with explicit action `signin`; suggestions use
+`typed-suggestion`. The Accounts section and Secure accounts scope accompany
+Username, Password and Region fields. Supply any nonempty username, password
+`conformance-secret`, and Local or Remote. A different password returns the
+fixed password-field Rejected outcome; successful submission updates worker
+session state without retaining the password. `typed-changed` changes schema
+guidance/fingerprint for stale-schema refusal exercises. With `commands_v1`,
+`secure-login` targets actionless `typed-login`; `secure-login-action` targets
+`typed-action` with action `signin`. Both forbid unstructured query arguments
+and support exercising schema-driven aliases and command shortcuts.
+
+### Runnable Modern Python author example
+
+Create `plugin.py` in a private package directory:
+
+```python
+from crikey_sdk import (
+    ArgumentSchema, Command, DropdownField, DropdownOption, FieldFailure, Item,
+    ItemPresentation, PasswordField, Plugin as BasePlugin, ResultPresentation,
+    SchemaBinding, Scope, Section, TextField, TypedOutcome,
+)
+
+SCHEMA = ArgumentSchema((
+    TextField(id="username", label="Username", required=True, max_bytes=256),
+    PasswordField(id="password", label="Password", required=True, max_bytes=256,
+                  guidance="Enter the example password"),
+    DropdownField(id="region", label="Region", required=True, default="local",
+                  options=(DropdownOption("local", "Local"),
+                           DropdownOption("remote", "Remote"))),
+))
+
+class Plugin(BasePlugin):
+    def supports_result_presentation(self):
+        return True
+
+    def build_catalog(self):
+        return [Item("login", "Python secure login", "example:login")]
+
+    def commands(self):
+        return [Command(command_id="login", label="Python secure login",
+                        item_id="login", argument_policy="forbidden")]
+
+    def catalog_presentation(self):
+        return ResultPresentation(
+            sections=(Section("accounts", "Accounts"),),
+            scopes=(Scope("secure", "Secure accounts"),),
+            items=(ItemPresentation("login", section="accounts",
+                                    scopes=("secure",)),),
+            schemas=(SchemaBinding("login", SCHEMA),),
+        )
+
+    def execute_typed(self, item, action_id, values):
+        password = values.get("password")
+        if password is None or password.value != "example-secret":
+            return TypedOutcome(failures=(FieldFailure("password", "rejected"),))
+        # Commit only nonsecret session state; never retain the live input.
+        self.account = (values.get("username").value, values.get("region").value)
+        return TypedOutcome()
+```
+
+Put this `crikey.toml` beside it:
+
+```toml
+manifest-version = 1
+[plugin]
+id = "dev.example.typed-python"
+name = "Typed Python Example"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "plugin:Plugin"
+[python]
+requires-python = ">=3.12"
+```
+
+Point `CRIKEY_MODERN_PLUGIN_ROOTS` at the package directory's **parent**, then
+launch `cargo run -p crikey-cli --bin crikey-launcher` from the repository root
+with private `CRIKEY_CONFIG_DIR`, `CRIKEY_STATE_DIR`, `CRIKEY_DATA_DIR` and
+`CRIKEY_CACHE_DIR` paths, as in the Native staging example. Use an interpreter
+matching the manifest (or the packaged runtime); development can select it with
+`CRIKEY_PYTHON`. Search `Python secure login`, enter a username, password
+`example-secret` and a region, then Run command. A wrong password returns only
+the fixed field failure and schema guidance; success stores the nonsecret
+account tuple in the worker. No external account service is contacted.
+
+Overriding `execute_typed(self, item, action_id, values)` negotiates typed
+support. Visual presentation separately requires
+`supports_result_presentation(self) -> bool` returning `True` (default `False`);
+overriding metadata callbacks alone does not opt in. This permits schema-only
+sidecars without visual support. Metadata callbacks still run for older hosts
+so the SDK retains schema bindings and refuses legacy execution.
+Execution and both metadata callbacks may be async; the support flag is
+synchronous. `TypedValues.get(field_id)` returns a
+redacted-repr `TypedValue` or `None`; its `.value` is sensitive plaintext even
+though repr is redacted. The callback receives the admitted frozen `Item`,
+not a new lookup by ID. `None` or `TypedOutcome()` means Completed.
+`suggestion_presentation(self, query)` supplies generation-local sidecars;
+`query.selected_scope_id` is the optional scope. Keep schemas for catalog and
+suggestion executables distinct where their actual bindings differ.
+For a declared typed command, keep the item's and declaration's legacy
+`argument_policy="forbidden"`; required typed fields belong to the schema.
+The typed path validates those fields independently of legacy free-form policy.
+The Python example declares `login` so its alias/global-shortcut controls can
+exercise that same schema, without allowing free-form execution.
+
+For regression exercises, the real worker package
+[`compatibility/test-plugins/modern-typed`](../compatibility/test-plugins/modern-typed/)
+also declares an actionless command and an explicit `submit` action, plus
+Local/Remote scopes. Copy it to a private plugin root; do not use real credentials.
+Name `reject` exercises fixed field refusal, and query `typed-scope-wait`
+holds suggestion work until cancellation. Name `leak` deliberately attempts to
+retain and emit the supplied password across later callbacks/threads to probe
+diagnostic suppression; it is adversarial test code, not an author pattern.
 
 ## Native/Rust lifecycle
 
@@ -828,10 +1100,9 @@ stops repainting is much harder to diagnose than one that never drew.
 
 ## Legacy compatibility
 
-A legacy plugin is a documented Keypirinha Python package loaded by the Legacy
-Compatibility Layer, usually a `.keypirinha-package`. Its callbacks are
-serialized per plugin instance. In the default `legacy-strict` profile, CriKey
-broadcasts the initial query, does not time-debounce, replaces pending obsolete
+A legacy plugin is an existing package loaded by the Legacy Compatibility Layer.
+Its callbacks are serialized per plugin instance. In the default `legacy-strict`
+profile, CriKey broadcasts the initial query, does not time-debounce, replaces pending obsolete
 work, sets `should_terminate()` for running obsolete callbacks, rejects stale
 results, disables dynamic cross-request caching, and does not impose a modern
 minimum query length or prefix gate. `set_suggestions()` publishes one complete

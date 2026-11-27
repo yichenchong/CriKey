@@ -20,6 +20,6 @@ pub use stream::{
 };
 pub use supervisor::{NativeSupervisor, SupervisorConfig};
 pub use worker::{
-    CancelHandle, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake, PluginResource,
-    ResourceKind, ResourceOutcome,
+    CancelHandle, ConfirmedTypedExecution, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake,
+    PluginResource, ResourceKind, ResourceOutcome, TypedPreparation,
 };

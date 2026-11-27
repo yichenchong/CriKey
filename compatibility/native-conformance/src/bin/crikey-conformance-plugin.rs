@@ -8,22 +8,29 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
-use crikey_native_protocol::message::{Envelope, Payload};
-use crikey_native_protocol::transport::{self, Transport};
-use crikey_native_protocol::{Endpoint, ProtocolError};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crikey_core::result_presentation::{
+    ExecutableSchemaBinding, ItemPresentation, ResultPresentation, Scope, ScopeId, Section, SectionId,
+};
+use crikey_core::structured_arguments::{
+    ArgumentField, ArgumentSchema, DropdownOption, ExecutableKey, FieldId, FieldKind, NonSecretValue,
+    OptionId, OwnedItem, StructuredValue, SubmissionFieldCode, SubmissionFieldFailure,
+};
 use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
+use crikey_native_protocol::message::{Envelope, Payload};
+use crikey_native_protocol::transport::{self, Transport};
+use crikey_native_protocol::{Endpoint, ProtocolError};
 use crikey_plugin_sdk::{
     serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder, PageCanvas,
     PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError,
     ServeConfig, SuggestionSink,
 };
+use crikey_plugin_sdk::{SubmissionFailureCode, SubmissionOutcome, TypedExecuteRequest};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
 const MODE_FILE: &str = "conformance-mode";
@@ -61,7 +68,10 @@ impl ObservedSilentTransport {
         }
         if matches!(envelope.payload, Some(Payload::Shutdown(_))) {
             fs::write(self.gate.join("shutdown"), std::process::id().to_string())
-                .and_then(|()| fs::write(self.gate.join("release"), b"real Shutdown received"))
+                .map_err(|error| ProtocolError::Io(error.to_string()))?;
+            // Older drivers close admission through Drop, not a stop ticket.
+            // Only receipt of the host's actual Shutdown releases the callback.
+            fs::write(self.gate.join("release"), b"real host Shutdown")
                 .map_err(|error| ProtocolError::Io(error.to_string()))?;
         }
         Ok(())
@@ -79,6 +89,15 @@ impl Transport for ObservedSilentTransport {
 
     fn recv(&mut self) -> std::result::Result<Envelope, ProtocolError> {
         let envelope = self.inner.recv()?;
+        self.observe(&envelope)?;
+        Ok(envelope)
+    }
+
+    fn recv_with_diagnostics(
+        &mut self,
+        sensitive: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<Envelope, ProtocolError> {
+        let envelope = self.inner.recv_with_diagnostics(sensitive)?;
         self.observe(&envelope)?;
         Ok(envelope)
     }
@@ -130,6 +149,11 @@ enum Mode {
     /// Publishes the interactive demo page and nothing else, so the surface a
     /// host draws is attributable to exactly one item.
     Page,
+    Typed {
+        changed: bool,
+    },
+    TypedPrivacy,
+    TypedInvalidFailure,
 }
 
 fn candidate(value: Option<String>) -> Option<String> {
@@ -164,6 +188,10 @@ fn parse_mode(spec: &str) -> Mode {
         "icon-gated" => Mode::IconGated,
         "icon-silent" => Mode::IconSilent,
         "page" => Mode::Page,
+        "typed" => Mode::Typed { changed: false },
+        "typed-changed" => Mode::Typed { changed: true },
+        "typed-privacy" => Mode::TypedPrivacy,
+        "typed-invalid-failure" => Mode::TypedInvalidFailure,
         "gated-ignore-cancel" => Mode::GatedIgnoreCancel,
         _ if spec.starts_with("stream:") => Mode::Stream(
             spec.strip_prefix("stream:")
@@ -226,6 +254,114 @@ fn catalog_items() -> Vec<crikey_core::Item> {
         item("catalog-1", "Conformance one", "conformance://one"),
         item("catalog-2", "Conformance two", "conformance://two"),
     ]
+}
+
+fn typed_schema(changed: bool) -> ArgumentSchema {
+    let field = |id: &str, label: &str, kind| ArgumentField {
+        id: FieldId(id.into()),
+        label: label.into(),
+        required: true,
+        placeholder: None,
+        validation_message: Some(
+            if changed {
+                "Re-enter current credentials"
+            } else {
+                "Enter valid credentials"
+            }
+            .into(),
+        ),
+        kind,
+    };
+    ArgumentSchema {
+        fields: vec![
+            field(
+                "username",
+                "Username",
+                FieldKind::Text {
+                    min_bytes: 1,
+                    max_bytes: 256,
+                    default: None,
+                    multiline: false,
+                },
+            ),
+            field(
+                "password",
+                "Password",
+                FieldKind::Password {
+                    min_bytes: 1,
+                    max_bytes: 256,
+                },
+            ),
+            field(
+                "region",
+                "Region",
+                FieldKind::Dropdown {
+                    options: vec![
+                        DropdownOption {
+                            id: OptionId("local".into()),
+                            label: "Local".into(),
+                        },
+                        DropdownOption {
+                            id: OptionId("remote".into()),
+                            label: "Remote".into(),
+                        },
+                    ],
+                    default: Some(OptionId("local".into())),
+                },
+            ),
+        ],
+    }
+}
+
+fn typed_item(id: &str) -> crikey_core::Item {
+    let builder = ItemBuilder::new(id, "Conformance secure login").target("conformance://login");
+    if id == "typed-action" {
+        builder
+            .action(ActionBuilder::new("signin", "Sign in").build())
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
+fn typed_presentation(context: &dyn PluginContext, changed: bool, suggestion: bool) -> ResultPresentation {
+    let ids: &[&str] = if suggestion {
+        &["typed-suggestion"]
+    } else {
+        &["typed-login", "typed-action"]
+    };
+    let schema = Arc::new(typed_schema(changed));
+    let mut presentation = ResultPresentation {
+        sections: vec![Section {
+            id: SectionId("accounts".into()),
+            label: "Accounts".into(),
+        }],
+        scopes: vec![Scope {
+            id: ScopeId("secure".into()),
+            label: "Secure accounts".into(),
+        }],
+        ..Default::default()
+    };
+    for id in ids {
+        let target = OwnedItem {
+            owner: context.plugin_id().clone(),
+            item: crikey_core::ItemId((*id).into()),
+        };
+        presentation.items.push(ItemPresentation {
+            target: target.clone(),
+            section: Some(SectionId("accounts".into())),
+            scopes: vec![ScopeId("secure".into())],
+            image: None,
+        });
+        presentation.schemas.push(ExecutableSchemaBinding {
+            executable: ExecutableKey {
+                target,
+                action: (*id == "typed-action").then(|| crikey_core::ActionId("signin".into())),
+            },
+            schema: Arc::clone(&schema),
+        });
+    }
+    presentation
 }
 
 fn catalog_stream_items(count: usize) -> Vec<crikey_core::Item> {
@@ -629,6 +765,8 @@ struct ConformancePlugin {
     /// because a page is a conversation: the host asks for frame after frame
     /// and nothing it sends carries the page's own content back.
     page: PageState,
+    /// Deliberately hostile diagnostic retention, only in typed-privacy mode.
+    diagnostic_secret: Option<crikey_core::structured_arguments::Password>,
 }
 
 impl ConformancePlugin {
@@ -636,6 +774,7 @@ impl ConformancePlugin {
         Self {
             mode,
             page: PageState::default(),
+            diagnostic_secret: None,
         }
     }
 
@@ -774,9 +913,130 @@ fn crash(reason: &str) -> ! {
     std::process::abort();
 }
 
+fn hostile_private_diagnostics(
+    context: &dyn PluginContext,
+    secret: &crikey_core::structured_arguments::Password,
+) {
+    context.log(crikey_plugin_sdk::LogLevel::Error, secret.expose_plaintext());
+    eprintln!("{}", secret.expose_plaintext());
+    let _ = std::io::stderr().flush();
+    thread::scope(|scope| {
+        let _ = scope.spawn(|| panic!("{}", secret.expose_plaintext())).join();
+    });
+}
+
 impl Plugin for ConformancePlugin {
+    fn supports_typed_arguments(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Typed { .. } | Mode::TypedPrivacy | Mode::TypedInvalidFailure
+        )
+    }
+    fn supports_result_presentation(&self) -> bool {
+        self.supports_typed_arguments()
+    }
+    fn catalog_presentation(&mut self, context: &dyn PluginContext) -> Result<ResultPresentation> {
+        Ok(match self.mode {
+            Mode::Typed { changed } => typed_presentation(context, changed, false),
+            Mode::TypedPrivacy | Mode::TypedInvalidFailure => typed_presentation(context, false, false),
+            _ => ResultPresentation::default(),
+        })
+    }
+    fn suggestion_presentation(
+        &mut self,
+        query: &Query,
+        context: &dyn PluginContext,
+    ) -> Result<ResultPresentation> {
+        Ok(match self.mode {
+            Mode::TypedPrivacy | Mode::TypedInvalidFailure
+                if query.selected_scope_id.as_deref().is_none_or(|s| s == "secure") =>
+            {
+                typed_presentation(context, false, true)
+            }
+            Mode::Typed { changed } if query.selected_scope_id.as_deref().is_none_or(|s| s == "secure") => {
+                if query.text == "catalog-overlap" {
+                    typed_presentation(context, !changed, false)
+                } else {
+                    typed_presentation(context, changed, true)
+                }
+            }
+            _ => ResultPresentation::default(),
+        })
+    }
+    fn execute_typed(
+        &mut self,
+        mut request: TypedExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<SubmissionOutcome> {
+        if !self.supports_typed_arguments() {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported));
+        }
+        if context.cancellation().is_cancelled() {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled));
+        }
+        let valid_target = match request.item.0.as_str() {
+            "typed-login" | "typed-suggestion" => request.action.is_none(),
+            "typed-action" => request.action.as_ref().is_some_and(|a| a.0 == "signin"),
+            _ => false,
+        };
+        if !valid_target {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+        }
+        if matches!(self.mode, Mode::TypedPrivacy) {
+            let Some(StructuredValue::Password(secret)) =
+                request.values.0.remove(&FieldId("password".into()))
+            else {
+                return Ok(SubmissionOutcome::Failed(
+                    SubmissionFailureCode::ProtocolViolation,
+                ));
+            };
+            hostile_private_diagnostics(context, &secret);
+            self.diagnostic_secret = Some(secret);
+            return Err(invalid(
+                self.diagnostic_secret.as_ref().unwrap().expose_plaintext(),
+            ));
+        }
+        if matches!(self.mode, Mode::TypedInvalidFailure) {
+            return Ok(SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
+                field: FieldId("hostile-unknown-field".into()),
+                code: SubmissionFieldCode::Rejected,
+            }]));
+        }
+        let username = match request.values.0.get(&FieldId("username".into())) {
+            Some(StructuredValue::NonSecret(NonSecretValue::Text(value))) => value,
+            _ => {
+                return Ok(SubmissionOutcome::Failed(
+                    SubmissionFailureCode::ProtocolViolation,
+                ))
+            }
+        };
+        let region = match request.values.0.get(&FieldId("region".into())) {
+            Some(StructuredValue::NonSecret(NonSecretValue::Dropdown(value)))
+                if value.0 == "local" || value.0 == "remote" =>
+            {
+                value
+            }
+            _ => {
+                return Ok(SubmissionOutcome::Failed(
+                    SubmissionFailureCode::ProtocolViolation,
+                ))
+            }
+        };
+        let accepted = matches!(request.values.0.get(&FieldId("password".into())),
+            Some(StructuredValue::Password(value)) if value.expose_plaintext() == "conformance-secret");
+        if !accepted {
+            return Ok(SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
+                field: FieldId("password".into()),
+                code: SubmissionFieldCode::Rejected,
+            }]));
+        }
+        // Real session state changes only after authentication, without retaining a password.
+        self.page.note = format!("{username}@{}", region.0);
+        self.page.counter += 1;
+        Ok(SubmissionOutcome::Completed)
+    }
     fn supports_commands(&self) -> bool {
-        matches!(self.mode, Mode::Acceptance)
+        matches!(self.mode, Mode::Acceptance) || self.supports_typed_arguments()
     }
 
     fn commands(&mut self, context: &dyn PluginContext) -> Result<crikey_plugin_sdk::PluginCommands> {
@@ -785,6 +1045,19 @@ impl Plugin for ConformancePlugin {
         }
         if !self.supports_commands() {
             return Ok(crikey_plugin_sdk::PluginCommands::Unsupported);
+        }
+        if self.supports_typed_arguments() {
+            return Ok(crikey_plugin_sdk::PluginCommands::Declarations(vec![
+                crikey_plugin_sdk::CommandBuilder::new("secure-login", "Secure login", "typed-login")
+                    .build()?,
+                crikey_plugin_sdk::CommandBuilder::new(
+                    "secure-login-action",
+                    "Secure login action",
+                    "typed-action",
+                )
+                .action("signin")
+                .build()?,
+            ]));
         }
         Ok(crikey_plugin_sdk::PluginCommands::Declarations(vec![
             crikey_plugin_sdk::CommandBuilder::new("conformance-one", "Conformance one", "catalog-1")
@@ -815,6 +1088,9 @@ impl Plugin for ConformancePlugin {
 
         let items = match self.mode {
             Mode::EnvWitness => environment_items(),
+            Mode::Typed { .. } | Mode::TypedPrivacy | Mode::TypedInvalidFailure => {
+                vec![typed_item("typed-login"), typed_item("typed-action")]
+            }
             // Deliberately empty. The page item is a suggestion, and
             // publishing the same stable id in the catalog as well makes the
             // aggregator treat the suggestion as a duplicate of a catalog row
@@ -833,6 +1109,12 @@ impl Plugin for ConformancePlugin {
         context: &dyn PluginContext,
         sink: &mut dyn SuggestionSink,
     ) -> Result<()> {
+        if matches!(self.mode, Mode::TypedPrivacy) {
+            if let Some(secret) = &self.diagnostic_secret {
+                hostile_private_diagnostics(context, secret);
+                return Err(invalid(secret.expose_plaintext()));
+            }
+        }
         match self.mode.clone() {
             Mode::Echo | Mode::SameId => self.suggest_echo(query, sink),
             Mode::EnvWitness => emit_final(sink, environment_items()),
@@ -854,6 +1136,18 @@ impl Plugin for ConformancePlugin {
                 vec![icon_item(&format!("icon-never-{}", query.generation), ICON_NEVER)],
             ),
             Mode::Page => emit_final(sink, vec![page_item()]),
+            Mode::Typed { .. } | Mode::TypedPrivacy | Mode::TypedInvalidFailure => emit_final(
+                sink,
+                if query.selected_scope_id.as_deref().is_none_or(|s| s == "secure") {
+                    if matches!(self.mode, Mode::Typed { .. }) && query.text == "catalog-overlap" {
+                        vec![typed_item("typed-login"), typed_item("typed-action")]
+                    } else {
+                        vec![typed_item("typed-suggestion")]
+                    }
+                } else {
+                    Vec::new()
+                },
+            ),
         }
     }
 
@@ -990,9 +1284,9 @@ fn run() -> Result<(), SdkError> {
         let mut children = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("icon-children")
-            .expect("child startup record is writable");
-        writeln!(children, "{}", std::process::id()).expect("child PID is writable");
+            .open("icon-child-pids")
+            .expect("per-package child receipt is writable");
+        writeln!(children, "{}", std::process::id()).expect("child PID receipt is writable");
     }
     if matches!(mode, Mode::IconGated) {
         // Installed only after the eager query child is running. Thus the
@@ -1033,12 +1327,12 @@ fn run() -> Result<(), SdkError> {
     config.capabilities.streaming_suggestions = true;
     config.capabilities.cancellation = true;
     let mut plugin = ConformancePlugin::new(mode);
-    let observer_gate = match plugin.mode {
-        Mode::IconSilent => Some("icon-silent-gate"),
-        Mode::IconGated => Some("icon-startup-gate"),
-        _ => None,
-    };
-    if let Some(gate_file) = observer_gate {
+    if matches!(plugin.mode, Mode::IconSilent | Mode::IconGated) {
+        let gate_file = if matches!(plugin.mode, Mode::IconGated) {
+            "icon-startup-gate"
+        } else {
+            "icon-silent-gate"
+        };
         if let Ok(path) = fs::read_to_string(gate_file) {
             let endpoint = config
                 .endpoint
@@ -1083,6 +1377,70 @@ mod tests {
     use super::*;
     use crikey_core::{NodeRole, PageColor};
     use crikey_plugin_sdk::PagePalette;
+
+    #[test]
+    fn typed_login_authenticates_before_retaining_nonsecret_session_state() {
+        use crikey_core::structured_arguments::{ArgumentValues, Password};
+        let mut plugin = ConformancePlugin::new(Mode::Typed { changed: false });
+        let context = TestContext;
+        let make_request = |password: &str, action: bool| {
+            let mut values = ArgumentValues::default();
+            values.0.insert(
+                FieldId("username".into()),
+                StructuredValue::NonSecret(NonSecretValue::Text("alice".into())),
+            );
+            values.0.insert(
+                FieldId("password".into()),
+                StructuredValue::Password(Password::new(password.into()).unwrap()),
+            );
+            values.0.insert(
+                FieldId("region".into()),
+                StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId("remote".into()))),
+            );
+            TypedExecuteRequest {
+                request: crikey_plugin_sdk::protocol::RequestId(1),
+                item: crikey_core::ItemId(if action { "typed-action" } else { "typed-login" }.into()),
+                action: action.then(|| crikey_core::ActionId("signin".into())),
+                expected_fingerprint: typed_schema(false).fingerprint().unwrap(),
+                values,
+            }
+        };
+        assert!(matches!(
+            plugin
+                .execute_typed(make_request("wrong", false), &context)
+                .unwrap(),
+            SubmissionOutcome::InvalidFields(_)
+        ));
+        assert_eq!(plugin.page.counter, 0);
+        assert!(plugin.page.note.is_empty());
+        assert_eq!(
+            plugin
+                .execute_typed(make_request("conformance-secret", false), &context)
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        assert_eq!(plugin.page.counter, 1);
+        assert_eq!(plugin.page.note, "alice@remote");
+        assert_eq!(
+            plugin
+                .execute_typed(make_request("conformance-secret", true), &context)
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        assert_eq!(plugin.page.counter, 2);
+        assert_ne!(
+            typed_schema(false).fingerprint().unwrap(),
+            typed_schema(true).fingerprint().unwrap()
+        );
+        let presentation = plugin.catalog_presentation(&context).unwrap();
+        assert_eq!(presentation.sections[0].id.0, "accounts");
+        assert_eq!(presentation.scopes[0].id.0, "secure");
+        assert!(presentation.schemas[0].executable.action.is_none());
+        assert_eq!(
+            presentation.schemas[1].executable.action.as_ref().unwrap().0,
+            "signin"
+        );
+    }
 
     fn request(generation: u64) -> PageRequest {
         PageRequest {

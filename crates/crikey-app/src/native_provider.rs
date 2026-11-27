@@ -31,6 +31,19 @@
 //! asynchronous job with the generation submitted by the UI and refuses a
 //! superseded answer before publishing it, so stale native rows never cross the
 //! presentation boundary (spec 8.1; acceptance 31.7).
+//!
+//! # Typed root publications
+//!
+//! Complete catalog and suggestion sidecars enter the shared source ledger as
+//! one validated transaction. Typed execution uses the existing foreground
+//! mailbox with move-only values and never authorizes query history. Canonical
+//! catalogs may reacquire a worker, whose transport confirms its current schema;
+//! suggestions retain their exact execution generation and producing connection,
+//! while a selected scope may outlive that generation on the same live producer.
+//! Worker schema discovery precedes final source, cancellation, and deadline
+//! admission; only confirmed execution may then move values into transport.
+//! Owner-qualified scopes are captured at query admission, never broadened when
+//! their declaration is unavailable.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -42,11 +55,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::plugin_action::{
+    RootExecutableBinding, RootPresentationSnapshot, RootSource, RootSourceLedger, SharedOriginItems,
+};
 use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate, PreviewCancellation};
+use crate::query_pipeline::ProviderQueryContext;
 use crikey_core::command::{
     validate_plugin_commands, CommandAvailability, CommandDeclaration, PluginCommands, MAX_COMMANDS,
     MAX_COMMAND_BYTES,
 };
+use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PageInput, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
@@ -72,9 +90,6 @@ use crate::{
 /// directory that supplied it. The source directory is intentionally part of
 /// the key: two packages sharing an entrypoint still own separate processes.
 type WorkerKey = (String, String);
-
-/// Shared item snapshots paired with their producing worker connection identifier.
-type NativeItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>;
 
 /// UI preview readers only inspect this snapshot. Background lifecycle polling
 /// updates idle workers as well as workers completing a query/action/preview.
@@ -396,15 +411,28 @@ struct NativeCatalogTask {
 /// same capacity never blocks a worker that is completing a legal task.
 #[derive(Debug)]
 struct NativeCatalogDispatcher {
-    result_tx: SyncSender<(u64, CatalogBuildResult, u64, NativeCommandSnapshot)>,
-    result_rx: Receiver<(u64, CatalogBuildResult, u64, NativeCommandSnapshot)>,
+    result_tx: SyncSender<(
+        u64,
+        CatalogBuildResult,
+        u64,
+        NativeCommandSnapshot,
+        ResultPresentation,
+    )>,
+    result_rx: Receiver<(
+        u64,
+        CatalogBuildResult,
+        u64,
+        NativeCommandSnapshot,
+        ResultPresentation,
+    )>,
     tasks: BTreeMap<u64, NativeCatalogTask>,
     commands: Arc<Mutex<NativeCommandPublications>>,
     incarnations: NativeIncarnations,
     next_id: u64,
-    items: NativeItemStore,
+    items: SharedOriginItems,
     /// Canonical targets whose healthy static catalog producer was released.
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    ledger: Arc<Mutex<RootSourceLedger>>,
 }
 
 impl Default for NativeCatalogDispatcher {
@@ -419,6 +447,7 @@ impl Default for NativeCatalogDispatcher {
             next_id: 0,
             items: Arc::new(Mutex::new(BTreeMap::new())),
             static_items: Arc::new(Mutex::new(BTreeMap::new())),
+            ledger: Arc::default(),
         }
     }
 }
@@ -443,7 +472,7 @@ impl NativeCatalogDispatcher {
 
     fn take(&mut self) -> Vec<CatalogBuildResult> {
         let mut ready = Vec::new();
-        while let Ok((id, result, incarnation, mut commands)) = self.result_rx.try_recv() {
+        while let Ok((id, result, incarnation, mut commands, presentation)) = self.result_rx.try_recv() {
             let Some(mut task) = self.tasks.remove(&id) else {
                 continue;
             };
@@ -479,11 +508,41 @@ impl NativeCatalogDispatcher {
                 let observed = incarnations.observed.get(&commands.plugin).copied();
                 if commands.status == NativeCommandStatus::Ready
                     && commands.producer != 0
-                    && (observed != Some(commands.producer)
-                        || (!commands.released && current != Some(commands.producer)))
+                    && !commands.released
+                    && (observed != Some(commands.producer) || current != Some(commands.producer))
                 {
                     commands.status = NativeCommandStatus::Stale;
                     commands.declarations = Arc::from([]);
+                }
+                if let CatalogBuildResult::Complete(build) = &result {
+                    let source = RootSource::Catalog(crate::plugin_action::DeclaredCommandSource {
+                        instance: commands.instance,
+                        generation: commands.generation,
+                        producer: commands.producer,
+                        publication: publications.revision.saturating_add(1),
+                    });
+                    let mut ledger = self.ledger.lock().unwrap_or_else(|error| error.into_inner());
+                    if matches!(
+                        commands.status,
+                        NativeCommandStatus::Ready | NativeCommandStatus::Unsupported
+                    ) {
+                        if ledger
+                            .publish(build.plugin.clone(), source, &build.items, presentation)
+                            .is_err()
+                        {
+                            ledger.invalidate(&build.plugin);
+                            commands.status =
+                                NativeCommandStatus::Invalid("invalid native presentation".into());
+                            commands.declarations = Arc::from([]);
+                        }
+                    } else {
+                        ledger.invalidate(&build.plugin);
+                    }
+                } else {
+                    self.ledger
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .invalidate(&commands.plugin);
                 }
                 publications.publish(commands);
             }
@@ -610,6 +669,8 @@ impl PreviewCancellation for CallControl {
 struct NativeCancellation {
     calls: Mutex<BTreeMap<(u64, PluginId), Arc<CallControl>>>,
     newest_job: AtomicU64,
+    #[cfg(test)]
+    publication_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
 }
 
 impl NativeCancellation {
@@ -666,6 +727,7 @@ impl NativeCancellation {
 struct ProducedSuggestions {
     suggestions: Suggestions,
     incarnation: u64,
+    generation: Generation,
 }
 
 #[derive(Debug)]
@@ -945,7 +1007,7 @@ pub struct NativeProvider {
     catalog_declarations: BTreeMap<PluginId, bool>,
     /// Current suggestion snapshots and their producing worker connection,
     /// published together before their rows enter the query pipeline.
-    action_items: NativeItemStore,
+    action_items: SharedOriginItems,
     incarnations: NativeIncarnations,
     collection_window: Duration,
     /// Answers taken off the completion channel that have not been published
@@ -960,6 +1022,7 @@ pub struct NativeProvider {
     pending: BTreeMap<PluginId, Generation>,
     /// UI submission identity and its independently minted pipeline generation.
     binding: Option<(Generation, Generation)>,
+    scope: Option<crate::plugin_action::RootScope>,
 }
 
 /// How long one query waits for native workers before presenting what arrived.
@@ -1013,6 +1076,7 @@ impl NativeProvider {
             late: Vec::new(),
             pending: BTreeMap::new(),
             binding: None,
+            scope: None,
         };
         provider.catalog.incarnations = Arc::clone(&provider.incarnations);
 
@@ -1477,6 +1541,7 @@ impl NativeProvider {
                             let incarnation = worker.connection_id();
                             let supports_preview = worker.handshake().preview;
                             let mut items = worker.build_catalog_with_timeout_ms(NATIVE_CALL_TIMEOUT_MS)?;
+                            let presentation = worker.catalog_presentation().cloned().unwrap_or_default();
                             for item in &mut items {
                                 item.plugin_id = plugin_for_thread.clone();
                             }
@@ -1484,10 +1549,10 @@ impl NativeProvider {
                             // its complete catalog; no other call can replace it.
                             let commands =
                                 native_commands(&plugin_for_thread, &items, worker.commands(request_id));
-                            Ok((items, incarnation, supports_preview, commands))
+                            Ok((items, incarnation, supports_preview, commands, presentation))
                         })
                         .map_err(|error| bounded_command_error(error.to_string()));
-                    let keep_origin = result.as_ref().is_ok_and(|(items, _, supported, _)| {
+                    let keep_origin = result.as_ref().is_ok_and(|(items, _, supported, _, _)| {
                         *supported
                             && items.iter().any(|item| {
                                 item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")
@@ -1499,7 +1564,7 @@ impl NativeProvider {
                         supervisor.release_worker(&plugin_for_thread, native_policy_now());
                         refresh_incarnation(&mut supervisor, &plugin_for_thread, &incarnations);
                     }
-                    result.map(|(items, incarnation, _, commands)| {
+                    result.map(|(items, incarnation, _, commands, presentation)| {
                         (
                             items,
                             if keep_origin { incarnation } else { 0 },
@@ -1513,6 +1578,7 @@ impl NativeProvider {
                                 status: commands.0,
                                 declarations: commands.1,
                             },
+                            presentation,
                         )
                     })
                 }));
@@ -1520,7 +1586,7 @@ impl NativeProvider {
                     .as_ref()
                     .ok()
                     .and_then(|result| result.as_ref().ok())
-                    .map_or(0, |(_, incarnation, _)| *incarnation);
+                    .map_or(0, |(_, incarnation, _, _)| *incarnation);
                 let mut commands = NativeCommandSnapshot {
                     plugin: thread_plugin.clone(),
                     revision: 0,
@@ -1531,8 +1597,10 @@ impl NativeProvider {
                     status: NativeCommandStatus::Failed("native catalog worker panicked".into()),
                     declarations: Arc::from([]),
                 };
+                let mut presentation = ResultPresentation::default();
                 let completion = match result {
-                    Ok(Ok((items, _, declaration_snapshot))) => {
+                    Ok(Ok((items, _, declaration_snapshot, sidecar))) => {
+                        presentation = sidecar;
                         commands = declaration_snapshot;
                         CatalogBuildResult::Complete(crate::CatalogBuild {
                             plugin: plugin_for_thread,
@@ -1558,7 +1626,7 @@ impl NativeProvider {
                         reason: "native catalog worker panicked".to_owned(),
                     },
                 };
-                let _ = sender.send((request_id, completion, incarnation, commands));
+                let _ = sender.send((request_id, completion, incarnation, commands, presentation));
                 drop(guard);
             })
             .map_err(|error| CatalogDispatchError::ThreadSpawn {
@@ -1588,6 +1656,11 @@ impl NativeProvider {
     pub fn invalidate_commands(&mut self, plugin: &PluginId) {
         self.catalog
             .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalidate(plugin);
+        self.catalog
+            .ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .invalidate(plugin);
@@ -1633,7 +1706,10 @@ impl NativeProvider {
 
     /// Validates and executes one admitted plugin action on the exact native
     /// worker that owns the item's plugin id.
-    fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<ActionEffect> {
+    fn execute_action_request(
+        &mut self,
+        mut request: NativeActionRequest,
+    ) -> crikey_core::Result<ActionEffect> {
         let _guard = request.admission.acquire(request.deadline, &request.cancelled)?;
         let plugin = request.plugin;
         // Admission froze both validation and privacy evidence for this item.
@@ -1657,6 +1733,90 @@ impl NativeProvider {
                 ))
             })?;
         request.work.validate(item, request.argument.as_deref())?;
+        if let Some(binding) = request.work.typed_binding().cloned() {
+            if self
+                .catalog
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .frozen_item(&binding)
+                .is_none()
+            {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed native source retired".into(),
+                ));
+            }
+            let supervisor =
+                self.pool.supervisors.get(&loaded.key).cloned().ok_or_else(|| {
+                    crikey_core::CoreError::Invalid("typed native worker unavailable".into())
+                })?;
+            let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+            let mut execute = |worker: &mut crikey_native_host::NativeWorker| {
+                // Physical-worker schema discovery can block (including a
+                // released static catalog's healthy reacquisition). Complete
+                // it before the final provider-side admission checks so no
+                // submitted values cross a retired authority boundary.
+                let confirmed = match worker.prepare_typed_execution(
+                    &item.stable_id,
+                    binding.executable.action.as_ref(),
+                    binding.fingerprint,
+                )? {
+                    crikey_native_host::TypedPreparation::Ready(confirmed) => confirmed,
+                    crikey_native_host::TypedPreparation::Refused(code) => {
+                        return Ok(crikey_core::structured_arguments::SubmissionOutcome::Failed(code));
+                    }
+                };
+                if self
+                    .catalog
+                    .ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .frozen_item(&binding)
+                    .is_none()
+                {
+                    return Err(HostError::PluginFailed {
+                        plugin: plugin.clone(),
+                        detail: "typed source retired".into(),
+                    });
+                }
+                if let RootSource::Suggestion { generation, .. } = &binding.source {
+                    if request.current_generation.load(Ordering::Acquire) != generation.get() {
+                        return Err(HostError::PluginFailed {
+                            plugin: plugin.clone(),
+                            detail: "typed generation retired".into(),
+                        });
+                    }
+                }
+                if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
+                    return Err(HostError::PluginFailed {
+                        plugin: plugin.clone(),
+                        detail: "typed execution cancelled".into(),
+                    });
+                }
+                let values = request
+                    .work
+                    .take_typed_values()
+                    .expect("typed work owns submitted values");
+                worker.execute_typed_confirmed(confirmed, values)
+            };
+            let outcome = if let Some(origin) = request.origin {
+                refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
+                let worker = supervisor
+                    .live_worker(&plugin)
+                    .filter(|worker| worker.connection_id() == origin)
+                    .ok_or_else(|| {
+                        crikey_core::CoreError::Invalid("typed native producing worker retired".into())
+                    })?;
+                let outcome = execute(worker);
+                refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
+                outcome
+            } else {
+                with_native_worker(&mut supervisor, &plugin, &self.incarnations, execute)
+            };
+            return outcome
+                .map(ActionEffect::Typed)
+                .map_err(|_| crikey_core::CoreError::Invalid("typed native execution failed".into()));
+        }
         let validate_command = || -> crikey_core::Result<()> {
             if let Some((declaration, source)) = request.work.command_source() {
                 let publications = self
@@ -1843,7 +2003,12 @@ impl NativeProvider {
         now: Millis,
         job: Option<Generation>,
     ) -> Option<ViewModel> {
-        let generation = pipeline.keystroke(query, now);
+        self.catalog
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire_suggestions();
+        let generation = pipeline.keystroke_scoped(query, now, self.scope.clone());
         self.action_items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1935,6 +2100,11 @@ impl NativeProvider {
             .unwrap_or_else(|error| error.into_inner());
         for plugin in &self.plugins {
             publications.invalidate(plugin);
+            self.catalog
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .invalidate(plugin);
         }
         drop(publications);
         self.pool.shutdown();
@@ -1971,6 +2141,7 @@ impl NativeProvider {
             text: query.to_owned(),
             normalized: query.to_owned(),
             selected_item_id: None,
+            selected_scope_id: self.scope.as_ref().map(|scope| scope.id.0.clone()),
         };
         let targets: Vec<(PluginId, WorkerKey, Duration)> = self
             .loaded
@@ -1998,6 +2169,8 @@ impl NativeProvider {
             let request_for_thread = request.clone();
             let plugin_for_thread = plugin.clone();
             let incarnations = Arc::clone(&self.incarnations);
+            let scope = self.scope.clone();
+            let ledger = Arc::clone(&self.catalog.ledger);
             self.pool
                 .cancellation
                 .register(job, plugin.clone(), Arc::clone(&control));
@@ -2007,7 +2180,33 @@ impl NativeProvider {
                     let mut soft_timeout_elapsed = false;
                     let result = {
                         let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
-                        with_native_worker(&mut supervisor, &plugin_for_thread, &incarnations, |worker| {
+                        let mut suggest = |worker: &mut crikey_native_host::NativeWorker| {
+                            if let Some(scope) = &scope {
+                                let current = ledger
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .scope_current(scope)
+                                    && match &scope.source {
+                                        RootSource::Suggestion { producer, .. } => {
+                                            worker.connection_id() == *producer
+                                        }
+                                        RootSource::Catalog(_) => true,
+                                    };
+                                if !current {
+                                    return Err(HostError::PluginFailed {
+                                        plugin: plugin_for_thread.clone(),
+                                        detail: "native scope retired".into(),
+                                    });
+                                }
+                            }
+                            if request_for_thread.selected_scope_id.is_some()
+                                && !worker.handshake().result_presentation
+                            {
+                                return Err(HostError::PluginFailed {
+                                    plugin: plugin_for_thread.clone(),
+                                    detail: "native scoped queries unsupported".into(),
+                                });
+                            }
                             control_for_thread.install(worker.cancel_handle());
                             let watch_control = Arc::clone(&control_for_thread);
                             let watcher = thread::Builder::new()
@@ -2021,6 +2220,7 @@ impl NativeProvider {
                                     .map(|suggestions| ProducedSuggestions {
                                         suggestions,
                                         incarnation,
+                                        generation: Generation::from_raw(job),
                                     });
                             soft_timeout_elapsed = started.elapsed() > soft_timeout;
                             control_for_thread.finish();
@@ -2028,7 +2228,24 @@ impl NativeProvider {
                                 let _ = watcher.join();
                             }
                             result
-                        })
+                        };
+                        if matches!(
+                            scope.as_ref().map(|scope| &scope.source),
+                            Some(RootSource::Suggestion { .. })
+                        ) {
+                            refresh_incarnation(&mut supervisor, &plugin_for_thread, &incarnations);
+                            let result = match supervisor.live_worker(&plugin_for_thread) {
+                                Some(worker) => suggest(worker),
+                                None => Err(HostError::PluginFailed {
+                                    plugin: plugin_for_thread.clone(),
+                                    detail: "native scope producer retired".into(),
+                                }),
+                            };
+                            refresh_incarnation(&mut supervisor, &plugin_for_thread, &incarnations);
+                            result
+                        } else {
+                            with_native_worker(&mut supervisor, &plugin_for_thread, &incarnations, suggest)
+                        }
                     };
                     let _ = sender.send(DispatchResult {
                         generation: generation_value,
@@ -2198,6 +2415,7 @@ impl NativeProvider {
             Ok(ProducedSuggestions {
                 suggestions,
                 incarnation,
+                generation,
             }) => {
                 if let Some(output) = output {
                     let mut items = suggestions.items;
@@ -2205,6 +2423,47 @@ impl NativeProvider {
                     // namespace by changing the stable item's owner.
                     for item in &mut items {
                         item.plugin_id = plugin.clone();
+                    }
+                    let presentation = suggestions.presentation.unwrap_or_default();
+                    #[cfg(test)]
+                    let publication_pause = self
+                        .pool
+                        .cancellation
+                        .publication_pause
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    #[cfg(test)]
+                    if let Some((entered, resume)) = publication_pause {
+                        entered.send(()).unwrap();
+                        resume.recv().unwrap();
+                    }
+                    let mut ledger = self
+                        .catalog
+                        .ledger
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    // Shared with intake retirement: an old physical callback
+                    // cannot restore declarations after All cleared capture.
+                    if generation.get() != self.pool.cancellation.newest_job.load(Ordering::Acquire) {
+                        output.insert(plugin, Vec::new());
+                        return false;
+                    }
+                    let publication = ledger.publish(
+                        plugin.clone(),
+                        RootSource::Suggestion {
+                            generation,
+                            producer: incarnation,
+                        },
+                        &items,
+                        presentation,
+                    );
+                    drop(ledger);
+                    if publication.is_err() {
+                        output.insert(plugin, Vec::new());
+                        return true;
+                    }
+                    for item in &items {
                         self.action_items
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -2257,6 +2516,7 @@ struct NativeJob {
     builtin_rows: Vec<ResultRow>,
     builtin_pending: bool,
     selected: usize,
+    scope: Option<crate::plugin_action::RootScope>,
 }
 
 /// Single-slot replace-oldest mailbox for native queries.
@@ -2301,6 +2561,7 @@ struct NativeActionRequest {
     admission: ForegroundActionAdmission,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    current_generation: Arc<AtomicU64>,
 }
 
 enum NativeWork {
@@ -2358,10 +2619,12 @@ struct NativeActionEndpoint {
     sender: SyncSender<NativeActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
-    items: NativeItemStore,
-    catalog_items: NativeItemStore,
+    items: SharedOriginItems,
+    catalog_items: SharedOriginItems,
     static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     commands: Arc<Mutex<NativeCommandPublications>>,
+    ledger: Arc<Mutex<RootSourceLedger>>,
+    current_generation: Arc<AtomicU64>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
@@ -2392,6 +2655,27 @@ impl NativeActionEndpoint {
         argument: Option<&str>,
         query_history_allowed: bool,
     ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
+        if work.typed_binding().is_none() {
+            let key = crikey_core::structured_arguments::ExecutableKey {
+                target: crikey_core::structured_arguments::OwnedItem {
+                    owner: plugin.clone(),
+                    item: item.stable_id.clone(),
+                },
+                action: work.action_id().cloned(),
+            };
+            let canonical = work.command_source().map(|(_, source)| source);
+            if self
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .binding(&key, canonical)
+                .is_some()
+            {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed arguments are required".into(),
+                ));
+            }
+        }
         let reserved = self
             .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2445,6 +2729,7 @@ impl NativeActionEndpoint {
             admission,
             deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
             cancelled,
+            current_generation: Arc::clone(&self.current_generation),
         };
         if let Err(error) = self.sender.try_send(request) {
             self.pending
@@ -2472,6 +2757,126 @@ impl NativeActionEndpoint {
 }
 
 impl crate::PluginActionExecutor for NativeActionEndpoint {
+    fn root_binding(
+        &self,
+        key: &crikey_core::structured_arguments::ExecutableKey,
+        canonical: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<RootExecutableBinding> {
+        let binding = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .binding(key, canonical)?;
+        if let RootSource::Suggestion { generation, producer } = &binding.source {
+            if self.current_generation.load(Ordering::Acquire) != generation.get() {
+                return None;
+            }
+            if self
+                .incarnations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&key.target.owner)
+                != Some(producer)
+            {
+                return None;
+            }
+        }
+        Some(binding)
+    }
+
+    fn root_presentations(&self) -> Vec<RootPresentationSnapshot> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| match &snapshot.source {
+                RootSource::Catalog(_) => true,
+                RootSource::Suggestion { generation, producer } => {
+                    self.current_generation.load(Ordering::Acquire) == generation.get()
+                        && self
+                            .incarnations
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(&snapshot.owner)
+                            == Some(producer)
+                }
+            })
+            .collect()
+    }
+
+    fn root_scope_current(&self, scope: &crate::plugin_action::RootScope) -> bool {
+        if !self.page_supervisors.contains_key(&scope.owner) {
+            return false;
+        }
+        {
+            let ledger = self.ledger.lock().unwrap_or_else(|error| error.into_inner());
+            if !ledger.scope_current(scope) {
+                return false;
+            }
+            if let RootSource::Suggestion { generation, .. } = &scope.source {
+                if !ledger.scope_captured(scope)
+                    && self.current_generation.load(Ordering::Acquire) != generation.get()
+                {
+                    return false;
+                }
+            }
+        }
+        match &scope.source {
+            RootSource::Catalog(_) => true,
+            RootSource::Suggestion { producer, .. } => {
+                self.incarnations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&scope.owner)
+                    == Some(producer)
+            }
+        }
+    }
+
+    fn submit_typed(
+        &self,
+        binding: &RootExecutableBinding,
+        values: crikey_core::structured_arguments::ArgumentValues,
+    ) -> crikey_core::Result<crate::plugin_action::TypedActionReceipt> {
+        let item = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .frozen_item(binding)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("typed native source retired".into()))?;
+        let origin = match &binding.source {
+            RootSource::Catalog(_) => None,
+            RootSource::Suggestion { generation, producer } => {
+                if self.current_generation.load(Ordering::Acquire) != generation.get() {
+                    return Err(crikey_core::CoreError::Invalid(
+                        "typed native generation retired".into(),
+                    ));
+                }
+                if self
+                    .incarnations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&item.plugin_id)
+                    != Some(producer)
+                {
+                    return Err(crikey_core::CoreError::Invalid(
+                        "typed native producing worker retired".into(),
+                    ));
+                }
+                Some(*producer)
+            }
+        };
+        let work = crate::plugin_action::AdmittedPluginWork::Typed {
+            binding: binding.clone(),
+            values,
+        };
+        work.validate(&item, None)?;
+        let queued = item.clone();
+        let receipt = self.enqueue(&item.plugin_id, queued, origin, work, None, false)?;
+        Ok(crate::plugin_action::TypedActionReceipt { receipt, item })
+    }
+
     fn submit_declared_command_with_receipt(
         &self,
         declaration: &CommandDeclaration,
@@ -2912,6 +3317,8 @@ impl NativeDriver {
             catalog_items: Arc::clone(&provider.catalog.items),
             static_catalog_items: Arc::clone(&provider.catalog.static_items),
             commands: Arc::clone(&provider.catalog.commands),
+            ledger: Arc::clone(&provider.catalog.ledger),
+            current_generation: Arc::clone(&current),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -3181,6 +3588,7 @@ impl NativeDriver {
                     last_now = job.now.max(clock_now.saturating_add(elapsed));
                     clock_now = last_now;
                     clock_origin = Instant::now();
+                    provider.scope = job.scope.clone();
 
                     thread_busy.store(true, Ordering::Release);
                     let native =
@@ -3309,6 +3717,11 @@ impl NativeDriver {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .invalidate(plugin);
+        self.action_endpoint
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalidate(plugin);
     }
 
     /// Submits a query without waiting for a native child. Older generations
@@ -3323,31 +3736,86 @@ impl NativeDriver {
         builtin_pending: bool,
         selected: usize,
     ) {
-        let generation_value = generation.get();
-        let mut observed = self.current.load(Ordering::Acquire);
-        loop {
-            if generation_value < observed {
-                return;
-            }
-            match self.current.compare_exchange_weak(
-                observed,
-                generation_value,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(next) => observed = next,
-            }
-        }
+        let context = ProviderQueryContext {
+            generation,
+            text: query,
+            now,
+            selected,
+        };
+        let _ = self.submit_inner(context, builtin, builtin_pending, None);
+    }
 
-        // Latch cancellation immediately at intake, rather than waiting for
-        // the provider thread to finish its current blocking call.
-        self.cancellation.cancel_before(generation_value);
+    /// Captures an exact declared owner scope; unavailable restoration never widens to All.
+    pub fn submit_scoped(
+        &self,
+        context: ProviderQueryContext<'_>,
+        builtin: Vec<ResultRow>,
+        builtin_pending: bool,
+        scope: Option<crate::plugin_action::RootScope>,
+    ) -> crikey_core::Result<()> {
+        self.submit_inner(context, builtin, builtin_pending, scope)
+    }
+
+    fn submit_inner(
+        &self,
+        context: ProviderQueryContext<'_>,
+        builtin: Vec<ResultRow>,
+        builtin_pending: bool,
+        scope: Option<crate::plugin_action::RootScope>,
+    ) -> crikey_core::Result<()> {
+        let ProviderQueryContext {
+            generation,
+            text: query,
+            now,
+            selected,
+        } = context;
+        let generation_value = generation.get();
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
-            return;
+            return Err(crikey_core::CoreError::Cancelled);
         }
+        let mut ledger = self
+            .action_endpoint
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Admission, capture, and retirement share terminal publication's
+        // ledger lock. A discarded older query cannot replace the chosen scope.
+        let observed = self.current.load(Ordering::Acquire);
+        if generation_value < observed {
+            return Ok(());
+        }
+        let owned_scope = scope
+            .as_ref()
+            .filter(|scope| self.permissions.contains_key(&scope.owner));
+        if let Some(scope) = owned_scope {
+            let live = match &scope.source {
+                RootSource::Catalog(_) => true,
+                RootSource::Suggestion { generation, producer } => {
+                    (ledger.scope_captured(scope) || generation.get() == observed)
+                        && self
+                            .action_endpoint
+                            .incarnations
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(&scope.owner)
+                            == Some(producer)
+                }
+            };
+            if !live || !ledger.scope_current(scope) {
+                return Err(crikey_core::CoreError::Invalid(
+                    "native scope is unavailable".into(),
+                ));
+            }
+        }
+        // All submissions serialize on the ledger, including foreign-runtime
+        // scopes, which remain nonapplicable but still retire prior native work.
+        self.current.store(generation_value, Ordering::Release);
+        ledger.capture_scope(owned_scope);
+        self.cancellation.cancel_before(generation_value);
+        ledger.retire_suggestions();
+        drop(ledger);
         let state = if self.worker.is_some() {
             crate::command_preferences::OrdinaryProviderState::Pending
         } else {
@@ -3364,6 +3832,7 @@ impl NativeDriver {
                     .query_policies
                     .iter()
                     .filter(|(_, policy)| policy.query_applicable(query))
+                    .filter(|(plugin, _)| scope.as_ref().is_none_or(|scope| scope.owner == **plugin))
                     .map(|(plugin, _)| crate::query_pipeline::OrdinarySearchProvider {
                         plugin: plugin.clone(),
                         state,
@@ -3380,9 +3849,11 @@ impl NativeDriver {
             builtin_rows: builtin,
             builtin_pending,
             selected,
+            scope,
         });
         drop(slot);
         cvar.notify_one();
+        Ok(())
     }
 
     /// Hands the supervisor thread one complete configuration state to publish
@@ -3528,6 +3999,88 @@ mod query_history_receipt_tests {
     use crate::PluginActionExecutor;
     use crikey_core::{ArgumentPolicy, ExecutionPolicy};
 
+    #[test]
+    fn typed_queue_preserves_source_privacy_and_foreground_handoff() {
+        use crikey_core::result_presentation::ExecutableSchemaBinding;
+        use crikey_core::structured_arguments::*;
+        let item = item();
+        let (endpoint, receiver) = endpoint(item.clone());
+        endpoint.current_generation.store(9, Ordering::Release);
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: item.plugin_id.clone(),
+                item: item.stable_id.clone(),
+            },
+            action: Some(item.actions[0].action_id.clone()),
+        };
+        let schema = Arc::new(ArgumentSchema {
+            fields: vec![ArgumentField {
+                id: FieldId("password".into()),
+                label: "Password".into(),
+                required: true,
+                placeholder: None,
+                validation_message: None,
+                kind: FieldKind::Password {
+                    min_bytes: 1,
+                    max_bytes: 128,
+                },
+            }],
+        });
+        endpoint
+            .ledger
+            .lock()
+            .unwrap()
+            .publish(
+                item.plugin_id.clone(),
+                RootSource::Suggestion {
+                    generation: Generation::from_raw(9),
+                    producer: 1,
+                },
+                &[item.clone()],
+                ResultPresentation {
+                    schemas: vec![ExecutableSchemaBinding {
+                        executable: key.clone(),
+                        schema,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let binding = endpoint.root_binding(&key, None).unwrap();
+        assert!(endpoint
+            .submit_plugin_action_by_id_with_receipt(
+                &item.plugin_id,
+                &item.stable_id,
+                &item.actions[0].action_id,
+                None
+            )
+            .is_err());
+        let control = Arc::new(CallControl::new());
+        let gate = &endpoint.gates[&item.plugin_id];
+        let preview = gate.try_preview(control.clone()).unwrap();
+        let values = ArgumentValues(BTreeMap::from([(
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new("private-native-value".into()).unwrap()),
+        )]));
+        let receipt = endpoint.submit_typed(&binding, values).unwrap();
+        assert!(!receipt.receipt.query_history_allowed);
+        assert!(control.requested.load(Ordering::Acquire));
+        let request = receiver.try_recv().unwrap();
+        assert_eq!(receipt.item.stable_id, request.item.stable_id);
+        assert_eq!(receipt.item.label, request.item.label);
+        assert!(!format!("{request:?}").contains("private-native-value"));
+        assert_eq!(request.origin, Some(1));
+        assert!(request.argument.is_none());
+        assert!(request.work.typed_binding().is_some());
+        endpoint.current_generation.store(10, Ordering::Release);
+        assert!(endpoint.root_binding(&key, None).is_none());
+        assert!(endpoint
+            .submit_typed(&binding, ArgumentValues::default())
+            .is_err());
+        drop(preview);
+        drop(request);
+    }
+
     fn item() -> Item {
         Item {
             stable_id: ItemId("shared".into()),
@@ -3654,6 +4207,8 @@ mod query_history_receipt_tests {
                 catalog_items: Arc::default(),
                 static_catalog_items: Arc::default(),
                 commands: Arc::default(),
+                ledger: Arc::default(),
+                current_generation: Arc::default(),
                 pending: Arc::default(),
                 in_flight: Arc::default(),
                 next_id: Arc::default(),
@@ -3830,6 +4385,400 @@ mod query_history_receipt_tests {
             })
         });
         BINARY.as_path()
+    }
+
+    fn typed_fixture_binary() -> &'static Path {
+        static BINARY: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let target = root.join("target/native-conformance");
+            let output = std::process::Command::new("cargo")
+                .arg("build")
+                .arg("--bin")
+                .arg("typed-admission-fixture")
+                .arg("--manifest-path")
+                .arg(root.join("compatibility/native-conformance/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target)
+                .output()
+                .expect("build real typed fixture");
+            assert!(
+                output.status.success(),
+                "typed fixture build failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target.join("debug").join(if cfg!(windows) {
+                "typed-admission-fixture.exe"
+            } else {
+                "typed-admission-fixture"
+            })
+        });
+        BINARY.as_path()
+    }
+
+    #[test]
+    fn real_scope_admission_rejects_old_capture_and_late_publication_after_all() {
+        use crikey_core::result_presentation::ScopeId;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "crikey-native-scope-intake-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        let fixture = ProcessFixture(root);
+        let package = fixture.0.join("typed");
+        fs::create_dir(&package).unwrap();
+        let executable = if cfg!(windows) { "worker.exe" } else { "worker" };
+        fs::copy(typed_fixture_binary(), package.join(executable)).unwrap();
+        fs::write(package.join("crikey.toml"), format!(
+            "manifest-version = 1\n[plugin]\nid = \"typed\"\nname = \"Typed\"\nversion = \"1.0.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n[performance]\nstartup = \"lazy\"\nsuggest-hard-timeout-ms = 20000\n"
+        )).unwrap();
+        let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+        let provider = NativeProvider::load(&mut pipeline, &[fixture.0.clone()], &DisabledPlugins::default());
+        assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+        let owner = provider.loaded[0].plugin.clone();
+        let cancellation = Arc::clone(&provider.pool.cancellation);
+        let ledger = Arc::clone(&provider.catalog.ledger);
+        let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+        let executor = driver.action_executor();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let wait_publication = |expected: u64| loop {
+            if let Some(snapshot) = executor.root_presentations().into_iter().find(|snapshot| {
+                    matches!(&snapshot.source, RootSource::Suggestion { generation, .. } if generation.get() == expected)
+                }) { break snapshot.source; }
+            assert!(
+                Instant::now() < deadline,
+                "real scope publication {expected} did not arrive"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        driver.submit(Generation::from_raw(1), "scopes", 0, Vec::new(), false, 0);
+        let first = wait_publication(1);
+        let selected = crate::plugin_action::RootScope {
+            owner: owner.clone(),
+            id: ScopeId("private".into()),
+            source: first,
+        };
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(2),
+                    text: "scopes",
+                    now: 1,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(selected.clone()),
+            )
+            .unwrap();
+        let fresh = wait_publication(2);
+        let competing = crate::plugin_action::RootScope {
+            owner: owner.clone(),
+            id: ScopeId("other".into()),
+            source: fresh.clone(),
+        };
+        assert!(executor.root_scope_current(&competing));
+        // This declaration is real/current, but its enclosing delayed query
+        // is not admitted and must not replace the already selected token.
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(1),
+                    text: "discarded",
+                    now: 2,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(competing.clone()),
+            )
+            .unwrap();
+        assert!(executor.root_scope_current(&selected));
+        assert!(ledger.lock().unwrap().scope_captured(&selected));
+        assert!(!ledger.lock().unwrap().scope_captured(&competing));
+        assert_eq!(driver.current.load(Ordering::Acquire), 2);
+
+        let (entered_old_tx, entered_old) = mpsc::sync_channel(1);
+        let (resume_old, resume_old_rx) = mpsc::sync_channel(1);
+        *cancellation.publication_pause.lock().unwrap() = Some((entered_old_tx, resume_old_rx));
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(3),
+                    text: "scopes",
+                    now: 3,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(selected.clone()),
+            )
+            .unwrap();
+        entered_old
+            .recv_timeout(Duration::from_secs(60))
+            .expect("real old callback reached publication");
+        let (entered_new_tx, entered_new) = mpsc::sync_channel(1);
+        let (resume_new, resume_new_rx) = mpsc::sync_channel(1);
+        *cancellation.publication_pause.lock().unwrap() = Some((entered_new_tx, resume_new_rx));
+        driver.submit(Generation::from_raw(4), "all", 4, Vec::new(), false, 0);
+        assert!(!executor.root_scope_current(&selected));
+        resume_old.send(()).unwrap();
+        entered_new
+            .recv_timeout(Duration::from_secs(60))
+            .expect("real All callback reached publication");
+        // Old callback has now drained, but the new result is still held.
+        // There must be no resurrected executable/declaration sidecar.
+        assert!(ledger
+            .lock()
+            .unwrap()
+            .snapshots()
+            .iter()
+            .all(|snapshot| !matches!(&snapshot.source, RootSource::Suggestion { .. })));
+        let producer = match fresh {
+            RootSource::Suggestion { producer, .. } => producer,
+            _ => unreachable!(),
+        };
+        let revoked = crate::plugin_action::RootScope {
+            owner,
+            id: ScopeId("private".into()),
+            source: RootSource::Suggestion {
+                generation: Generation::from_raw(3),
+                producer,
+            },
+        };
+        assert!(!executor.root_scope_current(&revoked));
+        assert!(driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(5),
+                    text: "revoked",
+                    now: 5,
+                    selected: 0
+                },
+                Vec::new(),
+                false,
+                Some(revoked)
+            )
+            .is_err());
+        assert_eq!(driver.current.load(Ordering::Acquire), 4);
+        resume_new.send(()).unwrap();
+        wait_publication(4);
+        assert!(!executor.root_scope_current(&selected));
+    }
+
+    #[test]
+    fn released_catalog_survives_replacement_worker_before_publication() {
+        use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "crikey-native-static-publication-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        let fixture = ProcessFixture(root);
+        let package = fixture.0.join("typed");
+        fs::create_dir(&package).unwrap();
+        let executable = if cfg!(windows) { "worker.exe" } else { "worker" };
+        fs::copy(typed_fixture_binary(), package.join(executable)).unwrap();
+        fs::write(package.join("crikey.toml"), format!(
+            "manifest-version = 1\n[plugin]\nid = \"typed\"\nname = \"Typed\"\nversion = \"1.0.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n[performance]\nstartup = \"lazy\"\n"
+        )).unwrap();
+        let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+        let mut provider =
+            NativeProvider::load(&mut pipeline, &[fixture.0.clone()], &DisabledPlugins::default());
+        assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+        let owner = provider.loaded[0].plugin.clone();
+        let key = provider.loaded[0].key.clone();
+        provider
+            .request_catalog_build(&owner, 1, Generation::ZERO)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // Keep the completed catalog in its real mailbox while a later call
+        // obtains a different physical worker. Do not drain publication early.
+        while !provider
+            .catalog
+            .tasks
+            .values()
+            .all(|task| task.join.as_ref().unwrap().is_finished())
+        {
+            assert!(Instant::now() < deadline, "real catalog worker did not finish");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let producer = {
+            let incarnations = provider.incarnations.lock().unwrap();
+            assert!(
+                incarnations.get(&owner).is_none(),
+                "static producer was healthily released"
+            );
+            *incarnations.observed.get(&owner).unwrap()
+        };
+        let supervisor = Arc::clone(provider.pool.supervisors.get(&key).unwrap());
+        let replacement = with_native_worker(
+            &mut supervisor.lock().unwrap(),
+            &owner,
+            &provider.incarnations,
+            |worker| Ok(worker.connection_id()),
+        )
+        .unwrap();
+        assert_ne!(producer, replacement);
+        let results = provider.take_catalog_results();
+        assert!(matches!(results.as_slice(), [CatalogBuildResult::Complete(_)]));
+        let commands = provider.command_snapshot(&owner).unwrap();
+        assert_eq!(commands.status, NativeCommandStatus::Ready);
+        assert!(commands.released);
+        assert_eq!(commands.producer, producer);
+        assert_eq!(commands.declarations.len(), 1);
+        let ledger = provider.catalog.ledger.lock().unwrap();
+        let binding = ledger
+            .binding(
+                &ExecutableKey {
+                    target: OwnedItem {
+                        owner: owner.clone(),
+                        item: ItemId("typed-login".into()),
+                    },
+                    action: None,
+                },
+                None,
+            )
+            .expect("released catalog retains its typed schema");
+        assert!(ledger.frozen_item(&binding).is_some());
+        let snapshots = ledger.snapshots();
+        assert!(snapshots.iter().any(|snapshot| snapshot.owner == owner
+            && snapshot
+                .presentation
+                .sections
+                .iter()
+                .any(|section| section.id.0 == "accounts")
+            && snapshot
+                .presentation
+                .scopes
+                .iter()
+                .any(|scope| scope.id.0 == "private")));
+    }
+
+    #[test]
+    fn typed_discovery_rechecks_source_cancellation_and_deadline_before_delivery() {
+        use crikey_core::structured_arguments::*;
+        for revoke in ["source", "cancel", "deadline", "current"] {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "crikey-native-typed-discovery-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&root).unwrap();
+            let fixture = ProcessFixture(root);
+            let package = fixture.0.join("typed");
+            fs::create_dir(&package).unwrap();
+            let executable = if cfg!(windows) { "worker.exe" } else { "worker" };
+            fs::copy(typed_fixture_binary(), package.join(executable)).unwrap();
+            fs::write(package.join("crikey.toml"), format!(
+                "manifest-version = 1\n[plugin]\nid = \"typed\"\nname = \"Typed\"\nversion = \"1.0.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n[performance]\nstartup = \"lazy\"\nsuggest-hard-timeout-ms = 20000\n"
+            )).unwrap();
+            let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+            let mut provider =
+                NativeProvider::load(&mut pipeline, &[fixture.0.clone()], &DisabledPlugins::default());
+            assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+            let owner = provider.loaded[0].plugin.clone();
+            provider
+                .request_catalog_build(&owner, 1, Generation::ZERO)
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(60);
+            let build = loop {
+                if let Some(result) = provider.take_catalog_results().into_iter().next() {
+                    match result {
+                        CatalogBuildResult::Complete(build) => break build,
+                        other => panic!("typed catalog failed: {other:?}"),
+                    }
+                }
+                assert!(Instant::now() < end, "typed catalog never completed");
+                thread::sleep(Duration::from_millis(2));
+            };
+            assert!(
+                provider.incarnations.lock().unwrap().get(&owner).is_none(),
+                "the replacement must perform its own schema discovery"
+            );
+            let item = build
+                .items
+                .iter()
+                .find(|item| item.stable_id.0 == "typed-login")
+                .unwrap()
+                .clone();
+            let (mut endpoint, receiver) = endpoint(item.clone());
+            endpoint.ledger = Arc::clone(&provider.catalog.ledger);
+            endpoint.incarnations = Arc::clone(&provider.incarnations);
+            endpoint.gates = provider.action_gates();
+            let key = ExecutableKey {
+                target: OwnedItem {
+                    owner: owner.clone(),
+                    item: item.stable_id.clone(),
+                },
+                action: None,
+            };
+            let binding = endpoint.root_binding(&key, None).unwrap();
+            let values = ArgumentValues(BTreeMap::from([(
+                FieldId("password".into()),
+                StructuredValue::Password(Password::new("private-discovery-secret".into()).unwrap()),
+            )]));
+            endpoint.submit_typed(&binding, values).unwrap();
+            let mut request = receiver.try_recv().unwrap();
+            // Keep startup outside the deadline interval: enter discovery on
+            // an already acquired healthy replacement worker.
+            {
+                let supervisor = provider.pool.supervisors.get(&provider.loaded[0].key).unwrap();
+                let mut supervisor = supervisor.lock().unwrap();
+                with_native_worker(&mut supervisor, &owner, &provider.incarnations, |_| Ok(())).unwrap();
+            }
+            request.deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = request.deadline;
+            let cancelled = Arc::clone(&request.cancelled);
+            let ledger = Arc::clone(&provider.catalog.ledger);
+            fs::write(package.join("typed-discovery-hold"), "").unwrap();
+            thread::scope(|scope| {
+                let execution = scope.spawn(|| provider.execute_action_request(request));
+                while !package.join("typed-discovery-entered").exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "discovery must enter before revocation/deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                match revoke {
+                    "source" => {
+                        ledger.lock().unwrap().invalidate(&owner);
+                    }
+                    "cancel" => cancelled.store(true, Ordering::Release),
+                    "deadline" => thread::sleep(deadline.saturating_duration_since(Instant::now())),
+                    "current" => {}
+                    _ => unreachable!(),
+                }
+                fs::write(package.join("typed-discovery-release"), "").unwrap();
+                let outcome = execution.join().unwrap();
+                if revoke == "current" {
+                    assert!(matches!(
+                        outcome,
+                        Ok(ActionEffect::Typed(SubmissionOutcome::Completed))
+                    ));
+                } else {
+                    assert!(outcome.is_err(), "{revoke} must refuse delivery");
+                }
+            });
+            // Reap the real transport before inspecting both independent
+            // witnesses; SDK rejection alone cannot satisfy this assertion.
+            provider.shutdown(0);
+            assert_eq!(
+                package.join("typed-received").exists(),
+                revoke == "current",
+                "{revoke}: raw physical transport receipt"
+            );
+            assert_eq!(
+                package.join("typed-executed").exists(),
+                revoke == "current",
+                "{revoke}: typed callback admission"
+            );
+        }
     }
 
     #[test]

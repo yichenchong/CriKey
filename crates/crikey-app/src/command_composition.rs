@@ -125,7 +125,286 @@ impl<'a> CommandCompositionContext<'a> {
     }
 }
 
+pub fn root_publication_identity(source: &crate::RootSource) -> crikey_ui::PublicationIdentity {
+    match source {
+        crate::RootSource::Catalog(source) => crikey_ui::PublicationIdentity::Catalog {
+            instance: source.instance,
+            generation: source.generation,
+            producer: source.producer,
+            publication: source.publication,
+        },
+        crate::RootSource::Suggestion { generation, producer } => {
+            crikey_ui::PublicationIdentity::Suggestion {
+                generation: *generation,
+                producer: *producer,
+            }
+        }
+    }
+}
+fn root_source_from_identity(identity: &crikey_ui::PublicationIdentity) -> crate::RootSource {
+    match identity {
+        crikey_ui::PublicationIdentity::Catalog {
+            instance,
+            generation,
+            producer,
+            publication,
+        } => crate::RootSource::Catalog(crate::DeclaredCommandSource {
+            instance: *instance,
+            generation: *generation,
+            producer: *producer,
+            publication: *publication,
+        }),
+        crikey_ui::PublicationIdentity::Suggestion { generation, producer } => {
+            crate::RootSource::Suggestion {
+                generation: *generation,
+                producer: *producer,
+            }
+        }
+    }
+}
+pub fn root_scope_from_identity(identity: &crikey_ui::ScopeIdentity) -> crate::RootScope {
+    crate::RootScope {
+        owner: identity.owner.clone(),
+        id: identity.id.clone(),
+        source: root_source_from_identity(&identity.source),
+    }
+}
+
 impl SearchService {
+    pub fn root_inline_binding(
+        &self,
+        input: &crikey_ui::InlineArguments,
+    ) -> Option<crate::RootExecutableBinding> {
+        let binding = if let Some((reference, revision)) = &input.command {
+            self.check_command_revision(*revision).ok()?;
+            let command = self.command_registry.resolve(reference)?;
+            let item = declared_catalog_item(&self.catalog, &command.declaration)?;
+            if item.plugin_id != input.executable.target.owner
+                || item.stable_id != input.executable.target.item
+            {
+                return None;
+            }
+            let source = self
+                .command_sources
+                .accepted
+                .get(&reference.provider_id)?
+                .source
+                .as_ref()?;
+            self.plugin_actions
+                .as_ref()?
+                .root_binding(&input.executable, Some(source))?
+        } else {
+            let source = root_source_from_identity(&input.source);
+            let canonical = match &source {
+                crate::RootSource::Catalog(source) => Some(source),
+                _ => None,
+            };
+            self.plugin_actions
+                .as_ref()?
+                .root_binding(&input.executable, canonical)?
+        };
+        (binding.executable == input.executable
+            && root_publication_identity(&binding.source) == input.source
+            && binding.fingerprint == input.fingerprint)
+            .then_some(binding)
+    }
+    pub fn root_presentations(&self) -> Vec<crate::RootPresentationSnapshot> {
+        self.plugin_actions
+            .as_ref()
+            .map_or_else(Vec::new, |router| router.root_presentations())
+    }
+    pub fn root_scope_choices(&self) -> Vec<crikey_ui::ScopeChoice> {
+        self.root_presentations()
+            .into_iter()
+            .flat_map(|snapshot| {
+                let source = root_publication_identity(&snapshot.source);
+                snapshot
+                    .presentation
+                    .scopes
+                    .iter()
+                    .map(|scope| crikey_ui::ScopeChoice {
+                        identity: crikey_ui::ScopeIdentity {
+                            owner: snapshot.owner.clone(),
+                            id: scope.id.clone(),
+                            source: source.clone(),
+                        },
+                        label: format!("{} — {}", snapshot.owner.0, scope.label),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+    pub fn resolve_root_scope(&self, identity: &crikey_ui::ScopeIdentity) -> Option<crate::RootScope> {
+        let scope = root_scope_from_identity(identity);
+        self.plugin_actions
+            .as_ref()?
+            .root_scope_current(&scope)
+            .then_some(scope)
+    }
+    pub fn project_root_rows(
+        &self,
+        mut rows: Vec<ResultRow>,
+        scope: Option<&crikey_ui::ScopeIdentity>,
+        limit: Option<usize>,
+    ) -> (Vec<ResultRow>, Vec<crikey_ui::SectionHeader>) {
+        let snapshots = self.root_presentations();
+        let membership = |row: &ResultRow| {
+            let source = row.source.as_ref()?;
+            let canonical = match source.kind {
+                ResultSourceKind::DeclaredCatalog { epoch } => {
+                    Some(self.declared_catalog_source(&source.owner, epoch)?)
+                }
+                ResultSourceKind::Ordinary => None,
+            };
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.owner == source.owner)
+                .filter(|snapshot| {
+                    canonical.is_none_or(|canonical| {
+                        snapshot.source == crate::RootSource::Catalog(canonical.clone())
+                    })
+                })
+                .filter_map(|snapshot| {
+                    snapshot
+                        .presentation
+                        .items
+                        .iter()
+                        .find(|item| item.target.item == source.item)
+                        .map(|item| (snapshot, item))
+                })
+                .max_by_key(|(snapshot, _)| matches!(snapshot.source, crate::RootSource::Suggestion { .. }))
+        };
+        if let Some(scope) = scope {
+            let current = self.resolve_root_scope(scope).is_some();
+            rows.retain(|row| {
+                membership(row).is_some_and(|(snapshot, item)| {
+                    let producer_matches = match &scope.source {
+                        crikey_ui::PublicationIdentity::Suggestion { producer, .. } => match &snapshot.source
+                        {
+                            crate::RootSource::Suggestion {
+                                producer: current, ..
+                            } => current == producer,
+                            crate::RootSource::Catalog(source) => source.producer == *producer,
+                        },
+                        crikey_ui::PublicationIdentity::Catalog { .. } => true,
+                    };
+                    current
+                        && producer_matches
+                        && snapshot.owner == scope.owner
+                        && item.scopes.contains(&scope.id)
+                })
+            });
+        }
+        rows.truncate(limit.unwrap_or(usize::MAX));
+        type SectionKey<'a> = (
+            &'a PluginId,
+            &'a crikey_core::result_presentation::SectionId,
+            &'a String,
+        );
+        let mut groups: Vec<(Option<SectionKey<'_>>, Vec<ResultRow>)> = Vec::new();
+        for row in rows {
+            let group = membership(&row).and_then(|(snapshot, item)| {
+                let id = item.section.as_ref()?;
+                let section = snapshot
+                    .presentation
+                    .sections
+                    .iter()
+                    .find(|section| &section.id == id)?;
+                Some((&snapshot.owner, id, &section.label))
+            });
+            if let Some((_, rows)) = groups.iter_mut().find(|(key, _)| *key == group) {
+                rows.push(row);
+            } else {
+                groups.push((group, vec![row]));
+            }
+        }
+        let mut rows = Vec::new();
+        let mut headers = Vec::new();
+        for (group, members) in groups {
+            if let Some((owner, id, label)) = group {
+                headers.push(crikey_ui::SectionHeader {
+                    row: rows.len(),
+                    owner: owner.clone(),
+                    id: id.clone(),
+                    label: label.clone(),
+                });
+            }
+            rows.extend(members);
+        }
+        (rows, headers)
+    }
+    pub fn root_command_binding(
+        &self,
+        reference: &CommandRef,
+        revision: u64,
+    ) -> Result<Option<crate::RootExecutableBinding>, CommandInvokeError> {
+        self.check_command_revision(revision)?;
+        let command = self
+            .command_registry
+            .resolve(reference)
+            .ok_or(CommandInvokeError::Unavailable)?;
+        let ExecutableTarget::Item { action_id, .. } = &command.declaration.executable_target else {
+            return Ok(None);
+        };
+        let item = declared_catalog_item(&self.catalog, &command.declaration)
+            .ok_or(CommandInvokeError::Unavailable)?;
+        let source = self
+            .command_sources
+            .accepted
+            .get(&reference.provider_id)
+            .and_then(|catalog| catalog.source.as_ref())
+            .ok_or(CommandInvokeError::Unavailable)?;
+        let key = crikey_core::structured_arguments::ExecutableKey {
+            target: crikey_core::structured_arguments::OwnedItem {
+                owner: item.plugin_id.clone(),
+                item: item.stable_id.clone(),
+            },
+            action: action_id
+                .clone()
+                .or_else(|| item.actions.first().map(|action| action.action_id.clone())),
+        };
+        Ok(self
+            .plugin_actions
+            .as_ref()
+            .and_then(|router| router.root_binding(&key, Some(source))))
+    }
+    pub fn root_result_binding(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        action: Option<&crikey_core::ActionId>,
+        source: Option<&ResultSource>,
+    ) -> Option<crate::RootExecutableBinding> {
+        let key = crikey_core::structured_arguments::ExecutableKey {
+            target: crikey_core::structured_arguments::OwnedItem {
+                owner: owner.clone(),
+                item: item.clone(),
+            },
+            action: action.cloned(),
+        };
+        let canonical = match source.map(|source| source.kind) {
+            Some(ResultSourceKind::DeclaredCatalog { epoch }) => {
+                Some(self.declared_catalog_source(owner, epoch)?)
+            }
+            _ => None,
+        };
+        self.plugin_actions.as_ref()?.root_binding(&key, canonical)
+    }
+    pub fn submit_root_typed(
+        &self,
+        binding: &crate::RootExecutableBinding,
+        values: crikey_core::structured_arguments::ArgumentValues,
+    ) -> crikey_core::Result<crate::TypedActionReceipt> {
+        if self.command_admission_paused {
+            return Err(crikey_core::CoreError::Invalid(
+                "typed admission unavailable".into(),
+            ));
+        }
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("typed admission unavailable".into()))?
+            .submit_typed(binding, values)
+    }
     pub fn command_snapshot(&self) -> Arc<CommandRegistrySnapshot> {
         self.command_registry.snapshot()
     }
@@ -338,6 +617,12 @@ impl SearchService {
             .command_registry
             .resolve(reference)
             .ok_or(CommandInvokeError::Unavailable)?;
+        if self
+            .root_command_binding(reference, expected_registry_revision)?
+            .is_some()
+        {
+            return Err(CommandInvokeError::MissingArgument);
+        }
         match command.declaration.argument_policy {
             ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
                 return Err(CommandInvokeError::MissingArgument)
@@ -546,6 +831,11 @@ impl SearchService {
                         continue;
                     };
                     if command.declaration.argument_policy == ArgumentPolicy::Forbidden
+                        || self
+                            .root_command_binding(reference, registry.revision)
+                            .ok()
+                            .flatten()
+                            .is_some()
                         || !search.eligible()
                         || !seen.insert(reference.clone())
                     {
@@ -686,6 +976,12 @@ impl SearchService {
         let policy = declaration.map_or(ArgumentPolicy::Forbidden, |declaration| {
             declaration.argument_policy
         });
+        let typed = self
+            .root_command_binding(reference, registry.revision)
+            .ok()
+            .flatten()
+            .is_some();
+        let policy = if typed { ArgumentPolicy::Forbidden } else { policy };
         ResultRow {
             target: ActionTarget::Command(reference.clone()),
             source: item.zip(accepted).map(|(item, catalog)| ResultSource {
@@ -747,7 +1043,11 @@ impl SearchService {
                 ArgumentPolicy::Optional => Some("optional argument".into()),
                 ArgumentPolicy::Required => Some("argument required".into()),
             },
-            status: (!available).then(|| "Unavailable".into()),
+            status: if typed && preferences.preferences.fallbacks.contains(reference) {
+                Some("Saved literal fallback unavailable for typed arguments".into())
+            } else {
+                (!available).then(|| "Unavailable".into())
+            },
             default_action: None,
             alternate_actions: item.map_or_else(Vec::new, |item| item.actions.clone()),
         }

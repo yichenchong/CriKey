@@ -181,6 +181,7 @@ fn send_empty_catalog(
             done: true,
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         }),
     ))
@@ -203,6 +204,7 @@ fn flood(
                 items: Vec::new(),
                 sequence,
                 error: None,
+                presentation: None,
                 unknown: UnknownFields::default(),
             }),
         ))?;
@@ -256,6 +258,7 @@ fn stderr_flood(
             items: Vec::new(),
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         }),
     ))
@@ -275,6 +278,7 @@ fn partial_no_terminal(
             items: Vec::new(),
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         }),
     ))?;
@@ -299,6 +303,7 @@ fn duplicate_sequence(
                 items: Vec::new(),
                 sequence: 0,
                 error: None,
+                presentation: None,
                 unknown: UnknownFields::default(),
             }),
         ))?;
@@ -324,6 +329,7 @@ fn terminal_items(
             items,
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         }),
     ))
@@ -380,6 +386,7 @@ fn control_witness(
             items: vec![trigger_item(0), trigger_item(1)],
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         }),
     ))?;
@@ -406,6 +413,7 @@ fn control_witness(
                         items,
                         sequence: 1,
                         error: None,
+                        presentation: None,
                         unknown: UnknownFields::default(),
                     }),
                 ))?;
@@ -430,6 +438,7 @@ fn control_witness(
                     items,
                     sequence: 1,
                     error: None,
+                    presentation: None,
                     unknown: Default::default(),
                 }),
             ))?;

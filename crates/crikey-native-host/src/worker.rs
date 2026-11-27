@@ -17,7 +17,11 @@ use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use crikey_core::result_presentation::ResultPresentation;
+use crikey_core::structured_arguments::{ArgumentValues, SubmissionFailureCode, SubmissionOutcome};
+use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
 use crikey_core::{ActionId, Item, ItemId, PageFrame, PluginId};
+
 use crikey_native_protocol::convert::{from_proto_item, from_proto_page_frame, to_proto_page_input};
 use crikey_native_protocol::frame::{read_frame, write_frame};
 use crikey_native_protocol::message::{self, Envelope, Payload};
@@ -41,6 +45,21 @@ const CHILD_REAP_TIMEOUT_MS: u64 = 2_000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ENDPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Discovery either refuses safely or yields a move-only incarnation-bound token.
+#[derive(Debug)]
+pub enum TypedPreparation {
+    Ready(ConfirmedTypedExecution),
+    Refused(SubmissionFailureCode),
+}
+
+/// Opaque confirmation; consuming it never performs discovery or reacquisition.
+#[derive(Debug)]
+pub struct ConfirmedTypedExecution {
+    connection_id: u64,
+    executable: ExecutableKey,
+    fingerprint: [u8; 32],
+}
 
 /// How a native child process ended (spec 24.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +132,8 @@ pub struct PluginHandshake {
     pub preview: bool,
     /// Explicit executable declarations, independent of preview/process liveness.
     pub commands: bool,
+    pub typed_arguments: bool,
+    pub result_presentation: bool,
 }
 
 /// Bytes a plugin served in answer to one [`NativeWorker::request_resource`].
@@ -185,6 +206,8 @@ struct ReaderContext {
     handshake_seen: Arc<AtomicBool>,
     observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
     mismatch: Arc<Mutex<Option<EchoMismatch>>>,
+    privacy: Arc<Mutex<StderrTail>>,
+    sensitive: Arc<AtomicBool>,
     /// Request id of the page frame the host is currently waiting for, or
     /// zero when it is waiting for none. A page frame is a reply and nothing
     /// else; without this the reader could not tell the answer the host asked
@@ -226,6 +249,8 @@ struct WorkerLink {
     peak_queue_depth: Arc<AtomicUsize>,
     observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
     mismatch: Arc<Mutex<Option<EchoMismatch>>>,
+    privacy: Arc<Mutex<StderrTail>>,
+    sensitive: Arc<AtomicBool>,
     /// Shared with the reader; see [`ReaderContext::page_request`].
     page_request: Arc<AtomicU64>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -254,35 +279,30 @@ impl WorkerLink {
         lock_unpoisoned(&self.mismatch).clone()
     }
 
-    fn send(&self, envelope: &Envelope) -> Result<(), HostError> {
+    fn send(&self, envelope: Envelope) -> Result<(), HostError> {
         let end = Instant::now()
             .checked_add(Duration::from_millis(CONTROL_WRITE_TIMEOUT_MS))
             .unwrap_or_else(Instant::now);
         self.send_until(envelope, end)
     }
 
-    fn send_until(&self, envelope: &Envelope, end: Instant) -> Result<(), HostError> {
+    fn send_until(&self, envelope: Envelope, end: Instant) -> Result<(), HostError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(HostError::Closed);
         }
-        let encoded = envelope.encode();
-        if encoded.len() > crikey_native_protocol::MAX_FRAME_BYTES {
+        if message::validate_outbound(&envelope).is_err() {
             self.resource_limit.store(true, Ordering::Release);
             return Err(HostError::ResourceLimit {
                 plugin: self.plugin.clone(),
-                detail: format!(
-                    "host {} envelope is {} bytes (limit {})",
-                    envelope_kind(envelope),
-                    encoded.len(),
-                    crikey_native_protocol::MAX_FRAME_BYTES
-                ),
+                detail: "outbound envelope exceeds protocol bounds".into(),
             });
         }
-        self.observe("host->plugin", envelope);
+        self.observe("host->plugin", &envelope);
         let _guard = lock_unpoisoned(&self.write_mutex);
         match &self.writer {
             WriterKind::Queued { sender, pending } => {
-                let mut value = envelope.clone();
+                let kind = envelope_kind(&envelope);
+                let mut value = envelope;
                 pending.fetch_add(1, Ordering::AcqRel);
                 loop {
                     if self.closed.load(Ordering::Acquire) {
@@ -293,13 +313,13 @@ impl WorkerLink {
                         Ok(()) => return Ok(()),
                         Err(TrySendError::Disconnected(_)) => {
                             pending.fetch_sub(1, Ordering::AcqRel);
-                            return Err(self.write_error(envelope, ProtocolError::Closed));
+                            return Err(self.write_error(kind, ProtocolError::Closed));
                         }
                         Err(TrySendError::Full(next)) => {
                             value = next;
                             if Instant::now() >= end {
                                 pending.fetch_sub(1, Ordering::AcqRel);
-                                return Err(self.write_error(envelope, ProtocolError::Timeout));
+                                return Err(self.write_error(kind, ProtocolError::Timeout));
                             }
                             thread::yield_now();
                         }
@@ -309,8 +329,8 @@ impl WorkerLink {
         }
     }
 
-    fn write_error(&self, envelope: &Envelope, error: ProtocolError) -> HostError {
-        let detail = format!("failed to write {} frame: {error:?}", envelope_kind(envelope));
+    fn write_error(&self, kind: &'static str, error: ProtocolError) -> HostError {
+        let detail = format!("failed to write {kind} frame: {error:?}");
         if self.protocol_violation() {
             HostError::Protocol(detail)
         } else {
@@ -336,6 +356,8 @@ impl WorkerLink {
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
                         Some(depth.saturating_sub(bytes))
                     });
+                let mut event = event;
+                sanitize_event(&mut event, &self.privacy);
                 Ok(event)
             }
             Err(error) => Err(error),
@@ -360,7 +382,7 @@ impl WorkerLink {
             })),
             unknown: Default::default(),
         };
-        let _ = self.send(&envelope);
+        let _ = self.send(envelope);
     }
 
     fn send_flow(&self) -> Result<(), HostError> {
@@ -377,7 +399,7 @@ impl WorkerLink {
             })),
             unknown: Default::default(),
         };
-        match self.send(&envelope) {
+        match self.send(envelope) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = self
@@ -460,6 +482,8 @@ pub struct NativeWorker {
     call_succeeded: bool,
     catalog_initialized: bool,
     failure_kind: Option<crikey_plugin_supervisor::FailureKind>,
+    catalog_presentation: Option<ResultPresentation>,
+    suggestion_presentation: Option<ResultPresentation>,
     #[cfg(windows)]
     job: Option<OwnedJob>,
 }
@@ -590,6 +614,7 @@ impl NativeWorker {
             }
         };
         let credits = Arc::new(AtomicI64::new(0));
+        let sensitive = Arc::new(AtomicBool::new(false));
         let (event_sender, event_receiver) = mpsc::sync_channel(READER_QUEUE_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
         let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -676,6 +701,8 @@ impl NativeWorker {
             observations: Arc::clone(&observations),
             mismatch: Arc::clone(&mismatch),
             page_request: Arc::clone(&page_request),
+            privacy: Arc::clone(&stderr_tail),
+            sensitive: Arc::clone(&sensitive),
         };
         let reader = if let Some(outgoing_receiver) = outgoing {
             spawn_multiplex_reader(
@@ -708,6 +735,8 @@ impl NativeWorker {
             page_request,
             reader: Mutex::new(Some(reader)),
             writer_thread: Mutex::new(writer_thread),
+            privacy: Arc::clone(&stderr_tail),
+            sensitive,
         });
         let handshake = match receive_handshake(&link, &token, &options) {
             Ok(value) => value,
@@ -750,6 +779,8 @@ impl NativeWorker {
             next_request_id: 1,
             call_succeeded: false,
             catalog_initialized: false,
+            catalog_presentation: None,
+            suggestion_presentation: None,
             failure_kind: None,
             #[cfg(windows)]
             job: Some(job),
@@ -811,7 +842,7 @@ impl NativeWorker {
             })),
             unknown: Default::default(),
         };
-        self.send_control(&envelope)
+        self.send_control(envelope)
     }
 
     /// Streams and folds the plugin catalog under aggregate bounds.
@@ -824,6 +855,7 @@ impl NativeWorker {
     pub fn build_catalog_with_timeout_ms(&mut self, timeout_ms: u64) -> Result<Vec<Item>, HostError> {
         self.ensure_alive()?;
         self.catalog_initialized = false;
+        self.catalog_presentation = None;
         let request_id = self.begin_request(0);
         let envelope = Envelope {
             connection_id: self.link.connection_id,
@@ -836,12 +868,13 @@ impl NativeWorker {
             })),
             unknown: Default::default(),
         };
-        self.send_control(&envelope)?;
+        self.send_control(envelope)?;
         let end = deadline(timeout_ms);
         let mut items = Vec::new();
         let mut batches = 0usize;
         let mut bytes = 0usize;
         let mut next_sequence = 0_u64;
+        let mut presentation = None;
         loop {
             let event = self.next_event(end, request_id, 0)?;
             let envelope = match event {
@@ -849,13 +882,14 @@ impl NativeWorker {
                 ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
             };
             match envelope.payload {
-                Some(Payload::CatalogBatch(batch)) => {
+                Some(Payload::CatalogBatch(mut batch)) => {
                     self.validate_batch_sequence(batch.sequence, &mut next_sequence, "catalog")?;
                     if let Some(error) = batch.error.as_ref() {
                         self.validate_nested_error(error, request_id, "catalog")?;
                     }
                     batches = batches.saturating_add(1);
                     let batch_bytes = batch.encode().len();
+                    self.accumulate_presentation(&mut presentation, batch.presentation.take())?;
                     bytes = bytes.saturating_add(batch_bytes);
                     self.record_batch(batch_bytes, batch.items.len());
                     if batches > self.options.limits.max_batches_per_query
@@ -901,6 +935,7 @@ impl NativeWorker {
                         });
                     }
                     if batch.done {
+                        self.catalog_presentation = self.admit_presentation(presentation, &items)?;
                         self.catalog_initialized = true;
                         self.mark_call_succeeded();
                         return Ok(items);
@@ -934,6 +969,7 @@ impl NativeWorker {
         clear_cancel: bool,
     ) -> Result<Suggestions, HostError> {
         self.ensure_alive()?;
+        self.suggestion_presentation = None;
         if clear_cancel {
             self.link.cancel_latched.store(false, Ordering::Release);
         }
@@ -948,12 +984,17 @@ impl NativeWorker {
                 normalized_text: request.normalized.clone(),
                 selected_item_id: request.selected_item_id.clone().unwrap_or_default(),
                 max_items: self.options.limits.max_items_per_query as u64,
+                selected_scope_id: if self.handshake.result_presentation {
+                    request.selected_scope_id.clone()
+                } else {
+                    None
+                },
                 max_batches: self.options.limits.max_batches_per_query as u64,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
         };
-        self.send_control(&envelope)?;
+        self.send_control(envelope)?;
         if self.link.cancel_latched.load(Ordering::Acquire) {
             self.link.send_cancel();
         }
@@ -965,6 +1006,7 @@ impl NativeWorker {
         let mut batches = 0usize;
         let mut bytes = 0usize;
         let mut next_sequence = 0_u64;
+        let mut presentation = None;
         loop {
             let event = self.next_event(end, request_id, request.generation)?;
             let envelope = match event {
@@ -972,7 +1014,7 @@ impl NativeWorker {
                 ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
             };
             match envelope.payload {
-                Some(Payload::Results(batch)) => {
+                Some(Payload::Results(mut batch)) => {
                     self.validate_batch_sequence(batch.sequence, &mut next_sequence, "result")?;
                     if let Some(error) = batch.error.as_ref() {
                         self.validate_nested_error(error, request_id, "result")?;
@@ -985,6 +1027,7 @@ impl NativeWorker {
                     let batch_bytes = batch.encode().len();
                     bytes = bytes.saturating_add(batch_bytes);
                     self.record_batch(batch_bytes, batch.items.len());
+                    self.accumulate_presentation(&mut presentation, batch.presentation.take())?;
                     let limit_exceeded = batches > self.options.limits.max_batches_per_query
                         || bytes > self.options.limits.max_bytes_per_query;
                     if limit_exceeded && state == 1 {
@@ -993,6 +1036,7 @@ impl NativeWorker {
                             self.await_terminal(request_id, request.generation, end, &mut next_sequence)?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
+                            presentation: None,
                             items,
                             state: BatchState::Final,
                             log: logs,
@@ -1027,6 +1071,7 @@ impl NativeWorker {
                             };
                             self.mark_call_succeeded();
                             return Ok(Suggestions {
+                                presentation: None,
                                 items,
                                 state: match state {
                                     2 => BatchState::Final,
@@ -1044,6 +1089,7 @@ impl NativeWorker {
                             self.await_terminal(request_id, request.generation, end, &mut next_sequence)?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
+                            presentation: None,
                             items,
                             state: BatchState::Final,
                             log: logs,
@@ -1063,6 +1109,7 @@ impl NativeWorker {
                         self.validate_nested_error(error, request_id, "result")?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
+                            presentation: None,
                             items,
                             state: BatchState::Failed,
                             log: logs,
@@ -1074,8 +1121,15 @@ impl NativeWorker {
                     match state {
                         1 => {}
                         2 => {
+                            let admitted = if limit_exceeded {
+                                None
+                            } else {
+                                self.admit_presentation(presentation, &items)?
+                            };
+                            self.suggestion_presentation = admitted.clone();
                             self.mark_call_succeeded();
                             return Ok(Suggestions {
+                                presentation: admitted,
                                 items,
                                 state: BatchState::Final,
                                 log: logs,
@@ -1088,6 +1142,7 @@ impl NativeWorker {
                             self.link.cancel_latched.store(false, Ordering::Release);
                             self.mark_call_succeeded();
                             return Ok(Suggestions {
+                                presentation: None,
                                 items,
                                 state: BatchState::Cancelled,
                                 log: logs,
@@ -1105,6 +1160,7 @@ impl NativeWorker {
                             });
                             self.mark_call_succeeded();
                             return Ok(Suggestions {
+                                presentation: None,
                                 items,
                                 state: BatchState::Failed,
                                 log: logs,
@@ -1117,7 +1173,7 @@ impl NativeWorker {
                     }
                 }
                 Some(Payload::Log(log)) => {
-                    if log_records < MAX_LOG_RECORDS {
+                    if !self.is_sensitive() && log_records < MAX_LOG_RECORDS {
                         log_records = log_records.saturating_add(1);
                         let remaining = self.options.limits.max_log_bytes.saturating_sub(log_bytes);
                         if remaining > 0 {
@@ -1134,6 +1190,260 @@ impl NativeWorker {
                 Some(_) | None => {
                     return Err(self.protocol_failure("unexpected suggestion response payload".to_owned()));
                 }
+            }
+        }
+    }
+
+    /// Metadata from this incarnation's last complete accepted catalog.
+    pub fn catalog_presentation(&self) -> Option<&ResultPresentation> {
+        self.catalog_presentation.as_ref()
+    }
+
+    fn accumulate_presentation(
+        &mut self,
+        aggregate: &mut Option<message::ResultPresentation>,
+        fragment: Option<message::ResultPresentation>,
+    ) -> Result<(), HostError> {
+        let Some(mut fragment) = fragment else {
+            return Ok(());
+        };
+        if !self.handshake.typed_arguments && !self.handshake.result_presentation {
+            return Err(self.protocol_failure("unnegotiated result metadata"));
+        }
+        if !self.handshake.typed_arguments && !fragment.schemas.is_empty() {
+            return Err(self.protocol_failure("unnegotiated argument schemas"));
+        }
+        if !self.handshake.result_presentation
+            && (!fragment.sections.is_empty() || !fragment.scopes.is_empty() || !fragment.items.is_empty())
+        {
+            return Err(self.protocol_failure("unnegotiated visual presentation"));
+        }
+        let combined = aggregate.get_or_insert_with(Default::default);
+        // Keep a conservative cumulative retained-allocation charge, including
+        // discarded fragment wrappers/unknowns, rather than allowing fragment
+        // boundaries to reset the decoder's allocation allowance.
+        let fragment_charge = fragment
+            .decoded_allocation
+            .max(crikey_native_protocol::typed::presentation_charge(&fragment));
+        let growth = presentation_growth(&combined.sections, fragment.sections.len())
+            .saturating_add(presentation_growth(&combined.scopes, fragment.scopes.len()))
+            .saturating_add(presentation_growth(&combined.items, fragment.items.len()))
+            .saturating_add(presentation_growth(&combined.schemas, fragment.schemas.len()));
+        let allocation = combined
+            .decoded_allocation
+            .saturating_add(fragment_charge)
+            .saturating_add(growth);
+        if allocation > 4 * 1024 * 1024 {
+            return Err(self.protocol_failure("result metadata exceeds aggregate allocation bounds"));
+        }
+        combined.decoded_allocation = allocation;
+        combined.decoded_bytes = combined.decoded_bytes.saturating_add(fragment.decoded_bytes);
+        if combined.decoded_bytes > 4 * 1024 * 1024 {
+            return Err(self.protocol_failure("result metadata exceeds aggregate byte bounds"));
+        }
+        if combined.sections.len().saturating_add(fragment.sections.len()) > 128
+            || combined.scopes.len().saturating_add(fragment.scopes.len()) > 128
+            || combined.items.len().saturating_add(fragment.items.len()) > 4096
+            || combined.schemas.len().saturating_add(fragment.schemas.len()) > 4096
+        {
+            return Err(self.protocol_failure("result metadata exceeds aggregate bounds"));
+        }
+        // Exact reservations make growth predictable before any append allocates.
+        reserve_presentation(&mut combined.sections, fragment.sections.len());
+        reserve_presentation(&mut combined.scopes, fragment.scopes.len());
+        reserve_presentation(&mut combined.items, fragment.items.len());
+        reserve_presentation(&mut combined.schemas, fragment.schemas.len());
+        combined.sections.append(&mut fragment.sections);
+        combined.scopes.append(&mut fragment.scopes);
+        combined.items.append(&mut fragment.items);
+        combined.schemas.append(&mut fragment.schemas);
+        Ok(())
+    }
+
+    fn admit_presentation(
+        &mut self,
+        presentation: Option<message::ResultPresentation>,
+        items: &[Item],
+    ) -> Result<Option<ResultPresentation>, HostError> {
+        let Some(presentation) = presentation else {
+            return Ok(None);
+        };
+        let presentation = crikey_native_protocol::typed::from_presentation(presentation, &self.spec.plugin)
+            .map_err(|_| self.protocol_failure("invalid result metadata"))?;
+        let mut targets = std::collections::BTreeSet::new();
+        let mut executables = std::collections::BTreeSet::new();
+        for item in items {
+            let target = OwnedItem {
+                owner: self.spec.plugin.clone(),
+                item: item.stable_id.clone(),
+            };
+            if !targets.insert(target.clone()) {
+                return Err(self.protocol_failure("duplicate result item identity"));
+            }
+            if item.actions.is_empty() {
+                executables.insert(ExecutableKey { target, action: None });
+            } else {
+                for action in &item.actions {
+                    executables.insert(ExecutableKey {
+                        target: target.clone(),
+                        action: Some(action.action_id.clone()),
+                    });
+                }
+            }
+        }
+        presentation
+            .validate(&self.spec.plugin, &targets, &executables)
+            .map_err(|_| self.protocol_failure("invalid result metadata references"))?;
+        Ok(Some(presentation))
+    }
+
+    fn is_sensitive(&self) -> bool {
+        self.link.sensitive.load(Ordering::Acquire)
+    }
+
+    fn mark_sensitive(&mut self) -> Result<(), HostError> {
+        {
+            let mut privacy = lock_unpoisoned(&self.stderr_tail);
+            privacy.sensitive = true;
+            self.link.sensitive.store(true, Ordering::Release);
+            privacy.bytes.clear();
+            lock_unpoisoned(&self.link.observations).clear();
+            *lock_unpoisoned(&self.link.mismatch) = None;
+        }
+        // No earlier request remains active at submission. Retire queued old
+        // diagnostics before delivery, preserving fixed transport failures and
+        // returning stream credits instead of stranding the next callback.
+        for _ in 0..READER_QUEUE_CAPACITY {
+            let event = match self.link.recv(Duration::ZERO) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return Err(HostError::Closed),
+            };
+            match event {
+                ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
+                ReaderEvent::Envelope(envelope) => match envelope.payload.as_ref() {
+                    Some(Payload::Results(_)) | Some(Payload::CatalogBatch(_)) => self.replenish_credit()?,
+                    Some(Payload::ResourceRequest(request)) => {
+                        self.answer_resource_request(&envelope, request)?
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Confirms the exact schema on this physical worker before moving values
+    /// into its writer queue. Dynamic authority is never regenerated.
+    pub fn execute_typed(
+        &mut self,
+        item: &ItemId,
+        action: Option<&ActionId>,
+        expected_fingerprint: [u8; 32],
+        values: ArgumentValues,
+    ) -> Result<SubmissionOutcome, HostError> {
+        match self.prepare_typed_execution(item, action, expected_fingerprint)? {
+            TypedPreparation::Ready(confirmed) => self.execute_typed_confirmed(confirmed, values),
+            TypedPreparation::Refused(code) => Ok(SubmissionOutcome::Failed(code)),
+        }
+    }
+
+    /// Performs discovery without accepting or queueing live values. Missing
+    /// bindings may bootstrap the static catalog, never dynamic suggestions.
+    pub fn prepare_typed_execution(
+        &mut self,
+        item: &ItemId,
+        action: Option<&ActionId>,
+        expected_fingerprint: [u8; 32],
+    ) -> Result<TypedPreparation, HostError> {
+        self.ensure_alive()?;
+        if !self.handshake.typed_arguments {
+            return Ok(TypedPreparation::Refused(SubmissionFailureCode::Unsupported));
+        }
+        let executable = ExecutableKey {
+            target: OwnedItem {
+                owner: self.spec.plugin.clone(),
+                item: item.clone(),
+            },
+            action: action.cloned(),
+        };
+        if !self.catalog_initialized
+            && self
+                .suggestion_presentation
+                .as_ref()
+                .and_then(|p| p.schema_for(&executable))
+                .is_none_or(|schema| schema.fingerprint().ok() != Some(expected_fingerprint))
+        {
+            self.build_catalog()?;
+        }
+        let matches = [&self.suggestion_presentation, &self.catalog_presentation]
+            .into_iter()
+            .filter_map(|presentation| presentation.as_ref()?.schema_for(&executable))
+            .any(|schema| schema.fingerprint().ok() == Some(expected_fingerprint));
+        if !matches {
+            return Ok(TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch));
+        }
+        Ok(TypedPreparation::Ready(ConfirmedTypedExecution {
+            connection_id: self.link.connection_id,
+            executable,
+            fingerprint: expected_fingerprint,
+        }))
+    }
+
+    /// Rechecks this incarnation's registry and sends without discovery.
+    pub fn execute_typed_confirmed(
+        &mut self,
+        confirmed: ConfirmedTypedExecution,
+        values: ArgumentValues,
+    ) -> Result<SubmissionOutcome, HostError> {
+        self.ensure_alive()?;
+        if confirmed.connection_id != self.link.connection_id {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
+        }
+        let schema = [&self.suggestion_presentation, &self.catalog_presentation]
+            .into_iter()
+            .filter_map(|presentation| presentation.as_ref()?.schema_for(&confirmed.executable))
+            .find(|schema| schema.fingerprint().ok() == Some(confirmed.fingerprint))
+            .cloned();
+        let Some(schema) = schema else {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
+        };
+        if schema.validate_values(&values).is_err() {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Denied));
+        }
+        self.mark_sensitive()?;
+        let request = crikey_native_protocol::typed::to_request(
+            &confirmed.executable.target.item,
+            confirmed.executable.action.as_ref(),
+            confirmed.fingerprint,
+            values,
+        )
+        .map_err(|_| HostError::Protocol("invalid typed execute request".into()))?;
+        let request_id = self.begin_request(0);
+        self.send_control(Envelope {
+            connection_id: self.link.connection_id,
+            request_id,
+            generation: 0,
+            deadline_ms: self.options.call_timeout_ms,
+            payload: Some(Payload::TypedExecuteRequest(request)),
+            unknown: Default::default(),
+        })?;
+        let end = deadline(self.options.call_timeout_ms);
+        loop {
+            let envelope = match self.next_event(end, request_id, 0)? {
+                ReaderEvent::Envelope(value) => value,
+                ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
+            };
+            match envelope.payload {
+                Some(Payload::TypedExecuteResponse(response)) => {
+                    let outcome = crikey_native_protocol::typed::from_response(response, &schema)
+                        .map_err(|_| self.protocol_failure("invalid typed execute response"))?;
+                    self.mark_call_succeeded();
+                    return Ok(outcome);
+                }
+                Some(Payload::Log(_)) => {}
+                Some(Payload::Error(error)) => return Err(self.error_payload(error, request_id)),
+                _ => return Err(self.protocol_failure("unexpected typed execute response")),
             }
         }
     }
@@ -1160,7 +1470,7 @@ impl NativeWorker {
             })),
             unknown: Default::default(),
         };
-        self.send_control(&envelope)?;
+        self.send_control(envelope)?;
         let event = self.next_event(deadline(self.options.call_timeout_ms), request_id, 0)?;
         let envelope = match event {
             ReaderEvent::Envelope(value) => value,
@@ -1224,7 +1534,7 @@ impl NativeWorker {
             return Err(HostError::Protocol("preview request identity exhausted".into()));
         }
         let request_id = self.begin_request(generation);
-        self.send_control(&Envelope {
+        self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation,
@@ -1307,7 +1617,7 @@ impl NativeWorker {
             return Err(HostError::Protocol("commands request identity exhausted".into()));
         }
         let request_id = self.begin_request(generation);
-        self.send_control(&Envelope {
+        self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation,
@@ -1392,14 +1702,14 @@ impl NativeWorker {
         // Latched before the request is written: the answer can be back
         // before `send_control` has returned on a fast transport.
         self.link.page_request.store(request_id, Ordering::Release);
-        let outcome = self.page_reply(&envelope, request_id, request.generation);
+        let outcome = self.page_reply(envelope, request_id, request.generation);
         self.link.page_request.store(0, Ordering::Release);
         outcome
     }
 
     fn page_reply(
         &mut self,
-        envelope: &Envelope,
+        envelope: Envelope,
         request_id: u64,
         generation: u64,
     ) -> Result<PageFrame, HostError> {
@@ -1426,7 +1736,7 @@ impl NativeWorker {
     pub fn health(&mut self) -> Result<HealthSnapshot, HostError> {
         self.ensure_alive()?;
         let request_id = self.begin_request(0);
-        self.send_control(&Envelope {
+        self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation: 0,
@@ -1485,7 +1795,7 @@ impl NativeWorker {
     ) -> Result<ResourceOutcome, HostError> {
         self.ensure_alive()?;
         let request_id = self.begin_request(0);
-        self.send_control(&Envelope {
+        self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation: 0,
@@ -1670,7 +1980,7 @@ impl NativeWorker {
             return exit;
         }
         let request_id = self.begin_request(0);
-        let _ = self.send_control(&Envelope {
+        let _ = self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation: 0,
@@ -1739,7 +2049,7 @@ impl NativeWorker {
     #[cfg(not(windows))]
     fn release_job(&mut self) {}
 
-    fn send_control(&mut self, envelope: &Envelope) -> Result<(), HostError> {
+    fn send_control(&mut self, envelope: Envelope) -> Result<(), HostError> {
         let result = self.link.send(envelope);
         if let Err(error) = &result {
             match error {
@@ -1884,7 +2194,7 @@ impl NativeWorker {
         envelope: &Envelope,
         request: &message::ResourceRequest,
     ) -> Result<(), HostError> {
-        self.send_control(&Envelope {
+        self.send_control(Envelope {
             connection_id: self.link.connection_id,
             request_id: envelope.request_id,
             generation: envelope.generation,
@@ -1979,6 +2289,14 @@ impl NativeWorker {
     fn record_log(&mut self, _message: String) {}
 
     fn transport_error(&mut self, failure: ReaderFailure) -> HostError {
+        let failure = if self.is_sensitive() {
+            ReaderFailure {
+                error: ProtocolError::Closed,
+                ..failure
+            }
+        } else {
+            failure
+        };
         if failure.resource_limit || self.link.resource_limit.load(Ordering::Acquire) {
             self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ResourceLimit);
             self.fail_and_reap(ExitKind::Killed);
@@ -2032,6 +2350,11 @@ impl NativeWorker {
     }
 
     fn error_payload(&mut self, error: message::StructuredError, request_id: u64) -> HostError {
+        let mut error = error;
+        if self.is_sensitive() {
+            error.message.clear();
+            error.detail.clear();
+        }
         let plugin_error = plugin_error(&error);
         if let Err(protocol) = self.validate_nested_error(&error, request_id, "structured") {
             return protocol;
@@ -2145,6 +2468,12 @@ impl Transport for ChildStdioTransport {
         Envelope::decode(&buffer)
     }
 
+    fn recv_with_diagnostics(&mut self, sensitive: &AtomicBool) -> Result<Envelope, ProtocolError> {
+        let mut buffer = Vec::new();
+        read_frame(&mut self.stdout, &mut buffer)?;
+        Envelope::decode_with_diagnostics(&buffer, sensitive)
+    }
+
     fn try_clone_handle(&self) -> Result<Box<dyn Transport>, ProtocolError> {
         Err(ProtocolError::Rejected(
             "child stdio transport cannot clone its read handle".to_owned(),
@@ -2171,7 +2500,11 @@ fn spawn_stdio_writer(
         }
         match receiver.recv_timeout(Duration::from_millis(SOCKET_POLL_MS)) {
             Ok(envelope) => {
-                let result = write_frame(&mut stdin, &envelope.encode());
+                let mut encoded = envelope.encode();
+                let result = write_frame(&mut stdin, &encoded);
+                if matches!(envelope.payload, Some(Payload::TypedExecuteRequest(_))) {
+                    encoded.fill(0);
+                }
                 pending.fetch_sub(1, Ordering::AcqRel);
                 if result.is_err() {
                     drain_pending(&receiver, &pending);
@@ -2198,7 +2531,7 @@ fn spawn_blocking_reader(mut transport: Box<dyn Transport>, context: ReaderConte
         if context.closed.load(Ordering::Acquire) {
             break;
         }
-        match transport.recv() {
+        match transport.recv_with_diagnostics(&context.sensitive) {
             Ok(envelope) => {
                 if !validate_inbound(&envelope, &context) {
                     context.protocol_violation.store(true, Ordering::Release);
@@ -2287,7 +2620,7 @@ fn spawn_multiplex_reader(
                     }
                 }
             }
-            match transport.recv() {
+            match transport.recv_with_diagnostics(&context.sensitive) {
                 Ok(envelope) => {
                     if !validate_inbound(&envelope, &context) {
                         context.protocol_violation.store(true, Ordering::Release);
@@ -2343,7 +2676,62 @@ fn spawn_multiplex_reader(
     })
 }
 
+/// Strip diagnostic text both on queue admission and again on publication:
+/// events queued before the transition must not bypass the incarnation latch.
+fn sanitize_event(event: &mut ReaderEvent, privacy: &Mutex<StderrTail>) {
+    let state = lock_unpoisoned(privacy);
+    if !state.sensitive {
+        return;
+    }
+    let envelope = match event {
+        ReaderEvent::Failure(failure) => {
+            failure.error = ProtocolError::Closed;
+            return;
+        }
+        ReaderEvent::Envelope(envelope) => envelope,
+    };
+    let clear_error = |error: &mut message::StructuredError| {
+        error.message.clear();
+        error.detail.clear();
+    };
+    match envelope.payload.as_mut() {
+        Some(Payload::Log(log)) => log.message.clear(),
+        Some(Payload::Error(error)) => clear_error(error),
+        Some(Payload::CatalogBatch(batch)) => {
+            if let Some(error) = &mut batch.error {
+                clear_error(error);
+            }
+        }
+        Some(Payload::Results(batch)) => {
+            if let Some(error) = &mut batch.error {
+                clear_error(error);
+            }
+        }
+        Some(Payload::ExecuteResult(result)) => {
+            if let Some(error) = &mut result.error {
+                clear_error(error);
+            }
+        }
+        Some(Payload::ResourceResponse(response)) => {
+            if let Some(error) = &mut response.error {
+                clear_error(error);
+            }
+        }
+        Some(Payload::PreviewResponse(response)) => response.detail.clear(),
+        Some(Payload::CommandsResponse(response)) => response.detail.clear(),
+        Some(Payload::HealthReport(report)) => report.detail.clear(),
+        _ => {}
+    }
+}
+
 fn enqueue_reader_event(context: &ReaderContext, event: ReaderEvent) -> bool {
+    let mut event = event;
+    if matches!(&event, ReaderEvent::Envelope(envelope) if matches!(envelope.payload, Some(Payload::Log(_))))
+        && lock_unpoisoned(&context.privacy).sensitive
+    {
+        return true;
+    }
+    sanitize_event(&mut event, &context.privacy);
     let bytes = reader_event_size(&event);
     if bytes > READER_QUEUE_MAX_BYTES {
         context.resource_limit.store(true, Ordering::Release);
@@ -2468,6 +2856,7 @@ fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
             | Some(Payload::Results(_))
             | Some(Payload::CatalogBatch(_))
             | Some(Payload::ExecuteResult(_))
+            | Some(Payload::TypedExecuteResponse(_))
             | Some(Payload::PreviewResponse(_))
             | Some(Payload::CommandsResponse(_))
             | Some(Payload::Error(_))
@@ -2559,6 +2948,8 @@ fn receive_handshake(
             "cancellation".to_owned(),
             crikey_core::PREVIEW_CAPABILITY.to_owned(),
             crikey_core::command::COMMANDS_CAPABILITY.to_owned(),
+            crikey_core::structured_arguments::TYPED_ARGUMENTS_CAPABILITY.to_owned(),
+            crikey_core::result_presentation::RESULT_PRESENTATION_CAPABILITY.to_owned(),
         ],
         host_version: env!("CARGO_PKG_VERSION").to_owned(),
         accepted: rejection.is_none(),
@@ -2568,7 +2959,7 @@ fn receive_handshake(
         unknown: Default::default(),
     };
     link.set_current(envelope.request_id, envelope.generation);
-    link.send(&Envelope {
+    link.send(Envelope {
         connection_id: link.connection_id,
         request_id: envelope.request_id,
         generation: envelope.generation,
@@ -2587,6 +2978,14 @@ fn receive_handshake(
         sdk_version: handshake.sdk_version,
         protocol_version: handshake.protocol_version,
         capabilities: capabilities_from_strings(&handshake.capabilities),
+        typed_arguments: handshake
+            .capabilities
+            .iter()
+            .any(|s| s == crikey_core::structured_arguments::TYPED_ARGUMENTS_CAPABILITY),
+        result_presentation: handshake
+            .capabilities
+            .iter()
+            .any(|s| s == crikey_core::result_presentation::RESULT_PRESENTATION_CAPABILITY),
         commands: handshake
             .capabilities
             .iter()
@@ -3310,10 +3709,14 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Default)]
 struct StderrTail {
     bytes: VecDeque<u8>,
+    sensitive: bool,
 }
 
 impl StderrTail {
     fn push(&mut self, bytes: &[u8]) {
+        if self.sensitive {
+            return;
+        }
         for byte in bytes {
             if self.bytes.len() == STDERR_TAIL_BYTES {
                 let _ = self.bytes.pop_front();
@@ -3323,6 +3726,9 @@ impl StderrTail {
     }
 
     fn text(&self) -> String {
+        if self.sensitive {
+            return String::new();
+        }
         let (first, second) = self.bytes.as_slices();
         if second.is_empty() {
             return String::from_utf8_lossy(first).into_owned();
@@ -3544,4 +3950,87 @@ mod windows_containment {
             "closing the last job handle must kill every process left in the job"
         );
     }
+}
+
+#[cfg(test)]
+mod typed_privacy {
+    use super::*;
+
+    #[test]
+    fn incarnation_latch_discards_stderr_and_clears_retained_tail() {
+        let mut tail = StderrTail::default();
+        tail.push(b"before");
+        assert_eq!(tail.text(), "before");
+        tail.sensitive = true;
+        tail.bytes.clear();
+        tail.push(b"submitted value from background callback");
+        assert!(tail.bytes.is_empty());
+        assert!(tail.text().is_empty());
+    }
+
+    #[test]
+    fn queued_diagnostics_are_sanitized_at_publication() {
+        let privacy = Mutex::new(StderrTail::default());
+        let mut event = ReaderEvent::Envelope(Box::new(Envelope {
+            payload: Some(Payload::Error(message::StructuredError {
+                code: message::ErrorCode::from_i32(5),
+                message: "callback echoed a value".into(),
+                detail: "traceback echoed a value".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }));
+        sanitize_event(&mut event, &privacy);
+        lock_unpoisoned(&privacy).sensitive = true;
+        sanitize_event(&mut event, &privacy);
+        let ReaderEvent::Envelope(envelope) = event else {
+            panic!("lost terminal");
+        };
+        let Some(Payload::Error(error)) = envelope.payload else {
+            panic!("lost error code");
+        };
+        assert_eq!(error.code.as_i32(), 5);
+        assert!(error.message.is_empty());
+        assert!(error.detail.is_empty());
+    }
+
+    #[test]
+    fn sensitive_reader_failures_keep_classification_not_raw_text() {
+        let privacy = Mutex::new(StderrTail {
+            sensitive: true,
+            ..Default::default()
+        });
+        let mut event = ReaderEvent::Failure(ReaderFailure {
+            error: ProtocolError::Malformed("raw frame secret".into()),
+            protocol_violation: true,
+            resource_limit: false,
+        });
+        sanitize_event(&mut event, &privacy);
+        let ReaderEvent::Failure(failure) = event else {
+            panic!("lost lifecycle");
+        };
+        assert!(matches!(failure.error, ProtocolError::Closed));
+        assert!(failure.protocol_violation);
+        assert!(!failure.resource_limit);
+    }
+}
+
+fn presentation_capacity<T>(current: &Vec<T>, incoming: usize) -> usize {
+    let needed = current.len().saturating_add(incoming);
+    if needed <= current.capacity() {
+        current.capacity()
+    } else {
+        needed.max(current.capacity().saturating_mul(2)).max(4)
+    }
+}
+
+fn presentation_growth<T>(current: &Vec<T>, incoming: usize) -> usize {
+    presentation_capacity(current, incoming)
+        .saturating_sub(current.capacity())
+        .saturating_mul(std::mem::size_of::<T>())
+}
+
+fn reserve_presentation<T>(current: &mut Vec<T>, incoming: usize) {
+    let additional = presentation_capacity(current, incoming).saturating_sub(current.len());
+    current.reserve_exact(additional);
 }

@@ -5447,6 +5447,88 @@ fn changing_a_pending_draft_back_to_submitted_text_still_requires_a_new_save() {
     );
 }
 
+#[test]
+fn typed_root_section_headers_are_painted_but_never_executable_rows() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(2, 1);
+    view.navigation.section_headers = vec![
+        crikey_ui::SectionHeader {
+            row: 0,
+            owner: PluginId("renderer-fixture".into()),
+            id: crikey_core::result_presentation::SectionId("first".into()),
+            label: "First section".into(),
+        },
+        crikey_ui::SectionHeader {
+            row: 1,
+            owner: PluginId("renderer-fixture".into()),
+            id: crikey_core::result_presentation::SectionId("second".into()),
+            label: "Second section".into(),
+        },
+    ]
+    .into();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "First section"));
+    assert!(painted(&frame, "Second section"));
+    let position = position_of(&frame, "First section");
+    let clicked = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(!clicked.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ActivateAction { .. }
+            | UiCommand::ActivateActionless { .. }
+            | UiCommand::InvokeCommand { .. }
+            | UiCommand::ExecuteDefault
+    )));
+    assert_eq!(view.rows.len(), 2);
+    assert_eq!(view.selected, 1);
+}
+
+#[test]
+fn actionless_typed_root_control_keeps_none_instead_of_inventing_an_action_id() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(1, 0);
+    view.navigation.actionless_targets = vec![crikey_core::structured_arguments::OwnedItem {
+        owner: PluginId("renderer-fixture".into()),
+        item: ItemId("item-0".into()),
+    }]
+    .into();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let position = position_of(&frame, "Run  Enter");
+    let clicked = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(clicked.commands.iter().any(|command| matches!(command, UiCommand::ActivateActionless { target: crikey_ui::ActionTarget::Result { owner, item } } if owner.0 == "renderer-fixture" && item.0 == "item-0")));
+    assert!(!clicked
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::ActivateAction { .. })));
+}
+
+#[test]
+fn an_unavailable_restored_scope_requires_explicit_all_selection() {
+    let context = create_launcher_context();
+    let mut view = model("scope");
+    view.navigation.selected_scope = Some(crikey_ui::ScopeIdentity {
+        owner: PluginId("gone".into()),
+        id: crikey_core::result_presentation::ScopeId("private".into()),
+        source: crikey_ui::PublicationIdentity::Suggestion {
+            generation: Generation::from_raw(1),
+            producer: 1,
+        },
+    });
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "Unavailable scope"));
+    assert!(!frame
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetScope(None))));
+    let position = position_of(&frame, "Unavailable scope");
+    let opened = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    let position = position_of(&opened, "All");
+    let chosen = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(chosen
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetScope(None))));
+}
+
 fn pending_scroll_return() -> (crikey_ui::LauncherViewModel, Frames, ViewModel) {
     let mut state = crikey_ui::LauncherViewModel::new();
     state.activate();

@@ -5,6 +5,8 @@ user-interface thread, and use ordinary Python imports with managed
 dependencies declared in the plugin manifest's ``[python]`` section.
 """
 
+from .arguments import *
+from .arguments import __all__ as _argument_exports
 from .plugin import (
     Action,
     Command,
@@ -36,5 +38,5 @@ __all__ = [
     "WorkerContext",
     "plugin_defined_category",
     "__version__",
-]
+] + _argument_exports
 __version__ = "0.1.0"

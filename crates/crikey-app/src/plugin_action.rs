@@ -10,11 +10,300 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::plugin_page::PageUpdate;
+use crikey_core::result_presentation::ResultPresentation;
+use crikey_core::structured_arguments::{
+    ArgumentSchema, ArgumentValues, ExecutableKey, OwnedItem, SubmissionOutcome,
+};
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
+/// Exact owner/item snapshots paired with their physical producing worker.
+pub(crate) type OriginItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+pub(crate) type SharedOriginItems = Arc<OriginItems>;
 type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
-type ActionItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+
+/// Authority supplied by an accepted provider publication, never item metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSource {
+    Catalog(DeclaredCommandSource),
+    Suggestion {
+        generation: crikey_core::Generation,
+        producer: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RootExecutableBinding {
+    pub executable: ExecutableKey,
+    pub source: RootSource,
+    pub schema: Arc<ArgumentSchema>,
+    pub fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct RootPresentationSnapshot {
+    pub owner: PluginId,
+    pub source: RootSource,
+    pub presentation: Arc<ResultPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootScope {
+    pub owner: PluginId,
+    pub id: crikey_core::result_presentation::ScopeId,
+    pub source: RootSource,
+}
+
+#[derive(Debug)]
+struct RootPublication {
+    snapshot: RootPresentationSnapshot,
+    items: BTreeMap<ItemId, Item>,
+}
+
+/// Complete sidecars and frozen executable items share one replacement boundary.
+#[derive(Debug, Default)]
+pub struct RootSourceLedger {
+    catalogs: BTreeMap<PluginId, RootPublication>,
+    suggestions: BTreeMap<PluginId, RootPublication>,
+    retired: BTreeSet<OwnedItem>,
+    retired_owners: BTreeSet<PluginId>,
+    captured_scope: Option<RootScope>,
+}
+
+impl RootSourceLedger {
+    pub fn publish(
+        &mut self,
+        owner: PluginId,
+        source: RootSource,
+        items: &[Item],
+        presentation: ResultPresentation,
+    ) -> CoreResult<()> {
+        let invalid = || CoreError::Invalid("invalid root publication".into());
+        let mut frozen = BTreeMap::new();
+        let mut targets = BTreeSet::new();
+        let mut executables = BTreeSet::new();
+        for item in items {
+            if item.plugin_id != owner {
+                return Err(invalid());
+            }
+            let target = OwnedItem {
+                owner: owner.clone(),
+                item: item.stable_id.clone(),
+            };
+            if !targets.insert(target.clone()) {
+                return Err(invalid());
+            }
+            if item.actions.is_empty() {
+                executables.insert(ExecutableKey { target, action: None });
+            } else {
+                let mut actions = BTreeSet::new();
+                for action in &item.actions {
+                    if !actions.insert(&action.action_id) {
+                        return Err(invalid());
+                    }
+                    if action.execution_policy == crikey_core::ExecutionPolicy::Plugin
+                        && (action.applicable_categories.is_empty()
+                            || action.applicable_categories.contains(&item.category))
+                    {
+                        executables.insert(ExecutableKey {
+                            target: target.clone(),
+                            action: Some(action.action_id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        presentation
+            .validate(&owner, &targets, &executables)
+            .map_err(|_| invalid())?;
+        for binding in &presentation.schemas {
+            binding.schema.fingerprint().map_err(|_| invalid())?;
+        }
+        for item in items {
+            frozen.insert(item.stable_id.clone(), item.clone());
+        }
+        let dynamic = matches!(source, RootSource::Suggestion { .. });
+        if dynamic
+            && self.captured_scope.as_ref().is_some_and(|scope| {
+                scope.owner == owner
+                    && (match (&scope.source, &source) {
+                        (
+                            RootSource::Suggestion {
+                                producer: captured, ..
+                            },
+                            RootSource::Suggestion { producer, .. },
+                        ) => captured != producer,
+                        _ => true,
+                    } || !presentation
+                        .scopes
+                        .iter()
+                        .any(|declaration| declaration.id == scope.id))
+            })
+        {
+            self.captured_scope = None;
+        }
+        let publication = RootPublication {
+            snapshot: RootPresentationSnapshot {
+                owner: owner.clone(),
+                source,
+                presentation: Arc::new(presentation),
+            },
+            items: frozen,
+        };
+        if dynamic {
+            if let Some(previous) = self.suggestions.insert(owner.clone(), publication) {
+                self.retire_items(&owner, previous.items.into_keys());
+            }
+            for target in targets {
+                self.retired.remove(&target);
+            }
+        } else {
+            self.catalogs.insert(owner, publication);
+        }
+        Ok(())
+    }
+
+    pub fn retire_suggestions(&mut self) {
+        for (owner, publication) in std::mem::take(&mut self.suggestions) {
+            self.retire_items(&owner, publication.items.into_keys());
+        }
+    }
+
+    /// Capture one selected declaration independently from executable rows.
+    /// Generation retirement removes old bindings, never this query's scope.
+    pub fn capture_scope(&mut self, scope: Option<&RootScope>) -> bool {
+        let Some(scope) = scope else {
+            self.captured_scope = None;
+            return true;
+        };
+        if !self.scope_current(scope) {
+            return false;
+        }
+        self.captured_scope = matches!(&scope.source, RootSource::Suggestion { .. }).then(|| scope.clone());
+        true
+    }
+
+    /// Endpoints additionally require the dynamic producer to remain live.
+    pub fn scope_current(&self, scope: &RootScope) -> bool {
+        if self.captured_scope.as_ref() == Some(scope) {
+            return true;
+        }
+        let publication = match &scope.source {
+            RootSource::Catalog(_) => self.catalogs.get(&scope.owner),
+            RootSource::Suggestion { .. } => self.suggestions.get(&scope.owner),
+        };
+        publication.is_some_and(|publication| {
+            publication.snapshot.source == scope.source
+                && publication
+                    .snapshot
+                    .presentation
+                    .scopes
+                    .iter()
+                    .any(|declaration| declaration.id == scope.id)
+        })
+    }
+
+    /// Only a deliberately captured declaration may outlive its query source.
+    pub fn scope_captured(&self, scope: &RootScope) -> bool {
+        self.captured_scope.as_ref() == Some(scope)
+    }
+
+    /// Worker death retires only that owner's dynamic authority. Healthy
+    /// siblings keep their current generation and presentation.
+    pub fn retire_owner_suggestions(&mut self, owner: &PluginId) {
+        if self
+            .captured_scope
+            .as_ref()
+            .is_some_and(|scope| &scope.owner == owner)
+        {
+            self.captured_scope = None;
+        }
+        if let Some(publication) = self.suggestions.remove(owner) {
+            self.retire_items(owner, publication.items.into_keys());
+        }
+    }
+
+    pub fn invalidate(&mut self, owner: &PluginId) {
+        self.catalogs.remove(owner);
+        self.retire_owner_suggestions(owner);
+    }
+
+    fn retire_items(&mut self, owner: &PluginId, items: impl Iterator<Item = ItemId>) {
+        if self.retired_owners.contains(owner) {
+            return;
+        }
+        for item in items {
+            self.retired.insert(OwnedItem {
+                owner: owner.clone(),
+                item,
+            });
+            if self.retired.len() > crikey_core::result_presentation::MAX_PRESENTATION_ITEMS {
+                // Explicit canonical admission remains available. Old result
+                // rows fail closed rather than retaining unbounded tombstones.
+                self.retired_owners
+                    .extend(self.retired.iter().map(|target| target.owner.clone()));
+                self.retired.clear();
+                break;
+            }
+        }
+    }
+
+    pub fn binding(
+        &self,
+        key: &ExecutableKey,
+        canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootExecutableBinding> {
+        let publication = if let Some(source) = canonical {
+            self.catalogs
+                .get(&key.target.owner)
+                .filter(|p| p.snapshot.source == RootSource::Catalog(source.clone()))?
+        } else if let Some(publication) = self
+            .suggestions
+            .get(&key.target.owner)
+            .filter(|p| p.items.contains_key(&key.target.item))
+        {
+            publication
+        } else {
+            if self.retired_owners.contains(&key.target.owner) || self.retired.contains(&key.target) {
+                return None;
+            }
+            self.catalogs.get(&key.target.owner)?
+        };
+        let schema = publication.snapshot.presentation.schema_for(key)?.clone();
+        Some(RootExecutableBinding {
+            executable: key.clone(),
+            source: publication.snapshot.source.clone(),
+            fingerprint: schema.fingerprint().ok()?,
+            schema,
+        })
+    }
+
+    pub fn snapshots(&self) -> Vec<RootPresentationSnapshot> {
+        self.catalogs
+            .values()
+            .chain(self.suggestions.values())
+            .map(|p| p.snapshot.clone())
+            .collect()
+    }
+
+    pub fn frozen_item(&self, binding: &RootExecutableBinding) -> Option<Item> {
+        let publication = match &binding.source {
+            RootSource::Catalog(_) => self.catalogs.get(&binding.executable.target.owner)?,
+            RootSource::Suggestion { .. } => self.suggestions.get(&binding.executable.target.owner)?,
+        };
+        if publication.snapshot.source != binding.source {
+            return None;
+        }
+        let schema = publication
+            .snapshot
+            .presentation
+            .schema_for(&binding.executable)?;
+        if schema.as_ref() != binding.schema.as_ref() || schema.fingerprint().ok()? != binding.fingerprint {
+            return None;
+        }
+        publication.items.get(&binding.executable.target.item).cloned()
+    }
+}
 
 /// Exact provider publication backing an accepted canonical catalog.
 /// This is not a UI epoch or a live-worker requirement for command execution.
@@ -36,6 +325,10 @@ pub(crate) enum AdmittedPluginWork {
         action_id: Option<ActionId>,
         source: DeclaredCommandSource,
     },
+    Typed {
+        binding: RootExecutableBinding,
+        values: ArgumentValues,
+    },
 }
 
 impl AdmittedPluginWork {
@@ -43,6 +336,7 @@ impl AdmittedPluginWork {
         match self {
             Self::Action(id) => Some(id),
             Self::Command { action_id, .. } => action_id.as_ref(),
+            Self::Typed { binding, .. } => binding.executable.action.as_ref(),
         }
     }
 
@@ -53,12 +347,50 @@ impl AdmittedPluginWork {
             Self::Command {
                 declaration, source, ..
             } => Some((declaration, source)),
-            Self::Action(_) => None,
+            Self::Action(_) | Self::Typed { .. } => None,
+        }
+    }
+
+    pub(crate) fn typed_binding(&self) -> Option<&RootExecutableBinding> {
+        match self {
+            Self::Typed { binding, .. } => Some(binding),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_typed_values(&mut self) -> Option<ArgumentValues> {
+        match self {
+            Self::Typed { values, .. } => Some(std::mem::take(values)),
+            _ => None,
         }
     }
 
     pub(crate) fn validate(&self, item: &Item, argument: Option<&str>) -> CoreResult<()> {
         match self {
+            Self::Typed { binding, values } => {
+                if argument.is_some()
+                    || item.plugin_id != binding.executable.target.owner
+                    || item.stable_id != binding.executable.target.item
+                {
+                    return Err(CoreError::Invalid("typed executable source changed".into()));
+                }
+                if let Some(id) = &binding.executable.action {
+                    let mut matching = item.actions.iter().filter(|a| &a.action_id == id);
+                    if matching.next().is_none_or(|a| {
+                        a.execution_policy != crikey_core::ExecutionPolicy::Plugin
+                            || (!a.applicable_categories.is_empty()
+                                && !a.applicable_categories.contains(&item.category))
+                    }) || matching.next().is_some()
+                    {
+                        return Err(CoreError::Invalid("typed executable action unavailable".into()));
+                    }
+                } else if !item.actions.is_empty() {
+                    return Err(CoreError::Invalid("typed actionless target changed".into()));
+                }
+                if binding.schema.validate_values(values).is_err() {
+                    return Err(CoreError::Invalid("invalid typed arguments".into()));
+                }
+            }
             Self::Action(id) => {
                 let (action, _) = validate_action_item(item, id, argument)?;
                 if action.execution_policy != crikey_core::ExecutionPolicy::Plugin {
@@ -144,7 +476,7 @@ pub(crate) fn validate_declared_command_item(
 pub(crate) struct CompletionWake(Arc<Mutex<Option<CompletionCallback>>>);
 
 impl CompletionWake {
-    pub(crate) fn install(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn install(&self, wake: CompletionCallback) {
         *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(wake);
     }
 
@@ -183,6 +515,8 @@ pub struct ActionRequestId {
 pub enum ActionEffect {
     /// The action ran and is finished.
     Completed,
+    /// Fixed-code typed outcome; values and callback diagnostics never return.
+    Typed(SubmissionOutcome),
     /// The action asked the host to open this plugin-drawn page. The owning
     /// plugin is [`PluginActionCompletion::plugin`].
     ShowPage { page_id: String },
@@ -215,6 +549,14 @@ pub enum ActionSubmission {
 pub struct PluginActionReceipt {
     pub request_id: ActionRequestId,
     pub query_history_allowed: bool,
+}
+
+/// Success-only item learning uses this exact admitted frozen snapshot. Typed
+/// values are never attached to the receipt or query-history evidence.
+#[derive(Debug)]
+pub struct TypedActionReceipt {
+    pub receipt: PluginActionReceipt,
+    pub item: Item,
 }
 
 /// A successful host/provider admission and its query-collection authorization.
@@ -268,8 +610,8 @@ pub(crate) fn resolve_action_item(
     plugin: &PluginId,
     item_id: &ItemId,
     live_origin: Option<u64>,
-    suggestions: &ActionItems,
-    catalog: &ActionItems,
+    suggestions: &OriginItems,
+    catalog: &OriginItems,
     static_catalog: &Mutex<BTreeMap<(PluginId, ItemId), Item>>,
 ) -> Option<(Item, Option<u64>)> {
     let key = (plugin.clone(), item_id.clone());
@@ -307,6 +649,29 @@ pub(crate) fn resolve_action_item(
 /// terminal completion is emitted, including transport failures, timeout,
 /// cancellation and worker reaping.
 pub trait PluginActionExecutor: Send + Sync {
+    fn root_binding(
+        &self,
+        _key: &ExecutableKey,
+        _canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootExecutableBinding> {
+        None
+    }
+    fn root_presentations(&self) -> Vec<RootPresentationSnapshot> {
+        Vec::new()
+    }
+    fn root_scope_current(&self, _scope: &RootScope) -> bool {
+        false
+    }
+    fn submit_typed(
+        &self,
+        _binding: &RootExecutableBinding,
+        _values: ArgumentValues,
+    ) -> CoreResult<TypedActionReceipt> {
+        Err(CoreError::Invalid(
+            "runtime does not support typed arguments".into(),
+        ))
+    }
+
     /// Resolve and freeze only the exact canonical catalog publication.
     /// Adapters without declaration support refuse, never use ordinary lookup.
     fn submit_declared_command_with_receipt(
@@ -653,6 +1018,62 @@ impl PluginActionRouter {
         })
     }
 
+    pub fn root_binding(
+        &self,
+        key: &ExecutableKey,
+        canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootExecutableBinding> {
+        let binding = self
+            .providers
+            .get(&key.target.owner)?
+            .root_binding(key, canonical)?;
+        if binding.executable != *key || binding.schema.fingerprint().ok()? != binding.fingerprint {
+            return None;
+        }
+        Some(binding)
+    }
+
+    pub fn root_presentations(&self) -> Vec<RootPresentationSnapshot> {
+        let mut seen = BTreeSet::new();
+        self.providers
+            .iter()
+            .filter(|(_, executor)| seen.insert(Arc::as_ptr(executor) as *const () as usize))
+            .flat_map(|(_, executor)| {
+                executor.root_presentations().into_iter().filter(move |snapshot| {
+                    self.providers
+                        .get(&snapshot.owner)
+                        .is_some_and(|owner| Arc::ptr_eq(owner, executor))
+                })
+            })
+            .collect()
+    }
+
+    pub fn root_scope_current(&self, scope: &RootScope) -> bool {
+        self.providers
+            .get(&scope.owner)
+            .is_some_and(|provider| provider.root_scope_current(scope))
+    }
+
+    pub fn submit_typed(
+        &self,
+        binding: &RootExecutableBinding,
+        values: ArgumentValues,
+    ) -> CoreResult<TypedActionReceipt> {
+        if binding.schema.fingerprint().ok() != Some(binding.fingerprint)
+            || binding.schema.validate_values(&values).is_err()
+        {
+            return Err(CoreError::Invalid("invalid typed arguments".into()));
+        }
+        self.providers
+            .get(&binding.executable.target.owner)
+            .ok_or_else(|| CoreError::Invalid("typed owner unavailable".into()))?
+            .submit_typed(binding, values)
+            .map(|mut receipt| {
+                receipt.receipt.query_history_allowed = false;
+                receipt
+            })
+    }
+
     /// Canonical commands never resolve through suggestion-first item lookup.
     pub fn submit_declared_command_with_receipt(
         &self,
@@ -819,6 +1240,7 @@ mod tests {
     };
     use crikey_plugin_supervisor::{shared_budget_from_section, BudgetKind, PluginBudgetHandle};
 
+    use super::{ArgumentSchema, ArgumentValues, ExecutableKey, OwnedItem, ResultPresentation};
     use super::{HostCapability, PluginActionExecutor, PluginActionRouter};
 
     fn item(plugin: &str) -> Item {
@@ -837,6 +1259,400 @@ mod tests {
             metadata: BTreeMap::new(),
             actions: Vec::new(),
         }
+    }
+
+    fn root_sidecar(target: &Item) -> (super::RootSource, ExecutableKey, ResultPresentation) {
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: target.plugin_id.clone(),
+                item: target.stable_id.clone(),
+            },
+            action: None,
+        };
+        let source = super::RootSource::Catalog(super::DeclaredCommandSource {
+            instance: 1,
+            generation: crikey_core::Generation::from_raw(1),
+            producer: 7,
+            publication: 1,
+        });
+        let presentation = ResultPresentation {
+            schemas: vec![crikey_core::result_presentation::ExecutableSchemaBinding {
+                executable: key.clone(),
+                schema: Arc::new(ArgumentSchema::default()),
+            }],
+            ..Default::default()
+        };
+        (source, key, presentation)
+    }
+
+    #[test]
+    fn root_sidecar_replacement_is_transactional_and_owner_qualified() {
+        let target = item("native.root");
+        let (source, key, presentation) = root_sidecar(&target);
+        let mut ledger = super::RootSourceLedger::default();
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                source.clone(),
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        let binding = ledger.binding(&key, None).unwrap();
+        let mut invalid = presentation;
+        invalid.schemas[0].executable.target.owner = PluginId("sibling".into());
+        assert!(ledger
+            .publish(target.plugin_id.clone(), source, &[target.clone()], invalid)
+            .is_err());
+        assert_eq!(ledger.frozen_item(&binding).unwrap().plugin_id, target.plugin_id);
+        let mut sibling = key;
+        sibling.target.owner = PluginId("sibling".into());
+        assert!(ledger.binding(&sibling, None).is_none());
+    }
+
+    #[test]
+    fn retired_dynamic_binding_never_borrows_same_id_catalog() {
+        let target = item("native.root");
+        let (catalog, key, presentation) = root_sidecar(&target);
+        let mut ledger = super::RootSourceLedger::default();
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                catalog.clone(),
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        let canonical = match &catalog {
+            super::RootSource::Catalog(source) => source,
+            _ => unreachable!(),
+        };
+        let static_binding = ledger.binding(&key, Some(canonical)).unwrap();
+        let dynamic = super::RootSource::Suggestion {
+            generation: crikey_core::Generation::from_raw(2),
+            producer: 7,
+        };
+        ledger
+            .publish(target.plugin_id.clone(), dynamic, &[target.clone()], presentation)
+            .unwrap();
+        let selected = ledger.binding(&key, None).unwrap();
+        ledger.retire_suggestions();
+        assert!(ledger.frozen_item(&selected).is_none());
+        assert!(ledger.binding(&key, None).is_none());
+        assert!(ledger.frozen_item(&static_binding).is_some());
+        assert!(ledger.binding(&key, Some(canonical)).is_some());
+    }
+
+    #[test]
+    fn owner_retirement_preserves_sibling_binding_and_presentation() {
+        let failing = item("modern.failing");
+        let healthy = item("modern.healthy");
+        let mut ledger = super::RootSourceLedger::default();
+        let (_, failing_key, failing_sidecar) = root_sidecar(&failing);
+        let (_, healthy_key, healthy_sidecar) = root_sidecar(&healthy);
+        let generation = crikey_core::Generation::from_raw(2);
+        ledger
+            .publish(
+                failing.plugin_id.clone(),
+                super::RootSource::Suggestion {
+                    generation,
+                    producer: 7,
+                },
+                &[failing.clone()],
+                failing_sidecar,
+            )
+            .unwrap();
+        ledger
+            .publish(
+                healthy.plugin_id.clone(),
+                super::RootSource::Suggestion {
+                    generation,
+                    producer: 8,
+                },
+                &[healthy.clone()],
+                healthy_sidecar,
+            )
+            .unwrap();
+        let healthy_binding = ledger.binding(&healthy_key, None).unwrap();
+        ledger.retire_owner_suggestions(&failing.plugin_id);
+        assert!(ledger.binding(&failing_key, None).is_none());
+        assert!(ledger.frozen_item(&healthy_binding).is_some());
+        assert!(ledger.binding(&healthy_key, None).is_some());
+        let snapshots = ledger.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].owner, healthy.plugin_id);
+        assert_eq!(snapshots[0].source, healthy_binding.source);
+    }
+
+    #[test]
+    fn captured_scope_survives_execution_retirement_but_not_withdrawal_or_producer_replacement() {
+        use crikey_core::result_presentation::{Scope, ScopeId};
+        let target = item("native.scope");
+        let (_, key, mut presentation) = root_sidecar(&target);
+        presentation.scopes.push(Scope {
+            id: ScopeId("secure".into()),
+            label: "Secure".into(),
+        });
+        let source = super::RootSource::Suggestion {
+            generation: crikey_core::Generation::from_raw(1),
+            producer: 7,
+        };
+        let scope = super::RootScope {
+            owner: target.plugin_id.clone(),
+            id: ScopeId("secure".into()),
+            source: source.clone(),
+        };
+        let mut ledger = super::RootSourceLedger::default();
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                source.clone(),
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        let binding = ledger.binding(&key, None).unwrap();
+        assert!(ledger.capture_scope(Some(&scope)));
+        ledger.retire_suggestions();
+        assert!(ledger.scope_current(&scope));
+        assert!(ledger.frozen_item(&binding).is_none());
+        assert!(ledger.binding(&key, None).is_none());
+        let fresh = super::RootSource::Suggestion {
+            generation: crikey_core::Generation::from_raw(2),
+            producer: 7,
+        };
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                fresh,
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        assert!(ledger.scope_current(&scope));
+        assert!(ledger.capture_scope(Some(&scope)));
+        let undeclared = super::RootSource::Suggestion {
+            generation: crikey_core::Generation::from_raw(3),
+            producer: 7,
+        };
+        let mut withdrawn = presentation.clone();
+        withdrawn.scopes.clear();
+        ledger
+            .publish(target.plugin_id.clone(), undeclared, &[target.clone()], withdrawn)
+            .unwrap();
+        assert!(!ledger.scope_current(&scope));
+        assert!(!ledger.capture_scope(Some(&scope)));
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                source.clone(),
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        assert!(ledger.capture_scope(Some(&scope)));
+        let replacement = super::RootSource::Suggestion {
+            generation: crikey_core::Generation::from_raw(4),
+            producer: 8,
+        };
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                replacement,
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        assert!(!ledger.scope_current(&scope));
+        ledger
+            .publish(target.plugin_id.clone(), source, &[target], presentation)
+            .unwrap();
+        assert!(ledger.capture_scope(Some(&scope)));
+        ledger.capture_scope(None);
+        ledger.retire_suggestions();
+        assert!(!ledger.scope_current(&scope));
+    }
+
+    #[test]
+    fn changed_schema_and_source_revoke_frozen_binding() {
+        use crikey_core::structured_arguments::{ArgumentField, FieldId, FieldKind};
+        let target = item("modern.root");
+        let (source, key, mut presentation) = root_sidecar(&target);
+        let mut ledger = super::RootSourceLedger::default();
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                source.clone(),
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        let binding = ledger.binding(&key, None).unwrap();
+        presentation.schemas[0].schema = Arc::new(ArgumentSchema {
+            fields: vec![ArgumentField {
+                id: FieldId("password".into()),
+                label: "Password".into(),
+                required: true,
+                placeholder: None,
+                validation_message: None,
+                kind: FieldKind::Password {
+                    min_bytes: 1,
+                    max_bytes: 64,
+                },
+            }],
+        });
+        ledger
+            .publish(target.plugin_id.clone(), source, &[target], presentation)
+            .unwrap();
+        assert!(ledger.frozen_item(&binding).is_none());
+        let current = ledger.binding(&key, None).unwrap();
+        assert_ne!(binding.fingerprint, current.fingerprint);
+        assert!(current
+            .schema
+            .validate_values(&ArgumentValues::default())
+            .is_err());
+    }
+
+    #[test]
+    fn sidecar_none_means_actionless_not_an_invented_primary() {
+        use crikey_core::{Action, ExecutionPolicy};
+        let mut target = item("native.root");
+        let (source, key, mut presentation) = root_sidecar(&target);
+        target.actions.push(Action {
+            action_id: ActionId("actual-primary".into()),
+            label: "Run".into(),
+            description: String::new(),
+            applicable_categories: vec![target.category.clone()],
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        });
+        let mut ledger = super::RootSourceLedger::default();
+        assert!(ledger
+            .publish(
+                target.plugin_id.clone(),
+                source.clone(),
+                &[target.clone()],
+                presentation.clone()
+            )
+            .is_err());
+        presentation.schemas[0].executable.action = Some(ActionId("actual-primary".into()));
+        ledger
+            .publish(target.plugin_id.clone(), source, &[target], presentation)
+            .unwrap();
+        assert!(ledger.binding(&key, None).is_none());
+        let mut actual = key;
+        actual.action = Some(ActionId("actual-primary".into()));
+        assert!(ledger.binding(&actual, None).is_some());
+    }
+
+    #[test]
+    fn retired_origin_tombstones_are_bounded_and_never_reenable_catalog_borrowing() {
+        let target = item("native.root");
+        let (catalog, key, presentation) = root_sidecar(&target);
+        let canonical = match &catalog {
+            super::RootSource::Catalog(source) => source.clone(),
+            _ => unreachable!(),
+        };
+        let mut ledger = super::RootSourceLedger::default();
+        ledger
+            .publish(
+                target.plugin_id.clone(),
+                catalog,
+                &[target.clone()],
+                presentation.clone(),
+            )
+            .unwrap();
+        for index in 0..=crikey_core::result_presentation::MAX_PRESENTATION_ITEMS {
+            let mut dynamic = target.clone();
+            dynamic.stable_id = ItemId(format!("dynamic-{index}"));
+            ledger
+                .publish(
+                    target.plugin_id.clone(),
+                    super::RootSource::Suggestion {
+                        generation: crikey_core::Generation::from_raw(index as u64 + 2),
+                        producer: 7,
+                    },
+                    &[dynamic],
+                    ResultPresentation::default(),
+                )
+                .unwrap();
+            ledger.retire_suggestions();
+        }
+        assert!(ledger.retired.len() <= crikey_core::result_presentation::MAX_PRESENTATION_ITEMS);
+        assert!(ledger.binding(&key, None).is_none());
+        assert!(ledger.binding(&key, Some(&canonical)).is_some());
+    }
+
+    #[test]
+    fn typed_router_moves_values_and_never_grants_query_collection() {
+        use crikey_core::structured_arguments::{
+            ArgumentField, FieldId, FieldKind, Password, StructuredValue,
+        };
+        struct TypedExecutor(AtomicBool);
+        impl PluginActionExecutor for TypedExecutor {
+            fn submit_plugin_action(
+                &self,
+                _: &PluginId,
+                _: &Item,
+                _: &ActionId,
+                _: Option<&str>,
+            ) -> CoreResult<super::ActionRequestId> {
+                panic!("typed input must never fall through to legacy execution")
+            }
+            fn submit_typed(
+                &self,
+                binding: &super::RootExecutableBinding,
+                values: ArgumentValues,
+            ) -> CoreResult<super::TypedActionReceipt> {
+                assert!(binding.schema.validate_values(&values).is_ok());
+                self.0.store(true, Ordering::Release);
+                Ok(super::TypedActionReceipt {
+                    receipt: super::PluginActionReceipt {
+                        request_id: super::ActionRequestId {
+                            plugin: binding.executable.target.owner.clone(),
+                            sequence: 1,
+                        },
+                        query_history_allowed: true,
+                    },
+                    item: item(&binding.executable.target.owner.0),
+                })
+            }
+        }
+        let target = item("modern.private");
+        let (source, key, _) = root_sidecar(&target);
+        let schema = Arc::new(ArgumentSchema {
+            fields: vec![ArgumentField {
+                id: FieldId("password".into()),
+                label: "Password".into(),
+                required: true,
+                placeholder: None,
+                validation_message: None,
+                kind: FieldKind::Password {
+                    min_bytes: 1,
+                    max_bytes: 64,
+                },
+            }],
+        });
+        let binding = super::RootExecutableBinding {
+            executable: key,
+            source,
+            fingerprint: schema.fingerprint().unwrap(),
+            schema,
+        };
+        let executor = Arc::new(TypedExecutor(AtomicBool::new(false)));
+        let mut router = PluginActionRouter::default();
+        router.register([target.plugin_id], executor.clone()).unwrap();
+        assert!(router.submit_typed(&binding, ArgumentValues::default()).is_err());
+        assert!(!executor.0.load(Ordering::Acquire));
+        let mut values = ArgumentValues::default();
+        values.0.insert(
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new("private-value".into()).unwrap()),
+        );
+        assert!(!format!("{values:?}").contains("private-value"));
+        let receipt = router.submit_typed(&binding, values).unwrap();
+        assert!(!receipt.receipt.query_history_allowed);
+        assert!(executor.0.load(Ordering::Acquire));
     }
 
     #[test]

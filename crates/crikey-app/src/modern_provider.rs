@@ -38,6 +38,11 @@
 //! returned when it belongs to the current generation — so a superseded answer
 //! is refused at the pipeline's intake boundary rather than shown out of order
 //! (acceptance 31.7).
+//!
+//! Typed root metadata is admitted with the complete catalog or exact suggestion
+//! generation. A captured suggestion scope survives executable retirement only
+//! while its declaration and physical producer remain current. Typed submissions
+//! retain the frozen item/schema and confirm it on that physical worker.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -67,21 +72,26 @@ use crikey_python_host::{
 };
 use crikey_ui::{ResultRow, ViewModel};
 
+use crate::plugin_action::{
+    RootExecutableBinding, RootPresentationSnapshot, RootScope, RootSource, RootSourceLedger,
+    SharedOriginItems,
+};
 use crate::plugin_preview::{
-    PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState, PreviewUpdate,
+    PendingPreviews, PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState,
+    PreviewUpdate,
 };
 use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate};
+use crate::query_pipeline::ProviderQueryContext;
 use crate::{
     plugin_icons::PluginIconResolver, ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError,
     DisabledPlugins, ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch,
     DISABLED_BY_CONFIGURATION,
 };
+use crikey_core::result_presentation::ResultPresentation;
+use crikey_core::structured_arguments::{ArgumentValues, ExecutableKey, OwnedItem};
 use crikey_core::{PreviewContent, PreviewImage, PreviewText, PreviewValue, PreviewValueKind};
 
-/// Shared item snapshots paired with their producing source epoch.
-type ModernItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>;
 type ModernStaticItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>;
-type ModernPreviewCalls = Arc<Mutex<Vec<(PreviewIdentity, Arc<AtomicBool>)>>>;
 
 struct ModernPreviewJob {
     request: PreviewRequest,
@@ -94,11 +104,11 @@ struct ModernPreviewEndpoint {
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     action_in_flight: Arc<AtomicUsize>,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
-    items: ModernItemStore,
-    catalog_items: ModernItemStore,
+    items: SharedOriginItems,
+    catalog_items: SharedOriginItems,
     static_catalog_items: ModernStaticItemStore,
     accepted_commands: ModernAcceptedCommands,
-    pending: ModernPreviewCalls,
+    pending: PendingPreviews<AtomicBool>,
     stopped: AtomicBool,
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -873,15 +883,28 @@ enum CatalogWorkerReturn {
 /// same capacity never blocks a worker that is completing a legal task.
 #[derive(Debug)]
 struct ModernCatalogDispatcher {
-    result_tx: SyncSender<(u64, CatalogBuildResult, CatalogWorkerReturn, ModernOwnerCommands)>,
-    result_rx: Receiver<(u64, CatalogBuildResult, CatalogWorkerReturn, ModernOwnerCommands)>,
+    result_tx: SyncSender<(
+        u64,
+        CatalogBuildResult,
+        CatalogWorkerReturn,
+        ModernOwnerCommands,
+        ResultPresentation,
+    )>,
+    result_rx: Receiver<(
+        u64,
+        CatalogBuildResult,
+        CatalogWorkerReturn,
+        ModernOwnerCommands,
+        ResultPresentation,
+    )>,
     tasks: BTreeMap<u64, ModernCatalogTask>,
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
-    items: ModernItemStore,
+    items: SharedOriginItems,
     static_items: ModernStaticItemStore,
     commands: ModernCommands,
     accepted_commands: ModernAcceptedCommands,
+    root: Arc<Mutex<RootSourceLedger>>,
 }
 
 impl Default for ModernCatalogDispatcher {
@@ -897,6 +920,7 @@ impl Default for ModernCatalogDispatcher {
             static_items: Arc::new(Mutex::new(BTreeMap::new())),
             commands: Arc::new(Mutex::new(Arc::new(ModernCommandSnapshot::default()))),
             accepted_commands: Arc::default(),
+            root: Arc::default(),
         }
     }
 }
@@ -920,7 +944,7 @@ impl ModernCatalogDispatcher {
 
     fn take(&mut self, pool: &mut ModernWorkerPool) -> Vec<CatalogBuildResult> {
         let mut ready = Vec::new();
-        while let Ok((id, result, worker, commands)) = self.result_rx.try_recv() {
+        while let Ok((id, result, worker, mut commands, presentation)) = self.result_rx.try_recv() {
             let Some(mut task) = self.tasks.remove(&id) else {
                 continue;
             };
@@ -963,6 +987,49 @@ impl ModernCatalogDispatcher {
                 .accepted_commands
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            // Declaration retirement revokes sidecar authority, not an
+            // otherwise successful ordinary catalog. The accepted-source lock
+            // above serializes this decision with source invalidation.
+            let admitted = match &result {
+                CatalogBuildResult::Complete(build) => self
+                    .commands
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .owners
+                    .get(&build.plugin)
+                    .is_some_and(|source| {
+                        source.request_id == id && source.status == ModernCommandStatus::Pending
+                    }),
+                _ => false,
+            };
+            if admitted {
+                if let CatalogBuildResult::Complete(build) = &result {
+                    let source = RootSource::Catalog(crate::plugin_action::DeclaredCommandSource {
+                        publication: id,
+                        instance: build.instance,
+                        generation: build.generation,
+                        producer: commands.incarnation,
+                    });
+                    let mut root = self.root.lock().unwrap_or_else(|error| error.into_inner());
+                    if root
+                        .publish(build.plugin.clone(), source, &build.items, presentation)
+                        .is_err()
+                    {
+                        root.invalidate(&build.plugin);
+                        // Presentation/executable rejection must not discard
+                        // ordinary items or overwrite an existing declaration
+                        // validation diagnostic (for example duplicate actions).
+                        if matches!(
+                            commands.status,
+                            ModernCommandStatus::Ready | ModernCommandStatus::Unsupported
+                        ) {
+                            commands.status =
+                                ModernCommandStatus::Invalid("invalid catalog presentation".into());
+                        }
+                        commands.declarations.clear();
+                    }
+                }
+            }
             if let CatalogBuildResult::Complete(build) = &result {
                 accepted.remove(&build.plugin);
                 let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
@@ -1104,6 +1171,10 @@ struct ModernCancellation {
     /// query. It lives on the registry because that is the one piece of
     /// supersession state the driver and the moved-out provider already share.
     intake: AtomicU64,
+    /// Intake whose suggestion authority has completed retirement under `root`.
+    suggestion_intake: AtomicU64,
+    #[cfg(test)]
+    publication_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
 }
 
 impl ModernCancellation {
@@ -1129,6 +1200,11 @@ impl ModernCancellation {
     /// The stamp of the newest admitted query.
     fn intake(&self) -> u64 {
         self.intake.load(Ordering::Acquire)
+    }
+
+    fn source_current(&self, source: &RootSource) -> bool {
+        matches!(source, RootSource::Catalog(_))
+            || self.suggestion_intake.load(Ordering::Acquire) == self.intake()
     }
 
     fn cancel_before(&self, generation: u64) {
@@ -1301,7 +1377,7 @@ pub struct ModernProvider {
     /// Current async suggestion snapshots keyed by the owning plugin and item
     /// id, atomically paired with the incarnation that produced each suggestion.
     /// Stable item ids are only unique within an owner.
-    action_items: ModernItemStore,
+    action_items: SharedOriginItems,
     cancellation: Arc<ModernCancellation>,
     /// Intake stamp of the query currently being served, set by the supervisor
     /// before each `drive_query`. Zero when nothing drives this provider
@@ -1769,6 +1845,11 @@ impl ModernProvider {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .retain(|(owner, _), _| owner != plugin);
+        self.catalog
+            .root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire_owner_suggestions(plugin);
         self.pool.workers.insert(key, WorkerLifecycle::NeverStarted);
         self.pool.recorded.remove(plugin);
         Ok(())
@@ -2016,6 +2097,8 @@ impl ModernProvider {
                 let keep_origin = worker.as_ref().is_some_and(ModernWorker::supports_preview)
                     && matches!(&completion, CatalogBuildResult::Complete(build)
                         if build.items.iter().any(|item| item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")));
+                let presentation = worker.as_ref().map(|worker| worker.presentation().clone())
+                    .unwrap_or_default();
                 let worker = if !panicked && worker.as_ref().is_some_and(ModernWorker::is_alive) {
                     if !was_live && !keep_origin {
                         let _ = worker.take().expect("healthy producer").shutdown();
@@ -2030,7 +2113,7 @@ impl ModernProvider {
                     };
                     CatalogWorkerReturn::Failed(reason)
                 };
-                let _ = sender.send((request_id, completion, worker, commands));
+                let _ = sender.send((request_id, completion, worker, commands, presentation));
                 drop(guard);
             })
             .map_err(|error| {
@@ -2092,12 +2175,26 @@ impl ModernProvider {
     /// retirement. Late completion cannot revive it. Old source revocation
     /// cannot remove a newer catalog. Preview release/restart does not call this.
     pub fn invalidate_command_source(&self, owner: &PluginId, request_id: u64) -> bool {
-        invalidate_modern_commands(
+        let invalidated = invalidate_modern_commands(
             &self.catalog.commands,
             &self.catalog.accepted_commands,
             owner,
             request_id,
-        )
+        );
+        if invalidated {
+            let mut root = self
+                .catalog
+                .root
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if root.snapshots().iter().any(|snapshot| {
+                snapshot.owner == *owner
+                    && matches!(&snapshot.source, RootSource::Catalog(source) if source.publication == request_id)
+            }) {
+                root.invalidate(owner);
+            }
+        }
+        invalidated
     }
 
     /// Clones the provider-owned action budget handles for the asynchronous
@@ -2115,7 +2212,25 @@ impl ModernProvider {
     /// The request owns the action guard. Keeping it in this function until
     /// the worker outcome is converted to `CoreResult` covers failures,
     /// cancellation, timeout and panic/unwind paths.
-    fn execute_action_request(&mut self, request: ModernActionRequest) -> crikey_core::Result<()> {
+    fn execute_action_request(
+        &mut self,
+        mut request: ModernActionRequest,
+    ) -> crikey_core::Result<crate::ActionEffect> {
+        if let Some(binding) = request.work.typed_binding() {
+            if !self.cancellation.source_current(&binding.source)
+                || self
+                    .catalog
+                    .root
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .frozen_item(binding)
+                    .is_none()
+            {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed modern source is no longer current".into(),
+                ));
+            }
+        }
         let _guard = request.admission.acquire(request.deadline, &request.cancelled)?;
         if request.cancelled.load(Ordering::Acquire) {
             return Err(crikey_core::CoreError::Cancelled);
@@ -2295,6 +2410,77 @@ impl ModernProvider {
             }
         }
 
+        if let Some(binding) = request.work.typed_binding().cloned() {
+            let action = binding.executable.action.as_ref().map(|id| id.0.as_str());
+            if !worker
+                .confirm_typed_schema(item, action, &binding.schema)
+                .map_err(|_| {
+                    crikey_core::CoreError::Invalid("typed modern schema confirmation failed".into())
+                })?
+            {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed modern schema changed".into(),
+                ));
+            }
+            if !self.cancellation.source_current(&binding.source)
+                || self
+                    .catalog
+                    .root
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .frozen_item(&binding)
+                    .is_none()
+            {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed modern source is no longer current".into(),
+                ));
+            }
+            if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
+                return Err(crikey_core::CoreError::Cancelled);
+            }
+            let values = request.work.take_typed_values().ok_or_else(|| {
+                crikey_core::CoreError::Invalid("typed modern values are unavailable".into())
+            })?;
+            let handle = worker.cancel_handle();
+            handle.reset();
+            let finished = AtomicBool::new(false);
+            let root = &self.catalog.root;
+            let cancellation = &self.cancellation;
+            let outcome = thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    while !finished.load(Ordering::Acquire) {
+                        if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
+                            handle.cancel();
+                            break;
+                        }
+                        thread::park_timeout(Duration::from_millis(5));
+                    }
+                });
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    worker
+                        .typed_execute_with_admission(item, action, &binding.schema, values, |send| {
+                            let root = root.lock().unwrap_or_else(|error| error.into_inner());
+                            cancellation.source_current(&binding.source)
+                                && root.frozen_item(&binding).is_some()
+                                && !request.cancelled.load(Ordering::Acquire)
+                                && Instant::now() < request.deadline
+                                && send()
+                        })
+                        .map_err(|_| crikey_core::CoreError::Invalid("typed modern execution failed".into()))
+                }));
+                finished.store(true, Ordering::Release);
+                watcher.thread().unpark();
+                let _ = watcher.join();
+                outcome
+            });
+            return match outcome {
+                Ok(Ok(outcome)) => Ok(crate::ActionEffect::Typed(outcome)),
+                Ok(Err(error)) => Err(error),
+                _ => Err(crikey_core::CoreError::Invalid(
+                    "typed modern execution failed".into(),
+                )),
+            };
+        }
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             worker.execute(
                 item,
@@ -2303,7 +2489,7 @@ impl ModernProvider {
             )
         }));
         match outcome {
-            Ok(Ok(ExecuteOutcome::Ok)) => Ok(()),
+            Ok(Ok(ExecuteOutcome::Ok)) => Ok(crate::ActionEffect::Completed),
             Ok(Ok(ExecuteOutcome::Failed(error))) => {
                 let reason = format!("modern plugin action failed: {}", error.message);
                 self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
@@ -2352,7 +2538,62 @@ impl ModernProvider {
         query: &str,
         now: Millis,
     ) -> Option<ViewModel> {
-        let generation = pipeline.keystroke(query, now);
+        self.drive_query_scoped(pipeline, query, now, None)
+    }
+
+    /// Admit an exact declared scope; an unavailable source never broadens to All.
+    pub fn drive_query_scoped(
+        &mut self,
+        pipeline: &mut QueryPipeline,
+        query: &str,
+        now: Millis,
+        scope: Option<RootScope>,
+    ) -> Option<ViewModel> {
+        let owned_scope = scope
+            .as_ref()
+            .filter(|scope| self.loaded.iter().any(|loaded| loaded.plugin == scope.owner));
+        if let Some(scope) = owned_scope {
+            if let RootSource::Suggestion { producer, .. } = &scope.source {
+                let key = &self
+                    .loaded
+                    .iter()
+                    .find(|loaded| loaded.plugin == scope.owner)?
+                    .key;
+                if !self
+                    .pool
+                    .live_mut(key)
+                    .is_some_and(|worker| worker.incarnation() == *producer && worker.is_alive())
+                {
+                    return None;
+                }
+            }
+        }
+        if (scope.is_none() || owned_scope.is_some())
+            && !self
+                .catalog
+                .root
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .capture_scope(owned_scope)
+        {
+            return None;
+        }
+        self.drive_query_admitted(pipeline, query, now, scope)
+    }
+
+    fn drive_query_admitted(
+        &mut self,
+        pipeline: &mut QueryPipeline,
+        query: &str,
+        now: Millis,
+        scope: Option<RootScope>,
+    ) -> Option<ViewModel> {
+        self.catalog
+            .root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire_suggestions();
+        let generation = pipeline.keystroke_scoped(query, now, scope.clone());
         // One reset per query, not one per tick: a generation can be dispatched
         // across several wake-ups, and clearing inside the collection below
         // would drop the action items an earlier tick's plugins just produced.
@@ -2403,7 +2644,8 @@ impl ModernProvider {
 
             let requested: BTreeSet<PluginId> =
                 requests.iter().map(|request| request.plugin.clone()).collect();
-            let (mut suggestions, newly_dead) = self.collect_suggestions(query, generation, &requested);
+            let (mut suggestions, newly_dead) =
+                self.collect_suggestions(query, generation, &requested, scope.as_ref());
             for request in requests {
                 if newly_dead.contains(&request.plugin) {
                     let _ = pipeline.fail_request(&request.plugin, request.generation, at);
@@ -2479,6 +2721,7 @@ impl ModernProvider {
         query: &str,
         generation: Generation,
         requested: &BTreeSet<PluginId>,
+        scope: Option<&RootScope>,
     ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
         let request = SuggestRequest {
             generation: generation.get(),
@@ -2554,6 +2797,26 @@ impl ModernProvider {
                 continue;
             }
 
+            if let Some(scope) = scope {
+                let current = scope_declared(&self.catalog.root, scope)
+                    && match &scope.source {
+                        RootSource::Catalog(_) => true,
+                        RootSource::Suggestion { producer, .. } => self
+                            .pool
+                            .live_mut(&key)
+                            .is_some_and(|worker| worker.incarnation() == *producer),
+                    };
+                if plugin != scope.owner
+                    || !current
+                    || !self
+                        .pool
+                        .live_mut(&key)
+                        .is_some_and(|worker| worker.supports_result_presentation())
+                {
+                    dead_plugins.insert(plugin.clone());
+                    continue;
+                }
+            }
             let control = Arc::new(ModernCallControl::new());
             self.cancellation
                 .register(generation.get(), plugin.clone(), Arc::clone(&control));
@@ -2574,7 +2837,9 @@ impl ModernProvider {
                     .name(format!("crikey-modern-cancel-{}", plugin.0))
                     .spawn(move || control_for_thread.watch_cancel());
                 let started = Instant::now();
-                let answer = catch_unwind(AssertUnwindSafe(|| worker.suggest_with_cancel_latched(&request)));
+                let answer = catch_unwind(AssertUnwindSafe(|| {
+                    worker.suggest_scoped(&request, scope.map(|scope| scope.id.0.as_str()))
+                }));
                 let elapsed = started.elapsed();
                 control.finish();
                 if let Ok(watcher) = watcher {
@@ -2616,13 +2881,68 @@ impl ModernProvider {
                     // reported.
                     for item in &mut items {
                         item.plugin_id = plugin.clone();
-                        self.action_items
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .insert(
-                                (plugin.clone(), item.stable_id.clone()),
-                                (item.clone(), incarnation),
-                            );
+                    }
+                    if self.superseded() {
+                        continue;
+                    }
+                    if scope.is_some_and(|scope| {
+                        !scope_declared(&self.catalog.root, scope)
+                            || matches!(&scope.source, RootSource::Suggestion { producer, .. } if *producer != incarnation)
+                    }) {
+                        dead_plugins.insert(plugin.clone());
+                        continue;
+                    }
+                    #[cfg(test)]
+                    if let Some((entered, resume)) = self
+                        .cancellation
+                        .publication_pause
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                    {
+                        entered.send(()).unwrap();
+                        resume.recv().unwrap();
+                    }
+                    // The intake check and publication share retirement's ledger
+                    // lock: a completion cannot republish after a newer intake
+                    // has retired its generation.
+                    let mut root = self
+                        .catalog
+                        .root
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if self.superseded() {
+                        continue;
+                    }
+                    if scope.is_some_and(|scope| !root.scope_current(scope)) {
+                        dead_plugins.insert(plugin.clone());
+                        continue;
+                    }
+                    let publication = root.publish(
+                        plugin.clone(),
+                        RootSource::Suggestion {
+                            generation,
+                            producer: incarnation,
+                        },
+                        &items,
+                        suggestions.presentation,
+                    );
+                    drop(root);
+                    if publication.is_err() {
+                        dead_plugins.insert(plugin.clone());
+                        self.pool
+                            .record_dispatch_failure(plugin, "invalid modern suggestion presentation".into());
+                        continue;
+                    }
+                    let mut action_items = self
+                        .action_items
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    for item in &items {
+                        action_items.insert(
+                            (plugin.clone(), item.stable_id.clone()),
+                            (item.clone(), incarnation),
+                        );
                     }
                     by_plugin.insert(plugin, items);
                 }
@@ -2646,6 +2966,11 @@ impl ModernProvider {
         (by_plugin, dead_plugins)
     }
 }
+fn scope_declared(root: &Mutex<RootSourceLedger>, scope: &RootScope) -> bool {
+    root.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .scope_current(scope)
+}
 
 /// One query handed to the modern supervisor thread, tagged with the search
 /// generation it belongs to.
@@ -2662,6 +2987,7 @@ struct ModernJob {
     builtin_rows: Vec<ResultRow>,
     builtin_pending: bool,
     selected: usize,
+    scope: Option<RootScope>,
 }
 
 /// The supervisor's request mailbox: a single slot with replace-oldest
@@ -2727,11 +3053,13 @@ struct ModernActionEndpoint {
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     action_wake: crate::plugin_action::CompletionWake,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
-    preview_pending: ModernPreviewCalls,
-    items: ModernItemStore,
-    catalog_items: ModernItemStore,
+    preview_pending: PendingPreviews<AtomicBool>,
+    items: SharedOriginItems,
+    catalog_items: SharedOriginItems,
     static_catalog_items: ModernStaticItemStore,
     accepted_commands: ModernAcceptedCommands,
+    root: Arc<Mutex<RootSourceLedger>>,
+    cancellation: Arc<ModernCancellation>,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
@@ -2749,6 +3077,25 @@ impl ModernActionEndpoint {
         argument: Option<&str>,
         query_history_allowed: bool,
     ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
+        let executable = ExecutableKey {
+            target: OwnedItem {
+                owner: plugin.clone(),
+                item: item.stable_id.clone(),
+            },
+            action: work.action_id().cloned(),
+        };
+        if work.typed_binding().is_none()
+            && self
+                .root
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .binding(&executable, work.command_source().map(|(_, source)| source))
+                .is_some()
+        {
+            return Err(crikey_core::CoreError::Invalid(
+                "typed arguments are required".into(),
+            ));
+        }
         let reserved = self
             .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2839,6 +3186,96 @@ impl ModernActionEndpoint {
 }
 
 impl crate::PluginActionExecutor for ModernActionEndpoint {
+    fn root_binding(
+        &self,
+        key: &ExecutableKey,
+        canonical: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<RootExecutableBinding> {
+        let root = self.root.lock().unwrap_or_else(|error| error.into_inner());
+        root.binding(key, canonical)
+            .filter(|binding| self.cancellation.source_current(&binding.source))
+    }
+
+    fn root_presentations(&self) -> Vec<RootPresentationSnapshot> {
+        self.root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| self.cancellation.source_current(&snapshot.source))
+            .collect()
+    }
+
+    fn root_scope_current(&self, scope: &RootScope) -> bool {
+        if !self.gates.contains_key(&scope.owner) || !scope_declared(&self.root, scope) {
+            return false;
+        }
+        match &scope.source {
+            RootSource::Catalog(_) => true,
+            RootSource::Suggestion { producer, .. } => {
+                self.incarnations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&scope.owner)
+                    == Some(producer)
+            }
+        }
+    }
+
+    fn submit_typed(
+        &self,
+        binding: &RootExecutableBinding,
+        values: ArgumentValues,
+    ) -> crikey_core::Result<crate::plugin_action::TypedActionReceipt> {
+        binding
+            .schema
+            .validate_values(&values)
+            .map_err(|_| crikey_core::CoreError::Invalid("invalid typed modern arguments".into()))?;
+        if !self.cancellation.source_current(&binding.source) {
+            return Err(crikey_core::CoreError::Invalid(
+                "typed modern source is no longer current".into(),
+            ));
+        }
+        let item = {
+            let root = self.root.lock().unwrap_or_else(|error| error.into_inner());
+            if !self.cancellation.source_current(&binding.source) {
+                return Err(crikey_core::CoreError::Invalid(
+                    "typed modern source is no longer current".into(),
+                ));
+            }
+            root.frozen_item(binding).ok_or_else(|| {
+                crikey_core::CoreError::Invalid("typed modern source is no longer current".into())
+            })?
+        };
+        let origin = match &binding.source {
+            RootSource::Catalog(_) => None,
+            RootSource::Suggestion { producer, .. } => Some(*producer),
+        };
+        if origin.is_some_and(|origin| {
+            self.incarnations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&binding.executable.target.owner)
+                .copied()
+                != Some(origin)
+        }) {
+            return Err(crikey_core::CoreError::Invalid(
+                "typed modern producer is unavailable".into(),
+            ));
+        }
+        let receipt = self.enqueue(
+            &binding.executable.target.owner,
+            item.clone(),
+            origin,
+            crate::plugin_action::AdmittedPluginWork::Typed {
+                binding: binding.clone(),
+                values,
+            },
+            None,
+            false,
+        )?;
+        Ok(crate::plugin_action::TypedActionReceipt { receipt, item })
+    }
     fn submit_declared_command_with_receipt(
         &self,
         declaration: &CommandDeclaration,
@@ -3149,6 +3586,8 @@ impl ModernDriver {
             catalog_items: Arc::clone(&provider.catalog.items),
             static_catalog_items: Arc::clone(&provider.catalog.static_items),
             accepted_commands: Arc::clone(&provider.catalog.accepted_commands),
+            root: Arc::clone(&provider.catalog.root),
+            cancellation: Arc::clone(&provider.cancellation),
             incarnations: Arc::clone(&preview_endpoint.incarnations),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             in_flight: Arc::clone(&preview_endpoint.action_in_flight),
@@ -3297,7 +3736,7 @@ impl ModernDriver {
                                 plugin,
                                 item_id,
                                 action_id,
-                                outcome: result.map(|()| crate::ActionEffect::Completed),
+                                outcome: result,
                             };
                             enqueue_modern_completion(
                                 &thread_completion_mailbox,
@@ -3329,7 +3768,7 @@ impl ModernDriver {
                     // The blocking child interpreter calls happen here, on this
                     // thread — never on the caller's. Stale answers are refused
                     // at the pipeline's intake boundary inside `drive_query`.
-                    let modern = provider.drive_query(&mut pipeline, &job.query, job.now);
+                    let modern = provider.drive_query_admitted(&mut pipeline, &job.query, job.now, job.scope);
                     thread_preview_endpoint.refresh_liveness(&mut provider);
                     *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                         pipeline.plugin_health_report();
@@ -3462,6 +3901,41 @@ impl ModernDriver {
         builtin_pending: bool,
         selected: usize,
     ) {
+        let _ = self.submit_scoped(
+            ProviderQueryContext {
+                generation,
+                text: query,
+                now,
+                selected,
+            },
+            builtin_rows,
+            builtin_pending,
+            None,
+        );
+    }
+
+    /// Submit an exact owner-qualified scope, returning an explicit stale-source refusal.
+    pub fn submit_scoped(
+        &self,
+        context: ProviderQueryContext<'_>,
+        builtin_rows: Vec<ResultRow>,
+        builtin_pending: bool,
+        scope: Option<RootScope>,
+    ) -> crikey_core::Result<()> {
+        let ProviderQueryContext {
+            generation,
+            text: query,
+            now,
+            selected,
+        } = context;
+        if scope.as_ref().is_some_and(|scope| {
+            self.permissions.contains_key(&scope.owner)
+                && !crate::PluginActionExecutor::root_scope_current(self.action_endpoint.as_ref(), scope)
+        }) {
+            return Err(crikey_core::CoreError::Invalid(
+                "modern query scope is unavailable".into(),
+            ));
+        }
         // Intake is monotonic even though `Generation` can be reconstructed
         // from an external value. A delayed caller must not rewind the live
         // generation and make its obsolete job eligible for publication.
@@ -3469,7 +3943,7 @@ impl ModernDriver {
         let mut observed = self.current.load(Ordering::Acquire);
         loop {
             if generation_value < observed {
-                return;
+                return Ok(());
             }
             match self.current.compare_exchange_weak(
                 observed,
@@ -3481,17 +3955,34 @@ impl ModernDriver {
                 Err(next) => observed = next,
             }
         }
-        // Signal superseded in-flight callbacks before queueing the new job.
+        // Capture and retirement share publication's ledger lock. A scope token
+        // is not executable authority and does not use the old intake stamp.
         self.cancellation.cancel_before(generation_value);
-        // Stamped before the job is queued: any later submission raises the
-        // registry's count past this stamp, so a provider already inside this
-        // job's startup handshake observes the supersession.
         let intake = self.cancellation.admit();
 
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
-            return;
+            return Err(crikey_core::CoreError::Cancelled);
+        }
+        {
+            let mut root = self
+                .action_endpoint
+                .root
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let owned_scope = scope
+                .as_ref()
+                .filter(|scope| self.permissions.contains_key(&scope.owner));
+            if (scope.is_none() || owned_scope.is_some()) && !root.capture_scope(owned_scope) {
+                return Err(crikey_core::CoreError::Invalid(
+                    "modern query scope is unavailable".into(),
+                ));
+            }
+            root.retire_suggestions();
+            self.cancellation
+                .suggestion_intake
+                .store(intake, Ordering::Release);
         }
         let state = if self.worker.is_some() {
             crate::command_preferences::OrdinaryProviderState::Pending
@@ -3509,6 +4000,7 @@ impl ModernDriver {
                     .query_policies
                     .iter()
                     .filter(|(_, policy)| policy.query_applicable(query))
+                    .filter(|(owner, _)| scope.as_ref().is_none_or(|scope| &scope.owner == *owner))
                     .map(|(plugin, _)| crate::query_pipeline::OrdinarySearchProvider {
                         plugin: plugin.clone(),
                         state,
@@ -3523,9 +4015,11 @@ impl ModernDriver {
             builtin_rows,
             builtin_pending,
             selected,
+            scope,
         });
         drop(slot);
         cvar.notify_one();
+        Ok(())
     }
 
     /// Hands the supervisor thread one complete configuration state to publish
@@ -3586,12 +4080,26 @@ impl ModernDriver {
     }
 
     pub fn invalidate_command_source(&self, owner: &PluginId, request_id: u64) -> bool {
-        invalidate_modern_commands(
+        let invalidated = invalidate_modern_commands(
             &self.commands,
             &self.action_endpoint.accepted_commands,
             owner,
             request_id,
-        )
+        );
+        if invalidated {
+            let mut root = self
+                .action_endpoint
+                .root
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if root.snapshots().iter().any(|snapshot| {
+                snapshot.owner == *owner
+                    && matches!(&snapshot.source, RootSource::Catalog(source) if source.publication == request_id)
+            }) {
+                root.invalidate(owner);
+            }
+        }
+        invalidated
     }
 
     /// Returns the exact plugin ids owned by this driver's action endpoint.
@@ -4750,6 +5258,8 @@ mod query_history_receipt_tests {
                 catalog_items: Arc::default(),
                 static_catalog_items: Arc::default(),
                 accepted_commands: Arc::default(),
+                root: Arc::default(),
+                cancellation: Arc::default(),
                 pending: Arc::default(),
                 in_flight: Arc::default(),
                 next_id: Arc::default(),
@@ -4922,7 +5432,7 @@ class Receipt(Plugin):
     def commands(self):
         return [Command("default", "Default callback", "actionless")]
     def execute(self, item, action_id, argument):
-        with Path(__file__).with_name("executed").open("a", encoding="utf-8") as stream:
+        with Path(__file__).with_name("executed").open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(item.label + (" default" if action_id is None else "") + "\n")
 "#).unwrap();
         let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
@@ -5044,5 +5554,633 @@ class Receipt(Plugin):
             fs::read_to_string(marker).unwrap().as_str(),
             "Receipt\nActionless default\n" | "Receipt\r\nActionless default\r\n"
         ));
+    }
+    fn password_values() -> ArgumentValues {
+        use crikey_core::structured_arguments::{FieldId, Password, StructuredValue};
+        ArgumentValues(BTreeMap::from([(
+            FieldId("secret".into()),
+            StructuredValue::Password(Password::new("provider-private-value".into()).unwrap()),
+        )]))
+    }
+
+    fn password_presentation(item: &Item) -> ResultPresentation {
+        use crikey_core::result_presentation::ExecutableSchemaBinding;
+        use crikey_core::structured_arguments::{ArgumentField, ArgumentSchema, FieldId, FieldKind};
+        ResultPresentation {
+            schemas: vec![ExecutableSchemaBinding {
+                executable: ExecutableKey {
+                    target: OwnedItem {
+                        owner: item.plugin_id.clone(),
+                        item: item.stable_id.clone(),
+                    },
+                    action: item.actions.first().map(|action| action.action_id.clone()),
+                },
+                schema: Arc::new(ArgumentSchema {
+                    fields: vec![ArgumentField {
+                        id: FieldId("secret".into()),
+                        label: "Secret".into(),
+                        required: true,
+                        placeholder: None,
+                        validation_message: None,
+                        kind: FieldKind::Password {
+                            min_bytes: 1,
+                            max_bytes: 64,
+                        },
+                    }],
+                }),
+            }],
+            ..ResultPresentation::default()
+        }
+    }
+
+    #[test]
+    fn typed_admission_moves_values_and_rejects_retired_generation_and_legacy_path() {
+        let item = item();
+        let (endpoint, receiver) = endpoint(item.clone());
+        let source = RootSource::Suggestion {
+            generation: Generation::from_raw(4),
+            producer: 1,
+        };
+        let presentation = password_presentation(&item);
+        let key = presentation.schemas[0].executable.clone();
+        endpoint
+            .root
+            .lock()
+            .unwrap()
+            .publish(item.plugin_id.clone(), source, &[item.clone()], presentation)
+            .unwrap();
+        let binding = endpoint.root_binding(&key, None).unwrap();
+        assert!(endpoint
+            .submit_plugin_action_with_receipt(&item.plugin_id, &item, &item.actions[0].action_id, None,)
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+        let receipt = endpoint.submit_typed(&binding, password_values()).unwrap();
+        assert!(!receipt.receipt.query_history_allowed);
+        let request = receiver.try_recv().unwrap();
+        assert!(request.argument.is_none());
+        assert_eq!(request.origin, Some(1));
+        assert!(!format!("{request:?}").contains("provider-private-value"));
+        request.work.validate(&request.item, None).unwrap();
+        drop(request);
+        endpoint.root.lock().unwrap().retire_suggestions();
+        assert!(endpoint.submit_typed(&binding, password_values()).is_err());
+        assert!(receiver.try_recv().is_err());
+        endpoint
+            .root
+            .lock()
+            .unwrap()
+            .publish(
+                item.plugin_id.clone(),
+                RootSource::Suggestion {
+                    generation: Generation::from_raw(5),
+                    producer: 1,
+                },
+                &[item.clone()],
+                password_presentation(&item),
+            )
+            .unwrap();
+        assert!(endpoint.submit_typed(&binding, password_values()).is_err());
+        let current = endpoint.root_binding(&key, None).unwrap();
+        endpoint
+            .incarnations
+            .lock()
+            .unwrap()
+            .insert(item.plugin_id.clone(), 2);
+        assert!(endpoint.submit_typed(&current, password_values()).is_err());
+    }
+
+    #[test]
+    fn invalid_complete_sidecar_grants_no_binding_or_scope_authority() {
+        let item = item();
+        let (endpoint, receiver) = endpoint(item.clone());
+        let mut presentation = password_presentation(&item);
+        let key = presentation.schemas[0].executable.clone();
+        presentation.schemas[0].executable.target.owner = PluginId("modern.other".into());
+        let source = RootSource::Suggestion {
+            generation: Generation::from_raw(1),
+            producer: 1,
+        };
+        assert!(endpoint
+            .root
+            .lock()
+            .unwrap()
+            .publish(
+                item.plugin_id.clone(),
+                source.clone(),
+                &[item.clone()],
+                presentation
+            )
+            .is_err());
+        assert!(endpoint.root_binding(&key, None).is_none());
+        assert!(endpoint.root_presentations().is_empty());
+        assert!(!scope_declared(
+            &endpoint.root,
+            &RootScope {
+                owner: item.plugin_id,
+                id: crikey_core::result_presentation::ScopeId("private".into()),
+                source,
+            }
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn captured_dynamic_scope_survives_pending_intake_and_uses_fresh_membership() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "crikey-modern-scope-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&path).unwrap();
+        let fixture = ProcessFixture(path);
+        let package = fixture.0.join("plugins/scoped");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("crikey.toml"),
+            "manifest-version = 1\n[plugin]\nid = \"scoped\"\nname = \"Scoped\"\nversion = \"1.0.0\"\nruntime = \"python\"\nentrypoint = \"scoped:Scoped\"\n[python]\nrequires-python = \">=3.12\"\n[performance]\nstartup = \"lazy\"\n").unwrap();
+        fs::write(
+            package.join("scoped.py"),
+            r#"
+from pathlib import Path
+from crikey_sdk import Item, Plugin
+from crikey_sdk.arguments import ResultPresentation, Scope, ItemPresentation
+class Scoped(Plugin):
+    def supports_result_presentation(self):
+        return True
+    def suggest(self, query, context):
+        Path(__file__).with_name("scope").write_text(query.selected_scope_id or "all")
+        context.emit(Item(query.text, query.text, query.text))
+    def suggestion_presentation(self, query):
+        if query.text == "missing":
+            return ResultPresentation()
+        return ResultPresentation(
+            scopes=(Scope("private", "Private"),),
+            items=(ItemPresentation(query.text, scopes=("private",)),),
+        )
+"#,
+        )
+        .unwrap();
+        let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+        let mut provider = ModernProvider::load(
+            &mut pipeline,
+            &[fixture.0.join("plugins")],
+            None,
+            fixture.0.join("cache"),
+            &DisabledPlugins::default(),
+        );
+        assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+        provider.drive_query(&mut pipeline, "first", 1).unwrap();
+        let snapshot = provider.catalog.root.lock().unwrap().snapshots().pop().unwrap();
+        let scope = RootScope {
+            owner: snapshot.owner,
+            id: crikey_core::result_presentation::ScopeId("private".into()),
+            source: snapshot.source,
+        };
+        assert!(provider
+            .drive_query_scoped(&mut pipeline, "direct", 2, Some(scope.clone()),)
+            .is_some());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        *provider.cancellation.publication_pause.lock().unwrap() = Some((entered_tx, resume_rx));
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let endpoint = driver.action_executor();
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(2),
+                    text: "pending",
+                    now: 2,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(scope.clone()),
+            )
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(endpoint.root_presentations().is_empty());
+        assert!(
+            endpoint.root_scope_current(&scope),
+            "retirement retains only the scope token"
+        );
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(3),
+                    text: "fresh",
+                    now: 3,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(scope.clone()),
+            )
+            .unwrap();
+        assert!(endpoint.root_scope_current(&scope));
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if driver
+                .take_outcome()
+                .is_some_and(|frame| frame.generation == Generation::from_raw(3))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fresh scoped query did not complete");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(fs::read_to_string(package.join("scope")).unwrap(), "private");
+        let fresh = endpoint.root_presentations();
+        assert_eq!(fresh.len(), 1);
+        assert!(endpoint.root_scope_current(&scope));
+        assert!(fresh[0]
+            .presentation
+            .items
+            .iter()
+            .any(|item| item.target.item == ItemId("fresh".into())));
+        // A replacement or dead physical producer cannot inherit this token.
+        let owner = scope.owner.clone();
+        let producer = match &scope.source {
+            RootSource::Suggestion { producer, .. } => *producer,
+            _ => unreachable!(),
+        };
+        let (mut probe, _) = self::endpoint(item());
+        probe.root = Arc::clone(&driver.action_endpoint.root);
+        probe.gates = driver.action_endpoint.gates.clone();
+        probe
+            .incarnations
+            .lock()
+            .unwrap()
+            .insert(owner.clone(), producer + 1);
+        assert!(!probe.root_scope_current(&scope));
+        probe.incarnations.lock().unwrap().remove(&owner);
+        assert!(!probe.root_scope_current(&scope));
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(4),
+                    text: "missing",
+                    now: 4,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(scope.clone()),
+            )
+            .unwrap();
+        loop {
+            if driver
+                .take_outcome()
+                .is_some_and(|frame| frame.generation == Generation::from_raw(4))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing declaration query did not complete"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!endpoint.root_scope_current(&scope));
+        assert!(driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(5),
+                    text: "refused",
+                    now: 5,
+                    selected: 0
+                },
+                Vec::new(),
+                false,
+                Some(scope),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn real_typed_worker_confirms_fresh_schema_preserves_frozen_item_and_suppresses_diagnostics() {
+        use crikey_core::structured_arguments::SubmissionOutcome;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "crikey-modern-typed-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        let fixture = ProcessFixture(root);
+        let package = fixture.0.join("plugins/typed");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("crikey.toml"),
+            "manifest-version = 1\n[plugin]\nid = \"typed\"\nname = \"Typed\"\nversion = \"1.0.0\"\nruntime = \"python\"\nentrypoint = \"typed:Typed\"\n[python]\nrequires-python = \">=3.12\"\n[performance]\nstartup = \"lazy\"\n").unwrap();
+        fs::write(package.join("typed.py"), r#"
+from pathlib import Path
+import sys
+import time
+from crikey_sdk import Item, Plugin
+from crikey_sdk.arguments import ArgumentSchema, PasswordField, SchemaBinding, ResultPresentation, Scope
+class Typed(Plugin):
+    def supports_result_presentation(self):
+        return True
+    def build_catalog(self):
+        if Path(__file__).with_name("bootstrap_wait").exists():
+            Path(__file__).with_name("bootstrap_started").touch()
+            while Path(__file__).with_name("bootstrap_wait").exists():
+                time.sleep(0.005)
+        return [Item("shared", "Frozen typed item", "original")]
+    def catalog_presentation(self):
+        maximum = 32 if Path(__file__).with_name("changed").exists() else 64
+        return ResultPresentation(
+            scopes=(Scope("private", "Private"),),
+            schemas=(SchemaBinding("shared", ArgumentSchema((PasswordField(id="secret", label="Secret", required=True, min_bytes=1, max_bytes=maximum),))),),
+        )
+    def execute(self, item, action_id, argument):
+        raise RuntimeError("legacy execution must never run")
+    def execute_typed(self, item, action_id, values):
+        assert action_id is None
+        assert "provider-private-value" not in repr(values)
+        with Path(__file__).with_name("executed").open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(item.label + "\n")
+        if Path(__file__).with_name("fail").exists():
+            print("provider-private-value", file=sys.stderr)
+            raise RuntimeError("provider-private-value")
+    def suggest(self, query, context):
+        if Path(__file__).with_name("fail").exists():
+            context.log("provider-private-value")
+            raise RuntimeError("provider-private-value")
+        Path(__file__).with_name("scope").write_text(query.selected_scope_id or "all")
+        context.emit(Item("dynamic", "Dynamic typed item", "dynamic"))
+    def suggestion_presentation(self, query):
+        return ResultPresentation(schemas=(SchemaBinding("dynamic", ArgumentSchema((PasswordField(id="secret", label="Secret", required=True, min_bytes=1, max_bytes=64),))),))
+"#).unwrap();
+        let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+        let mut provider = ModernProvider::load(
+            &mut pipeline,
+            &[fixture.0.join("plugins")],
+            None,
+            fixture.0.join("cache"),
+            &DisabledPlugins::default(),
+        );
+        assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+        let owner = provider.loaded[0].plugin.clone();
+        provider
+            .request_catalog_build(&owner, 1, Generation::ZERO)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let build = loop {
+            if let Some(result) = provider.take_catalog_results().into_iter().next() {
+                match result {
+                    CatalogBuildResult::Complete(build) => break build,
+                    other => panic!("typed catalog failed: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        };
+        let key = provider.loaded[0].key.clone();
+        assert!(provider.pool.never_started(&key));
+        let (mut endpoint, receiver) = endpoint(build.items[0].clone());
+        endpoint.root = Arc::clone(&provider.catalog.root);
+        endpoint.cancellation = Arc::clone(&provider.cancellation);
+        endpoint.gates = provider
+            .action_budgets()
+            .into_iter()
+            .map(|(owner, budget)| (owner, PreviewActionGate::new(budget)))
+            .collect();
+        let executable = ExecutableKey {
+            target: OwnedItem {
+                owner: owner.clone(),
+                item: build.items[0].stable_id.clone(),
+            },
+            action: None,
+        };
+        let binding = endpoint.root_binding(&executable, None).unwrap();
+        fs::write(package.join("changed"), "").unwrap();
+        endpoint.submit_typed(&binding, password_values()).unwrap();
+        assert!(provider
+            .execute_action_request(receiver.try_recv().unwrap())
+            .is_err());
+        assert!(
+            !package.join("executed").exists(),
+            "fresh physical worker changed its schema"
+        );
+        assert!(provider
+            .dispatch_failures()
+            .iter()
+            .all(|(_, reason)| !reason.contains("provider-private-value")));
+        // A genuinely new physical worker bootstraps the original binding.
+        fs::remove_file(package.join("changed")).unwrap();
+        let worker = provider.pool.workers.remove(&key).unwrap();
+        drop(worker);
+        provider
+            .pool
+            .workers
+            .insert(key.clone(), WorkerLifecycle::NeverStarted);
+        provider
+            .catalog
+            .static_items
+            .lock()
+            .unwrap()
+            .get_mut(&(owner.clone(), executable.target.item.clone()))
+            .unwrap()
+            .label = "replacement must not reach callback".into();
+        let receipt = endpoint.submit_typed(&binding, password_values()).unwrap();
+        assert!(!receipt.receipt.query_history_allowed);
+        assert_eq!(receipt.item.label, "Frozen typed item");
+        assert!(matches!(
+            provider
+                .execute_action_request(receiver.try_recv().unwrap())
+                .unwrap(),
+            crate::ActionEffect::Typed(SubmissionOutcome::Completed),
+        ));
+        assert_eq!(
+            fs::read_to_string(package.join("executed")).unwrap(),
+            "Frozen typed item\n"
+        );
+        let scope = RootScope {
+            owner: owner.clone(),
+            id: crikey_core::result_presentation::ScopeId("private".into()),
+            source: binding.source.clone(),
+        };
+        let frame = provider
+            .drive_query_scoped(&mut pipeline, "scoped", 1, Some(scope.clone()))
+            .unwrap();
+        assert_eq!(frame.rows.len(), 1);
+        assert_eq!(fs::read_to_string(package.join("scope")).unwrap(), "private");
+        let incarnation = provider.pool.live_mut(&key).unwrap().incarnation();
+        endpoint
+            .incarnations
+            .lock()
+            .unwrap()
+            .insert(owner.clone(), incarnation);
+        let dynamic = ExecutableKey {
+            target: OwnedItem {
+                owner: owner.clone(),
+                item: ItemId("dynamic".into()),
+            },
+            action: None,
+        };
+        let dynamic_binding = endpoint.root_binding(&dynamic, None).unwrap();
+        endpoint
+            .submit_typed(&dynamic_binding, password_values())
+            .unwrap();
+        let retired = receiver.try_recv().unwrap();
+        provider.drive_query(&mut pipeline, "new generation", 2).unwrap();
+        assert!(
+            provider.execute_action_request(retired).is_err(),
+            "old generation cannot retarget an identical new result"
+        );
+        // Intake revokes execution even while ledger retirement is held.
+        let held_binding = endpoint.root_binding(&dynamic, None).unwrap();
+        endpoint.submit_typed(&held_binding, password_values()).unwrap();
+        let held_request = receiver.try_recv().unwrap();
+        let cancellation = Arc::clone(&provider.cancellation);
+        let root = Arc::clone(&provider.catalog.root);
+        let held_retirement = root.lock().unwrap();
+        let intake = cancellation.admit();
+        assert!(endpoint.submit_typed(&held_binding, password_values()).is_err());
+        assert!(provider.execute_action_request(held_request).is_err());
+        drop(held_retirement);
+        assert!(
+            endpoint.root_binding(&dynamic, None).is_none(),
+            "intake rejects authority before retirement"
+        );
+        let mut held_retirement = root.lock().unwrap();
+        held_retirement.retire_suggestions();
+        cancellation.suggestion_intake.store(intake, Ordering::Release);
+        drop(held_retirement);
+        assert!(endpoint.root_binding(&dynamic, None).is_none());
+        provider.begin_serving(intake);
+        fs::write(package.join("fail"), "").unwrap();
+        endpoint.submit_typed(&binding, password_values()).unwrap();
+        let failure = provider.execute_action_request(receiver.try_recv().unwrap());
+        assert!(!format!("{failure:?}").contains("provider-private-value"));
+        provider
+            .drive_query(&mut pipeline, "later diagnostics", 3)
+            .unwrap();
+        assert!(provider
+            .dispatch_failures()
+            .iter()
+            .all(|(_, reason)| !reason.contains("provider-private-value")));
+        // Pause a real result after its first supersession check, then retire
+        // its intake before allowing it to acquire publication authority.
+        fs::remove_file(package.join("fail")).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        *provider.cancellation.publication_pause.lock().unwrap() = Some((entered_tx, resume_rx));
+        let cancellation = Arc::clone(&provider.cancellation);
+        let root = Arc::clone(&provider.catalog.root);
+        let publication = thread::spawn(move || {
+            let _ = provider.drive_query(&mut pipeline, "held publication", 4);
+            (provider, pipeline)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        let intake = cancellation.admit();
+        {
+            let mut root = root.lock().unwrap();
+            root.retire_suggestions();
+            cancellation.suggestion_intake.store(intake, Ordering::Release);
+        }
+        resume_tx.send(()).unwrap();
+        let (mut provider, mut pipeline) = publication.join().unwrap();
+        provider.begin_serving(intake);
+        assert!(endpoint.root_binding(&dynamic, None).is_none());
+        assert!(endpoint
+            .submit_typed(&dynamic_binding, password_values())
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+        // Retire while fresh-worker metadata discovery is blocked, then release
+        // discovery. Confirmation must not turn the retired source executable.
+        let before = fs::read_to_string(package.join("executed")).unwrap();
+        drop(provider.pool.workers.remove(&key));
+        provider.pool.workers.insert(key, WorkerLifecycle::NeverStarted);
+        fs::write(package.join("bootstrap_wait"), "").unwrap();
+        endpoint.submit_typed(&binding, password_values()).unwrap();
+        let request = receiver.try_recv().unwrap();
+        let root = Arc::clone(&provider.catalog.root);
+        let execution = thread::spawn(move || {
+            let outcome = provider.execute_action_request(request);
+            (provider, outcome)
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !package.join("bootstrap_started").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fresh worker never entered schema discovery"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        root.lock().unwrap().invalidate(&owner);
+        fs::remove_file(package.join("bootstrap_wait")).unwrap();
+        let (mut provider, outcome) = execution.join().unwrap();
+        assert!(outcome.is_err());
+        assert_eq!(fs::read_to_string(package.join("executed")).unwrap(), before);
+        assert!(provider
+            .drive_query_scoped(&mut pipeline, "stale", 4, Some(scope))
+            .is_none());
+        assert!(endpoint.submit_typed(&binding, password_values()).is_err());
+        // A revoked in-flight catalog cannot restore root sidecar authority.
+        fs::remove_file(package.join("bootstrap_started")).unwrap();
+        fs::write(package.join("bootstrap_wait"), "").unwrap();
+        provider
+            .request_catalog_build(&owner, 2, Generation::from_raw(8))
+            .unwrap();
+        let request_id = provider.command_snapshot().owners[&owner].request_id;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !package.join("bootstrap_started").exists() {
+            assert!(Instant::now() < deadline, "catalog never entered held build");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(provider.invalidate_command_source(&owner, request_id));
+        fs::remove_file(package.join("bootstrap_wait")).unwrap();
+        let result = loop {
+            if let Some(result) = provider.take_catalog_results().into_iter().next() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "retired catalog never completed");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let CatalogBuildResult::Complete(retired_catalog) = result else {
+            panic!("retiring command authority must preserve the ordinary catalog");
+        };
+        let retained_item = retired_catalog
+            .items
+            .iter()
+            .find(|item| item.plugin_id == owner && item.stable_id == executable.target.item)
+            .expect("the ordinary catalog still contains its exact owned item");
+        assert_eq!(retained_item.label, "Frozen typed item");
+        assert!(endpoint.root_binding(&executable, None).is_none());
+        assert!(!endpoint
+            .root_presentations()
+            .iter()
+            .any(|snapshot| snapshot.owner == owner));
+        assert!(endpoint.submit_typed(&binding, password_values()).is_err());
+
+        // Exercise real restart and binding consumers for sibling preservation.
+        let mut sibling = build.items[0].clone();
+        sibling.plugin_id = PluginId("modern.healthy-sibling".into());
+        let presentation = password_presentation(&sibling);
+        let sibling_key = presentation.schemas[0].executable.clone();
+        endpoint
+            .root
+            .lock()
+            .unwrap()
+            .publish(
+                sibling.plugin_id.clone(),
+                RootSource::Suggestion {
+                    generation: Generation::from_raw(99),
+                    producer: 1,
+                },
+                &[sibling],
+                presentation,
+            )
+            .unwrap();
+        let sibling_binding = endpoint.root_binding(&sibling_key, None).unwrap();
+        let key = provider.loaded[0].key.clone();
+        provider.pool.fail(&key, "restart regression".into());
+        provider.restart_worker(&owner).unwrap();
+        let retained = endpoint.root_binding(&sibling_key, None).unwrap();
+        assert_eq!(retained.executable, sibling_binding.executable);
+        assert_eq!(retained.source, sibling_binding.source);
+        assert_eq!(retained.fingerprint, sibling_binding.fingerprint);
     }
 }

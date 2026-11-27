@@ -276,6 +276,7 @@ fn request(generation: u64, text: &str) -> NativeSuggestRequest {
         text: text.to_owned(),
         normalized: text.to_lowercase(),
         selected_item_id: None,
+        selected_scope_id: None,
     }
 }
 

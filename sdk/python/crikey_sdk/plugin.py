@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
+from .arguments import ArgumentSchema, ResultPresentation, TypedValues, TypedOutcome
 
 __all__ = [
     "Action",
@@ -111,6 +112,7 @@ class Query:
     text: str
     normalized: str
     generation: int
+    selected_scope_id: str | None = None
 
 
 class SuggestContext(Protocol):
@@ -194,6 +196,22 @@ class Plugin:
     ) -> None | Awaitable[None]:
         return None
 
+    def supports_result_presentation(self) -> bool:
+        """Explicit independent opt-in for root sections/scopes."""
+        return False
+
+    def catalog_presentation(self) -> ResultPresentation | Awaitable[ResultPresentation]:
+        """Optional metadata; existing list-returning catalog callbacks are unchanged."""
+        return ResultPresentation()
+
+    def suggestion_presentation(self, query: Query) -> ResultPresentation | Awaitable[ResultPresentation]:
+        """Optional metadata for the exact query generation."""
+        return ResultPresentation()
+
+    def execute_typed(self, item: Item, action_id: str | None, values: TypedValues) -> TypedOutcome | None | Awaitable[TypedOutcome | None]:
+        """Independent typed_arguments_v1 opt-in; never forwarded to execute."""
+        raise NotImplementedError("typed_arguments_v1 is unavailable")
+
     def preview(
         self, item: Item, context: PreviewContext
     ) -> Preview | None | Awaitable[Preview | None]:
@@ -274,7 +292,7 @@ class WorkerContext:
         self._sink(item)
 
     def log(self, message: str) -> None:
-        self._logger(str(message))
+        self._logger(message)
 
     def spawn(self, coro: Coroutine[Any, Any, object]) -> object:
         if not asyncio.iscoroutine(coro):
