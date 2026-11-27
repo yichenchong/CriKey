@@ -483,6 +483,59 @@ fn real_scoped_suggestions_retire_dynamic_schema_authority() {
 }
 
 #[test]
+fn catalog_and_suggestion_schemas_for_the_same_executable_remain_independently_usable() {
+    let (executable, _) = conformance_binaries();
+    for discover_catalog_first in [true, false] {
+        let mut worker =
+            NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();
+        let catalog_hash = if discover_catalog_first {
+            Some(catalog_fingerprint(&mut worker, "typed-login", None))
+        } else {
+            None
+        };
+        let suggestions = worker.suggest(&request(1, "catalog-overlap")).unwrap();
+        let dynamic_hash = suggestions.presentation.unwrap().schemas[0]
+            .schema
+            .fingerprint()
+            .unwrap();
+        // A fresh static source supplies the canonical fingerprint even when
+        // this worker has not built its catalog yet.
+        let catalog_hash = catalog_hash.unwrap_or_else(|| {
+            let mut source =
+                NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();
+            let hash = catalog_fingerprint(&mut source, "typed-login", None);
+            source.shutdown();
+            hash
+        });
+        assert_ne!(catalog_hash, dynamic_hash);
+        let TypedPreparation::Ready(confirmed) = worker
+            .prepare_typed_execution(&ItemId("typed-login".into()), None, catalog_hash)
+            .unwrap()
+        else {
+            panic!("a live suggestion must not shadow the canonical catalog schema");
+        };
+        assert_eq!(
+            worker
+                .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-login".into()),
+                    None,
+                    dynamic_hash,
+                    typed_values("conformance-secret"),
+                )
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        worker.shutdown();
+    }
+}
+
+#[test]
 fn healthy_suggestion_first_worker_bootstraps_static_schema_without_regenerating_dynamic_authority() {
     let (executable, _) = conformance_binaries();
     let mut source = NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();

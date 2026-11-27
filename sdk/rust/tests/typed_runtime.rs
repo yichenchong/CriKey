@@ -192,6 +192,26 @@ fn outcome(host: &mut dyn Transport, request: message::TypedExecuteRequest) -> T
 
 #[test]
 fn typed_authority_fingerprint_hostility_and_process_lifetime_privacy() {
+    // Panic hooks and the SDK's Once-installed privacy policy are process-wide.
+    // A sibling serving test must not initialize that policy before this test
+    // installs its observer, or this observer would replace the privacy wrapper.
+    const CHILD: &str = "CRIKEY_SDK_TYPED_PRIVACY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "typed_authority_fingerprint_hostility_and_process_lifetime_privacy",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("isolated typed privacy consumer");
+        assert!(
+            status.success(),
+            "isolated typed privacy consumer exited with {status}"
+        );
+        return;
+    }
     let panic_hooks = Arc::new(AtomicUsize::new(0));
     let observed_hooks = Arc::clone(&panic_hooks);
     std::panic::set_hook(Box::new(move |_| {

@@ -2034,19 +2034,36 @@ fn handle_typed_execute(
             .lock()
             .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
         if request.view.is_some() {
-            route.as_ref().and_then(|(_, schema)| schema.clone())
+            route.as_ref().and_then(|(_, schema)| {
+                schema
+                    .as_ref()
+                    .map(|schema| (Arc::clone(schema), schema.fingerprint().ok()))
+            })
         } else {
-            registry
+            let mut selected = None;
+            for binding in registry
                 .suggestions
                 .schemas
                 .iter()
                 .chain(&registry.catalog.schemas)
-                .find(|binding| {
-                    binding.executable.target.owner == context.plugin_id
-                        && binding.executable.target.item.0 == request.item_id
-                        && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
-                })
-                .map(|binding| Arc::clone(&binding.schema))
+            {
+                if binding.executable.target.owner == context.plugin_id
+                    && binding.executable.target.item.0 == request.item_id
+                    && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
+                {
+                    // Both root publications remain authoritative, independently
+                    // of the separately resolved view namespace.
+                    let fingerprint = binding.schema.fingerprint().ok();
+                    if fingerprint.as_ref().map(|v| v.as_slice())
+                        == Some(request.expected_fingerprint.as_slice())
+                    {
+                        selected = Some((binding, fingerprint));
+                        break;
+                    }
+                    selected.get_or_insert((binding, fingerprint));
+                }
+            }
+            selected.map(|(binding, fingerprint)| (Arc::clone(&binding.schema), fingerprint))
         }
     };
     let empty = ArgumentSchema::default();
@@ -2058,8 +2075,7 @@ fn handle_typed_execute(
         failed(SubmissionFailureCode::Unsupported)
     } else if context.cancellation().is_cancelled() {
         failed(SubmissionFailureCode::Cancelled)
-    } else if let Some(schema) = schema.as_deref() {
-        let fingerprint = schema.fingerprint().ok();
+    } else if let Some((schema, fingerprint)) = schema.as_ref() {
         if fingerprint.as_ref().map(|v| v.as_slice()) != Some(request.expected_fingerprint.as_slice()) {
             failed(SubmissionFailureCode::SchemaMismatch)
         } else if schema.validate_values(&request.values).is_err() {
@@ -2109,8 +2125,12 @@ fn handle_typed_execute(
     }
     // Navigation is a proposal, not host publication. Retain the exact current
     // descriptor until a subsequent admitted Open/Refresh replaces it.
-    let response = crikey_native_protocol::typed::to_response(outcome, schema.as_deref().unwrap_or(&empty))
-        .map_err(SdkError::from)?;
+    let response_schema = schema
+        .as_ref()
+        .map(|(schema, _)| schema.as_ref())
+        .unwrap_or(&empty);
+    let response =
+        crikey_native_protocol::typed::to_response(outcome, response_schema).map_err(SdkError::from)?;
     send_envelope(
         transport,
         Envelope {

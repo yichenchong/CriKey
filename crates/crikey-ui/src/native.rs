@@ -313,6 +313,7 @@ struct DeferredActionInput {
     token: u64,
     source: Arc<crate::ActionInputCheckpoint>,
     focus_ready: bool,
+    typed_focus: Option<egui::Id>,
     events: Vec<egui::Event>,
 }
 
@@ -366,6 +367,9 @@ fn prepare_action_input(
         });
         let valid = focused
             && editor_owned
+            && (owner.typed.is_none()
+                || (owner.typed != pending.source.typed && !pending.focus_ready)
+                || context.memory(|memory| memory.focused() == pending.typed_focus))
             && receipt.is_none_or(|receipt| receipt.accepted)
             && owner.matches(
                 model.view,
@@ -376,14 +380,14 @@ fn prepare_action_input(
                 (model.preview.focused, model.preview.detail),
                 model.navigation.standard.as_ref(),
                 model.navigation.standard_refresh_pending,
-                model.navigation.inline_arguments.as_ref().map(|input| (input.revision, input.draft_revision)),
+                model.navigation.inline_arguments.as_ref(),
             );
         if valid {
             pending.events.append(&mut input.events);
-            if receipt.is_none()
-                || (model.settings_open && owner.view != pending.source.view && !pending.focus_ready)
-            {
-                // Establish a fresh Settings surface's ordinary editor focus
+            let new_editor = model.settings_open && owner.view != pending.source.view
+                || owner.typed.is_some() && owner.typed != pending.source.typed;
+            if receipt.is_none() || (new_editor && !pending.focus_ready) {
+                // Establish the replacement surface's ordinary editor focus
                 // once before delivering the retained stream.
                 let establish_focus = receipt.is_some();
                 pending.focus_ready |= establish_focus;
@@ -398,7 +402,11 @@ fn prepare_action_input(
             }
             if model.action_panel.is_some() {
                 context.memory_mut(|memory| memory.request_focus(editor));
-            } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+            } else if !model.settings_open
+                && model.navigation.inline_arguments.is_none()
+                && model.page.is_none()
+                && !model.preview.focused
+            {
                 context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
             }
             input.events = pending.events;
@@ -410,7 +418,11 @@ fn prepare_action_input(
             if resumed {
                 if model.action_panel.is_some() {
                     context.memory_mut(|memory| memory.request_focus(editor));
-                } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                } else if !model.settings_open
+                    && model.navigation.inline_arguments.is_none()
+                    && model.page.is_none()
+                    && !model.preview.focused
+                {
                     context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
                 }
             }
@@ -487,6 +499,8 @@ fn prepare_action_input(
                     token,
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
+                    typed_focus: model.navigation.inline_arguments.as_ref()
+                        .and_then(|_| context.memory(|memory| memory.focused())),
                     events,
                 }),
             );
@@ -588,6 +602,19 @@ fn build_launcher_frame_with_transparency(
         }
     }
     if waiting_for_input {
+        if model.navigation.inline_arguments.is_some() {
+            let focused = context.memory(|memory| memory.focused());
+            context.data_mut(|data| {
+                if let Some(Some(mut pending)) =
+                    data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
+                {
+                    if pending.focus_ready {
+                        pending.typed_focus = focused;
+                    }
+                    data.insert_temp(action_input_queue(), Some(pending));
+                }
+            });
+        }
         commands.clear();
     } else {
         let host_boundary = action_boundary.is_some();

@@ -293,6 +293,12 @@ A mismatch is a fixed refusal. Dynamic targets require their original live
 producer; never regenerate suggestions to retarget an old submission. Keep SDK
 schema bindings even with an older host so schema-only targets refuse legacy
 execution rather than silently discarding fields.
+
+Catalog and suggestion bindings may coexist for the same executable with
+different schemas. Physical-worker admission checks the expected fingerprint
+against both current inventories; a suggestion does not shadow an exact
+canonical catalog binding.
+
 Python replaces catalog and suggestion execution inventories independently on
 successful terminal publication; unsuccessful publications grant no new authority.
 After a root schema is declared, legacy execution requires a currently
@@ -316,6 +322,10 @@ name unique current schema fields and only `Required`, `TooShort`, `TooLong`,
 never callback text. Fixed global failures are `Unavailable`, `Denied`,
 `Cancelled`, `Timeout`, `Unsupported`, `Failed`, `SchemaMismatch`, `ResourceLimit`
 and `ProtocolViolation`.
+
+The Rust and Python runtimes skip typed callbacks whose request is already
+cancelled and report `Cancelled` if cancellation arrives during the callback,
+even if it returns normally. Cancellation does not roll back callback effects.
 
 Passwords have no representable defaults. They are masked live memory, excluded
 from nonsecret drafts, navigation snapshots, history, configuration and host

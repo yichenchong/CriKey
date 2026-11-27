@@ -530,7 +530,8 @@ pub struct ActionInputCheckpoint {
     // Retain only its binding, never a descriptor outside navigation accounting.
     pub(crate) standard: Option<(PluginId, u64, crikey_core::structured_view::ViewExecutionContext)>,
     pub(crate) standard_refresh_pending: bool,
-    pub(crate) typed_revision: Option<(u64, u64)>,
+    // Opaque editor authority only: never retain drafts or argument values.
+    pub(crate) typed: Option<typed_input::TypedInputIdentity>,
 }
 
 impl ActionInputCheckpoint {
@@ -551,8 +552,12 @@ impl ActionInputCheckpoint {
                 (surface.owner.clone(), surface.producer, surface.context.clone())
             }),
             standard_refresh_pending: model.navigation.standard_refresh_pending,
-            typed_revision: model.navigation.inline_arguments.as_ref().map(|input| (input.revision, input.draft_revision)),
+            typed: Self::typed_identity(model.navigation.inline_arguments.as_ref()),
         }
+    }
+
+    pub(crate) fn typed_identity(input: Option<&InlineArguments>) -> Option<typed_input::TypedInputIdentity> {
+        input.map(typed_input::TypedInputIdentity::of)
     }
 
     fn same_panel(&self, panel: Option<&Arc<ActionPanel>>) -> bool {
@@ -580,7 +585,7 @@ impl ActionInputCheckpoint {
         preview_focus: (bool, bool),
         standard: Option<&Arc<standard_view::StandardSurface>>,
         standard_refresh_pending: bool,
-        typed_revision: Option<(u64, u64)>,
+        typed: Option<&InlineArguments>,
     ) -> bool {
         self.view.is_some()
             && self.view == view
@@ -590,12 +595,16 @@ impl ActionInputCheckpoint {
                 == standard.map(|surface| (&surface.owner, surface.producer, &surface.context))
             && self.standard_refresh_pending == standard_refresh_pending
             && !standard_refresh_pending
-            && self.typed_revision == typed_revision
             && self.primary.as_ref()
                 == row
                     .and_then(|row| row.default_action.as_ref())
                     .map(|action| &action.action_id)
             && self.preview_focus == preview_focus
+            && match (&self.typed, typed) {
+                (Some(identity), Some(input)) => identity.matches(input),
+                (None, None) => true,
+                _ => false,
+            }
             && self.same_panel(panel)
             && match (&self.target, row) {
                 (Some(target), Some(row)) => target.matches(row),
@@ -615,7 +624,7 @@ impl PartialEq for ActionInputCheckpoint {
             && self.preview_focus == other.preview_focus
             && self.standard == other.standard
             && self.standard_refresh_pending == other.standard_refresh_pending
-            && self.typed_revision == other.typed_revision
+            && self.typed == other.typed
             && self.same_panel(other.panel.as_ref())
     }
 }
@@ -2048,7 +2057,7 @@ impl LauncherViewModel {
                 (surface.owner.clone(), surface.producer, surface.context.clone())
             }),
             standard_refresh_pending: self.standard_refresh_pending,
-            typed_revision: self.inline_arguments.as_ref().map(|input| (input.revision, input.draft_revision)),
+            typed: ActionInputCheckpoint::typed_identity(self.inline_arguments.as_ref()),
         };
         self.input_receipt = Some(Arc::new(ActionInputReceipt {
             token,
@@ -2299,7 +2308,7 @@ impl LauncherViewModel {
                     (self.preview.focused, self.preview.detail),
                     self.standard.as_ref(),
                     self.standard_refresh_pending,
-                    self.inline_arguments.as_ref().map(|input| (input.revision, input.draft_revision)),
+                    self.inline_arguments.as_ref(),
                 );
                 let query_refused = source_valid
                     && commands.iter().any(|command| {
