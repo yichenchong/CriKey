@@ -98,7 +98,7 @@ impl Plugin for Fixture {
         &mut self,
         _: TypedExecuteRequest,
         context: &dyn PluginContext,
-    ) -> Result<SubmissionOutcome> {
+    ) -> Result<TypedExecutionOutcome> {
         self.entered.send(()).unwrap();
         if self.cancel_typed {
             self.cancel_typed = false;
@@ -106,7 +106,7 @@ impl Plugin for Fixture {
         }
         // Completion racing with cancellation must not become a successful
         // submission merely because the callback returns normally.
-        Ok(SubmissionOutcome::Completed)
+        Ok(SubmissionOutcome::Completed.into())
     }
 }
 fn frame(id: u64, payload: Payload) -> Envelope {
@@ -225,7 +225,7 @@ fn typed() -> Payload {
         .unwrap(),
     )
 }
-fn typed_outcome(host: &mut dyn Transport) -> SubmissionOutcome {
+fn typed_outcome(host: &mut dyn Transport) -> TypedExecutionOutcome {
     let Some(Payload::TypedExecuteResponse(response)) = host.recv().unwrap().payload else {
         panic!("typed response")
     };
@@ -241,7 +241,7 @@ fn presentation_failures_keep_same_connection_usable() {
             host.send(&frame(1, typed())).unwrap();
             assert_eq!(
                 typed_outcome(&mut *host),
-                SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+                SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable).into()
             );
             host.send(&frame(2, request(suggestions))).unwrap();
             if matches!(failure, Failure::Cancel) {
@@ -259,12 +259,12 @@ fn presentation_failures_keep_same_connection_usable() {
             host.send(&frame(3, typed())).unwrap();
             assert_eq!(
                 typed_outcome(&mut *host),
-                SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+                SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable).into()
             );
             host.send(&frame(4, request(suggestions))).unwrap();
             terminal(&mut *host, 4, suggestions, false, false);
             host.send(&frame(5, typed())).unwrap();
-            assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed);
+            assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed.into());
             stop(&mut *host, worker);
         }
     }
@@ -280,10 +280,10 @@ fn typed_callback_observes_cancel_without_host_timeout() {
     host.send(&frame(2, Payload::Cancel(Default::default()))).unwrap();
     assert_eq!(
         typed_outcome(&mut *host),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
+        SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into()
     );
     host.send(&frame(3, typed())).unwrap();
-    assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed);
+    assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed.into());
     stop(&mut *host, worker);
 }
 
@@ -298,11 +298,11 @@ fn already_cancelled_typed_request_never_enters_callback() {
     host.send(&frame(2, typed())).unwrap();
     assert_eq!(
         typed_outcome(&mut *host),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
+        SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into()
     );
     assert!(matches!(entered.try_recv(), Err(mpsc::TryRecvError::Empty)));
     host.send(&frame(3, typed())).unwrap();
-    assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed);
+    assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed.into());
     entered.recv_timeout(Duration::from_secs(3)).unwrap();
     stop(&mut *host, worker);
 }

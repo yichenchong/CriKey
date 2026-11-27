@@ -42,10 +42,25 @@ fn optional_string(value: &Option<String>, number: u32, out: &mut Vec<u8>) {
 
 // Persist the known-member mask across message fragments. Equality deliberately
 // ignores decoder bookkeeping, and unknown bytes retain the usual bounded policy.
+macro_rules! typed_debug {
+    (StructuredViewRequest; $($name:ident),*) => {
+        impl std::fmt::Debug for StructuredViewRequest {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("StructuredViewRequest { [REDACTED] }")}
+        }
+    };
+    ($type:ident; $($name:ident),*) => {
+        impl std::fmt::Debug for $type {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+                f.debug_struct(stringify!($type))$(.field(stringify!($name),&self.$name))*.field("unknown",&self.unknown).finish()
+            }
+        }
+    };
+}
 macro_rules! typed_message {
     ($type:ident, $max:expr, [$($repeat:literal),*], { $($name:ident : $ty:ty = $default:expr),* $(,)? }, encode($this:ident,$out:ident) {$($enc:tt)*}, decode($v:ident,$f:ident,$b:ident) {$($n:literal => $body:expr,)*}) => {
-        #[derive(Debug, Clone)]
+        #[derive(Clone)]
         pub struct $type { $(pub $name: $ty,)* pub unknown: UnknownFields, #[doc(hidden)] pub known_fields: u64, #[doc(hidden)] pub decoded_bytes: usize, #[doc(hidden)] pub decoded_allocation: usize }
+        typed_debug!($type; $($name),*);
         impl Default for $type { fn default() -> Self { Self { $($name:$default,)* unknown:Default::default(), known_fields:0, decoded_bytes:0, decoded_allocation:0 } } }
         impl PartialEq for $type { fn eq(&self, other:&Self)->bool { true $(&& self.$name == other.$name)* && self.unknown == other.unknown } }
         impl Eq for $type {}
@@ -84,6 +99,9 @@ macro_rules! typed_message {
 }
 
 fn preflight_typed_shape(name: &str, bytes: &[u8]) -> Result<(), ProtocolError> {
+    if name == "ViewItemDefinition" {
+        return preflight_view_definition(bytes);
+    }
     if name != "ArgumentField" {
         return Ok(());
     }
@@ -210,11 +228,17 @@ typed_message!(TypedFieldFailure, 1024, [], {
     2 => v.code=decode_u32(f)?,
 });
 typed_message!(TypedExecuteResponse, 65536, [2], {
-    status:u32=0, failures:Vec<TypedFieldFailure>=Vec::new(), failure_code:u32=0
-}, encode(t,o) { put_varint(1,u64::from(t.status),&mut o); for failure in &t.failures { put_message(2,failure,&mut o); } if t.failure_code!=0 { put_varint(3,u64::from(t.failure_code),&mut o); } }, decode(v,f,b) {
+    status:u32=0, failures:Vec<TypedFieldFailure>=Vec::new(), failure_code:u32=0, navigation:Option<RouteNavigation>=None
+}, encode(t,o) {
+    put_varint(1,u64::from(t.status),&mut o);
+    for failure in &t.failures { put_message(2,failure,&mut o); }
+    if t.failure_code!=0 { put_varint(3,u64::from(t.failure_code),&mut o); }
+    if let Some(x)=&t.navigation { put_message(4,x,&mut o); }
+}, decode(v,f,b) {
     1 => v.status=decode_u32(f)?,
     2 => bounded_push(&mut v.failures,f,b,64)?,
     3 => v.failure_code=decode_u32(f)?,
+    4 => merge_optional(&mut v.navigation,f,b)?,
 });
 
 /// Move-only input. Debug never renders any submitted value (including text).
@@ -224,6 +248,7 @@ pub struct TypedExecuteRequest {
     pub action_id: Option<String>,
     pub expected_fingerprint: Vec<u8>,
     pub values: ArgumentValues,
+    pub view: Option<ViewExecutionContext>,
     pub unknown: UnknownFields,
     #[doc(hidden)]
     pub value_unknown: BTreeMap<FieldId, UnknownFields>,
@@ -242,6 +267,7 @@ impl PartialEq for TypedExecuteRequest {
         self.item_id == other.item_id
             && self.action_id == other.action_id
             && self.expected_fingerprint == other.expected_fingerprint
+            && self.view == other.view
             && self.unknown == other.unknown
             && self.value_unknown == other.value_unknown
             && self.values.0.len() == other.values.0.len()
@@ -266,6 +292,9 @@ impl TypedExecuteRequest {
         if let Some(action) = &self.action_id {
             size += string_size(action.len());
         }
+        if let Some(view) = &self.view {
+            size += 1 + varint_size(view.encoded_len() as u64) + view.encoded_len();
+        }
         for (id, value) in &self.values.0 {
             let length = match value {
                 StructuredValue::NonSecret(NonSecretValue::Text(s)) => s.len(),
@@ -281,6 +310,9 @@ impl TypedExecuteRequest {
         put_string(1, &self.item_id, out);
         optional_string(&self.action_id, 2, out);
         put_bytes(3, &self.expected_fingerprint, out);
+        if let Some(view) = &self.view {
+            put_message(5, view, out);
+        }
         for (id, value) in &self.values.0 {
             let (kind, text) = match value {
                 StructuredValue::NonSecret(NonSecretValue::Text(s)) => (1, s.as_str()),
@@ -381,6 +413,7 @@ impl DecodeWithBudget for TypedExecuteRequest {
                     budget.charge_map_entry()?;
                     self.values.0.insert(id, value);
                 }
+                5 => merge_optional(&mut self.view, field, budget)?,
                 // There is deliberately no legacy argument member. Unknown
                 // additions remain bounded, but never become callback values.
                 _ => unknown(bytes, start, field.end, &mut self.unknown, budget)?,
@@ -480,6 +513,12 @@ pub fn validate_outbound(envelope: &Envelope) -> Result<(), ProtocolError> {
                         .saturating_add(value.len());
                 }
             }
+            if let Some(view) = &request.view {
+                crate::structured_view::check_context(view)?;
+                charge = charge.saturating_add(view.route_id.len() + unknown_charge(&view.unknown));
+                let len = view.encoded_len();
+                payload_bytes = payload_bytes.saturating_add(1 + varint_size(len as u64) + len);
+            }
             let mut frame_bytes = envelope
                 .unknown
                 .as_bytes()
@@ -510,6 +549,10 @@ pub fn validate_outbound(envelope: &Envelope) -> Result<(), ProtocolError> {
                 return Err(typed_error());
             }
             charge = charge.saturating_add(unknown_charge(&response.unknown));
+            if let Some(nav) = &response.navigation {
+                crate::structured_view::check_navigation(nav)?;
+                charge = charge.saturating_add(nav.route_id.len() + unknown_charge(&nav.unknown));
+            }
             let mut repeated = RepeatedFieldCharge::new::<TypedFieldFailure>();
             for failure in &response.failures {
                 if failure.field_id.len() > 256 {
@@ -555,6 +598,18 @@ pub fn validate_outbound(envelope: &Envelope) -> Result<(), ProtocolError> {
                 .is_some_and(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
             {
                 return Err(typed_error());
+            }
+        }
+        Some(Payload::StructuredViewResponse(response)) => {
+            charge = charge.saturating_add(crate::structured_view::response_charge(response)?);
+        }
+        Some(Payload::StructuredViewRequest(request)) => {
+            charge = charge.saturating_add(crate::structured_view::request_charge(request)?);
+        }
+        Some(Payload::ExecuteResult(response)) => {
+            if let Some(nav) = &response.navigation {
+                crate::structured_view::check_navigation(nav)?;
+                charge = charge.saturating_add(nav.route_id.len() + unknown_charge(&nav.unknown));
             }
         }
         _ => {}

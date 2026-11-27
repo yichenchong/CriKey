@@ -822,8 +822,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let mut web_page = WebPageRuntime::new();
     let mut retained = RetainedRows::default();
     let mut action_origins = std::collections::BTreeMap::new();
-    let mut typed_revision = 0u64;
     let mut typed_requests = std::collections::BTreeMap::new();
+    let mut view_requests: PendingViewRequests = std::collections::BTreeMap::new();
+    let mut latest_view_refresh: Option<(
+        crikey_ui::ViewId,
+        crikey_core::structured_view::ViewRefreshReason,
+    )> = None;
+    let mut action_activity = std::collections::BTreeMap::new();
+    let mut view_actions = std::collections::BTreeSet::new();
+    let mut live_standard: Option<std::sync::Arc<crikey_ui::standard_view::StandardSurface>> = None;
+    let mut standard_activation_session = None;
     let mut command_projection_dirty = true;
     let mut active_root_query = String::new();
     let mut pending_command_learning: std::collections::BTreeMap<
@@ -852,13 +860,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         std::collections::BTreeMap::new();
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
-            if matches!(&event, NativeLauncherEvent::Command { .. })
+            if matches!(&event, NativeLauncherEvent::Command { command, .. } if command_advances_activity(command))
+                || matches!(&event, NativeLauncherEvent::TypedInput { .. })
                 || matches!(&event, NativeLauncherEvent::Activated) && !prepared_activation
             {
+                for id in std::mem::take(&mut view_actions) { search.cancel_action(&id); }
                 hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
             }
             let hotkey_receipts = hotkeys.drain_events();
             if !hotkey_receipts.is_empty() {
+                view_model.clear_standard_activation();
+                standard_activation_session = None;
                 hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
             }
             let mut page_failure_status = None;
@@ -992,6 +1004,90 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             // Fold any legacy rows the supervisor produced since the last turn
             for completion in search.poll_action_completions() {
+                view_actions.remove(&completion.request_id);
+                if let Some((owner, producer, view, _intent)) = view_requests.remove(&completion.request_id) {
+                    if view_model.view().is_some_and(|(current, _)| current == view) {
+                        match completion.outcome {
+                            Ok(ActionEffect::View(reply)) => {
+                                let context = reply.context.clone();
+                                let latest = latest_view_refresh.take().filter(|(target, _)| *target == view);
+                                // Capture the latest P3 intent before changing the admitted descriptor.
+                                let next_request = latest.and_then(|(_, reason)| view_model.standard_refresh_request(reason));
+                                let installed = if latest.is_some() {
+                                    view_model.adopt_standard_revision(&owner, producer, reply)
+                                } else {
+                                    view_model.publish_standard_view(owner.clone(), producer, reply)
+                                };
+                                if installed {
+                                    if let Some(request) = next_request {
+                                        begin_standard_refresh(&search, &mut view_model, &mut view_requests, hotkey_intent, request);
+                                    }
+                                } else if search.view_current(&owner, &context) {
+                                    search.retire_view(&owner, context.session);
+                                }
+                            }
+                            _ => {
+                                latest_view_refresh = None;
+                                if let Some(surface) = view_model.standard_surface() {
+                                    search.retire_view(&surface.owner, surface.context.session);
+                                    view_model.standard_unavailable();
+                                }
+                                view_model.set_navigation_notice("View unavailable. Go Back or open Settings.".into());
+                            }
+                        }
+                    } else if let Ok(ActionEffect::View(reply)) = completion.outcome {
+                        if search.view_current(&owner, &reply.context) {
+                            search.retire_view(&owner, reply.context.session);
+                        }
+                    }
+                    continue;
+                }
+                // Success evidence belongs to admission, not to the still-current
+                // presentation. Drain it once before any navigation/typed early exit.
+                if let Some(learning) = take_success_learning(
+                    &completion,
+                    &mut pending_command_learning,
+                    &mut pending_ordinary_learning,
+                    &mut pending_typed_items,
+                    || history_clock.advance(),
+                ) {
+                    command_projection_dirty = true;
+                    if let Err(message) = publish_learning(
+                        learning,
+                        &mut search,
+                        &history_writer,
+                        ranking_reset_pending,
+                        &mut deferred_learning,
+                    ) {
+                        view_model.set_navigation_notice(message);
+                    }
+                }
+                if let Ok(ActionEffect::Navigate { outcome, producer }) = &completion.outcome {
+                    let activity = action_activity.remove(&completion.request_id);
+                    let typed = typed_requests.remove(&completion.request_id);
+                    let current_typed = typed.is_some_and(|(revision, draft, view, generation)| view_model.accepts_typed_draft(revision, draft, view, generation));
+                    let origin = action_origins.remove(&completion.request_id).flatten();
+                    let current_origin = origin.is_some_and(|(view, session)| render_handle.is_visible_session(session) && view_model.view().is_some_and(|(current, _)| current == view));
+                    let deliberate = hotkey_presentations.remove(&completion.request_id).is_some_and(|intent| intent == hotkey_intent);
+                    if (current_typed || current_origin) && activity == Some(hotkey_intent) || deliberate {
+                        if deliberate && !view_model.is_visible() {
+                            activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                            if render_handle.request_activation().is_ok() { prepared_activation = true; }
+                        }
+                        let previous = view_model.standard_surface().cloned();
+                        if let Some(request) = view_model.open_standard_route(completion.plugin.clone(), *producer, outcome.clone()) {
+                            if let Some(old) = previous { search.retire_view(&old.owner, old.context.session); }
+                            web_page.close("standard route opened");
+                            search.close_page();
+                            match search.request_view(&completion.plugin, *producer, request) {
+                                Ok(id) => { view_requests.insert(id, (completion.plugin.clone(), *producer, view_model.view().unwrap().0, hotkey_intent)); }
+                                Err(_) => view_model.set_navigation_notice("View unavailable. Go Back or open Settings.".into()),
+                            }
+                        }
+                    }
+                    continue;
+                }
+                action_activity.remove(&completion.request_id);
                 if let Some((revision, draft_revision, view, generation)) =
                     typed_requests.remove(&completion.request_id)
                 {
@@ -1001,65 +1097,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             crikey_core::structured_arguments::SubmissionFailureCode::Failed,
                         ),
                     };
-                    let command_learning = pending_command_learning.remove(&completion.request_id);
-                    let item_learning = pending_typed_items.remove(&completion.request_id);
-                    if matches!(
-                        &outcome,
-                        crikey_core::structured_arguments::SubmissionOutcome::Completed
-                    ) {
-                        let time = history_clock.advance();
-                        let learning = command_learning
-                            .map(|learning| command_history::Learning::Command(learning, time))
-                            .or_else(|| {
-                                item_learning.map(|item| command_history::Learning::ItemSelection(item, time))
-                            });
-                        if let Some(learning) = learning {
-                            command_projection_dirty = true;
-                            if let Err(message) = publish_learning(
-                                learning,
-                                &mut search,
-                                &history_writer,
-                                ranking_reset_pending,
-                                &mut deferred_learning,
-                            ) {
-                                view_model.set_navigation_notice(message);
-                            }
-                        }
-                    }
                     if view_model.accepts_typed_draft(revision, draft_revision, view, generation) {
                         view_model.inline_arguments_completed(revision, draft_revision, outcome);
                     }
                     continue;
-                }
-                let command_learning = pending_command_learning.remove(&completion.request_id);
-                let ordinary_learning = pending_ordinary_learning.remove(&completion.request_id);
-                if matches!(
-                    &completion.outcome,
-                    Ok(ActionEffect::Completed
-                        | ActionEffect::ShowPage { .. }
-                        | ActionEffect::Typed(
-                            crikey_core::structured_arguments::SubmissionOutcome::Completed
-                        ))
-                ) {
-                    let time = history_clock.advance();
-                    let learning = command_learning
-                        .map(|evidence| command_history::Learning::Command(evidence, time))
-                        .or_else(|| {
-                            ordinary_learning
-                                .map(|evidence| command_history::Learning::Ordinary(evidence, time))
-                        });
-                    if let Some(learning) = learning {
-                        command_projection_dirty = true;
-                        if let Err(message) = publish_learning(
-                            learning,
-                            &mut search,
-                            &history_writer,
-                            ranking_reset_pending,
-                            &mut deferred_learning,
-                        ) {
-                            view_model.set_navigation_notice(message);
-                        }
-                    }
                 }
                 let origin = action_origins.remove(&completion.request_id).flatten();
                 let may_present = origin.is_some_and(|(view, session)| {
@@ -1098,6 +1139,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     continue;
                 }
                 let message = match completion.outcome {
+                    Ok(ActionEffect::View(_)) | Ok(ActionEffect::Navigate { .. }) => continue,
                     Ok(ActionEffect::Typed(_)) => "Typed command finished".into(),
                     Ok(ActionEffect::Completed) => format!(
                         "Action completed: {} / {}",
@@ -1136,6 +1178,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     ),
                 };
                 report_status(&mut view_model, message);
+            }
+            if let Some(surface) = view_model.standard_surface() {
+                let pending = view_model.view().and_then(|(view, _)| {
+                    pending_standard_refresh(&view_requests, &surface.owner, surface.producer, view)
+                });
+                if search.retire_unavailable_view(&surface.owner, &surface.context, surface.producer, pending) {
+                    view_model.standard_unavailable();
+                }
             }
             // A page answers on its own thread like any other provider, so its
             // finished frames are folded in here rather than on the keystroke
@@ -1399,12 +1449,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 hotkey_report = report;
                 command_management_revision = None;
             }
-            if view_model
-                .inline_arguments()
-                .is_some_and(|input| search.root_inline_binding(input).is_none())
-            {
-                view_model.retire_unavailable_inline_arguments();
-            }
+            revalidate_root_inline_arguments(&search, &mut view_model);
             let mut shortcut_root_query = None;
             for receipt in hotkey_receipts {
                 let Some(dispatch) = hotkeys.resolve_event(&receipt, &registry, &preferences) else {
@@ -1444,7 +1489,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             shortcut_root_query = Some(query);
                             open_typed_input(
                                 &mut view_model,
-                                &mut typed_revision,
                                 &binding,
                                 Some((reference.clone(), registry.revision)),
                             );
@@ -1542,7 +1586,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
 
             let mut root_submission = None;
-            let (command_session, effect) = match event {
+            let (mut command_session, effect) = match event {
                 NativeLauncherEvent::Activated => {
                     // A rapid off/on hotkey pair may supersede the queued
                     // dismissal. Reset the old session before opening the new
@@ -1561,6 +1605,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     (None, None)
                 }
                 NativeLauncherEvent::Command { session, command } => {
+                    match &command {
+                        crikey_ui::UiCommand::StandardDoubleClick { .. } => standard_activation_session = Some(session),
+                        crikey_ui::UiCommand::SetLogicalScroll(_) => {}
+                        _ => standard_activation_session = None,
+                    }
                     if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
                         root_submission = view_model
                             .submitted_root_query()
@@ -1581,7 +1630,20 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             submission.generation,
                         )
                     {
-                        if let Some(binding) = view_model
+                        if let Some(surface) = view_model.standard_surface().cloned() {
+                            if let Some(input) = view_model.inline_arguments() {
+                                let executable = input.executable.clone();
+                                match search.submit_view_typed(&surface.owner, &surface.context, &view_model.standard_host_state(), &executable, submission.values) {
+                                    Ok(id) => {
+                                        action_activity.insert(id.clone(), hotkey_intent);
+                                        view_actions.insert(id.clone());
+                                        typed_requests.insert(id, (submission.revision, submission.draft_revision, submission.view, submission.generation));
+                                    }
+                                    Err(_) => view_model.inline_arguments_completed(submission.revision, submission.draft_revision,
+                                        crikey_core::structured_arguments::SubmissionOutcome::Failed(crikey_core::structured_arguments::SubmissionFailureCode::Unavailable)),
+                                }
+                            }
+                        } else if let Some(binding) = view_model
                             .inline_arguments()
                             .and_then(|input| search.root_inline_binding(input))
                         {
@@ -1602,6 +1664,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                     } else {
                                         pending_typed_items.insert(receipt.request_id.clone(), item);
                                     }
+                                    action_activity.insert(receipt.request_id.clone(), hotkey_intent);
                                     typed_requests.insert(
                                         receipt.request_id,
                                         (
@@ -1644,6 +1707,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 NativeLauncherEvent::ActionCompletion => (None, None),
             };
 
+            let effect = effect.or_else(|| {
+                let session = standard_activation_session?;
+                if !render_handle.is_visible_session(session) {
+                    return None;
+                }
+                let effect = view_model.take_standard_activation();
+                if effect.is_some() {
+                    command_session = Some(session);
+                    standard_activation_session = None;
+                }
+                effect
+            });
+
             // Read before the match consumes the effect: the window and the
             // process are one decision made in one place, so no arm can grow
             // its own private answer to "does this end the launcher".
@@ -1662,6 +1738,30 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     disposition = Some(next);
                 }
                 match effect {
+                    Some(UiEffect::OpenStandardLink { owner, context, url }) => {
+                        if search.open_view_url(&owner, &context, &view_model.standard_host_state(), &url).is_err() {
+                            view_model.set_navigation_notice("Link unavailable".into());
+                        }
+                    }
+                    Some(UiEffect::RefreshStandard(reason)) => {
+                        if let Some((view, _)) = view_model.view() {
+                            if !coalesce_standard_refresh(&view_requests, &mut latest_view_refresh, view, reason) {
+                                if let Some(request) = view_model.standard_refresh_request(reason) {
+                                    begin_standard_refresh(&search, &mut view_model, &mut view_requests, hotkey_intent, request);
+                                }
+                            }
+                        }
+                    }
+                    Some(UiEffect::ExecuteStandard { owner, context, executable }) => {
+                        match search.submit_view_action(&owner, &context, &view_model.standard_host_state(), &executable, None) {
+                            Ok(id) => {
+                                action_activity.insert(id.clone(), hotkey_intent);
+                                view_actions.insert(id.clone());
+                                action_origins.insert(id, view_model.view().map(|(view, _)| view).zip(command_session));
+                            }
+                            Err(_) => view_model.set_navigation_notice("View action unavailable".into()),
+                        }
+                    }
                     Some(UiEffect::RecallQuery) => {
                         view_model.set_query_recall(query_history.snapshot());
                     }
@@ -1814,7 +1914,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                     .selected_preview_row()
                                     .and_then(|row| row.source.as_ref()),
                             ) {
-                                open_typed_input(&mut view_model, &mut typed_revision, &binding, None);
+                                open_typed_input(&mut view_model, &binding, None);
+                            } else if let Some(source) = search.root_actionless_source(&owner, &item,
+                                view_model.selected_preview_row().and_then(|row| row.source.as_ref())) {
+                                match search.submit_root_actionless(&owner, &item, &source) {
+                                    Ok(id) => {
+                                        action_activity.insert(id.clone(), hotkey_intent);
+                                        action_origins.insert(id, view_model.view().map(|(view, _)| view).zip(command_session));
+                                    }
+                                    Err(_) => view_model.set_navigation_notice("Action unavailable".into()),
+                                }
                             }
                         }
                     }
@@ -1842,7 +1951,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             } else {
                                 open_typed_input(
                                     &mut view_model,
-                                    &mut typed_revision,
                                     &binding,
                                     Some((reference.clone(), registry_revision)),
                                 );
@@ -1905,6 +2013,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                             }
                                         }
                                         ActionSubmission::Pending(request_id) => {
+                                            action_activity.insert(request_id.clone(), hotkey_intent);
                                             pending_command_learning.insert(request_id.clone(), learning);
                                             action_origins.insert(
                                                 request_id.clone(),
@@ -2114,7 +2223,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 .selected_preview_row()
                                 .and_then(|row| row.source.as_ref()),
                         ) {
-                            open_typed_input(&mut view_model, &mut typed_revision, &binding, None);
+                            open_typed_input(&mut view_model, &binding, None);
                         } else if let Some(text) = calculated {
                             match calculator.copy(&text) {
                                 Ok(()) => {
@@ -2180,6 +2289,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                     }
                                 }
                                 Ok(ActionSubmission::Pending(request_id)) => {
+                                    action_activity.insert(request_id.clone(), hotkey_intent);
                                     if let Some(learning) = learning {
                                         pending_ordinary_learning.insert(request_id.clone(), learning);
                                     }
@@ -2201,20 +2311,32 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     None => {}
                 }
-                if let Some(route @ crikey_ui::NavigationRoute::CustomPage { .. }) =
-                    view_model.take_page_reopen()
-                {
-                    if let crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } = &route {
-                        if let Err(reason) = open_plugin_page(
-                            &mut search,
-                            &mut view_model,
-                            &mut web_page,
-                            plugin,
-                            page_id,
-                            page_window,
-                        ) {
-                            view_model.page_reopen_failed(route, reason);
+                if view_model.standard_surface().is_none() {
+                    if let Some(old) = live_standard.take() { search.retire_view(&old.owner, old.context.session); }
+                }
+                live_standard = view_model.standard_surface().cloned();
+                let current_view = view_model.view().map(|(view, _)| view);
+                latest_view_refresh = latest_view_refresh.filter(|(view, _)| Some(*view) == current_view);
+                for (id, (_, _, view, _)) in &view_requests {
+                    if Some(*view) != current_view { search.cancel_action(id); }
+                }
+                if let Some(route) = view_model.take_page_reopen() {
+                    match &route {
+                        crikey_ui::NavigationRoute::Standard { owner, producer, route: id, .. } => {
+                            if let Some(request) = view_model.open_standard_route(owner.clone(), *producer,
+                                crikey_core::structured_view::StructuredRouteOutcome::Replace(id.clone())) {
+                                match search.request_view(owner, *producer, request) {
+                                    Ok(request) => { view_requests.insert(request, (owner.clone(), *producer, view_model.view().unwrap().0, hotkey_intent)); }
+                                    Err(_) => view_model.page_reopen_failed(route, "Owner unavailable".into()),
+                                }
+                            }
                         }
+                        crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } => {
+                            if let Err(reason) = open_plugin_page(&mut search, &mut view_model, &mut web_page, plugin, page_id, page_window) {
+                                view_model.page_reopen_failed(route, reason);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 if let Some(raw) = view_model.take_query_refresh() {
@@ -2228,6 +2350,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     registry_query_refresh = false;
                     effect = view_model.refresh_root_query().map(UiEffect::Query);
                 } else if let Some(command) = input_commands.next() {
+                    match &command {
+                        crikey_ui::UiCommand::StandardDoubleClick { .. } => standard_activation_session = command_session,
+                        crikey_ui::UiCommand::SetLogicalScroll(_) => {}
+                        _ => standard_activation_session = None,
+                    }
                     // Capture only this command's actual pre-apply root query,
                     // after all preceding query and route effects have settled.
                     root_submission = if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
@@ -2542,15 +2669,13 @@ impl WebPageRuntime {
 
 fn open_typed_input(
     model: &mut LauncherViewModel,
-    sequence: &mut u64,
     binding: &crikey_app::RootExecutableBinding,
     command: Option<(crikey_core::CommandRef, u64)>,
 ) -> bool {
-    let Some(revision) = sequence.checked_add(1) else {
+    let Some(revision) = crikey_ui::next_inline_input_revision() else {
         model.set_navigation_notice("Command input identity limit reached; restart the launcher.".into());
         return false;
     };
-    *sequence = revision;
     model.open_inline_arguments(
         revision,
         binding.executable.clone(),
@@ -2558,6 +2683,16 @@ fn open_typed_input(
         crikey_app::root_publication_identity(&binding.source),
         command,
     )
+}
+
+fn revalidate_root_inline_arguments(search: &SearchService, model: &mut LauncherViewModel) {
+    if model.standard_surface().is_none()
+        && model
+            .inline_arguments()
+            .is_some_and(|input| input.view_context.is_none() && search.root_inline_binding(input).is_none())
+    {
+        model.retire_unavailable_inline_arguments();
+    }
 }
 
 fn activate_launcher_session(
@@ -4121,6 +4256,36 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
     None
 }
 
+/// Consume frozen evidence on every terminal completion, crediting only success.
+/// A route-open reply has its own request ID and cannot credit the invocation twice.
+fn take_success_learning(
+    completion: &crikey_app::PluginActionCompletion,
+    commands: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, crikey_app::CommandLearning>,
+    ordinary: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, crikey_app::SelectionLearning>,
+    typed_items: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, Item>,
+    time: impl FnOnce() -> u64,
+) -> Option<command_history::Learning> {
+    let command = commands.remove(&completion.request_id);
+    let ordinary = ordinary.remove(&completion.request_id);
+    let typed_item = typed_items.remove(&completion.request_id);
+    if !matches!(
+        &completion.outcome,
+        Ok(ActionEffect::Completed
+            | ActionEffect::ShowPage { .. }
+            | ActionEffect::Navigate { .. }
+            | ActionEffect::Typed(crikey_core::structured_arguments::SubmissionOutcome::Completed))
+    ) {
+        return None;
+    }
+    if let Some(command) = command {
+        Some(command_history::Learning::Command(command, time()))
+    } else if let Some(ordinary) = ordinary {
+        Some(command_history::Learning::Ordinary(ordinary, time()))
+    } else {
+        typed_item.map(|item| command_history::Learning::ItemSelection(item, time()))
+    }
+}
+
 fn publish_learning(
     learning: command_history::Learning,
     search: &mut SearchService,
@@ -4243,9 +4408,12 @@ fn publish_projected_rows(
             };
             (row.default_action.is_none()
                 && row.alternate_actions.is_empty()
-                && search
+                && (search
                     .root_result_binding(owner, item, None, row.source.as_ref())
-                    .is_some())
+                    .is_some()
+                    || search
+                        .root_actionless_source(owner, item, row.source.as_ref())
+                        .is_some()))
             .then(|| crikey_core::structured_arguments::OwnedItem {
                 owner: owner.clone(),
                 item: item.clone(),
@@ -4256,15 +4424,76 @@ fn publish_projected_rows(
     model.publish(generation, rows, retained.pending());
 }
 
-/// Apply the current native intent after draining queued shortcuts. A newly
-/// admitted shortcut cannot borrow authority from before this command executes.
+// Correlation only: current query, selection, scope and drafts remain in P3.
+type PendingViewRequests =
+    std::collections::BTreeMap<crikey_app::ActionRequestId, (PluginId, u64, crikey_ui::ViewId, u64)>;
+
+fn pending_standard_refresh<'a>(
+    pending: &'a PendingViewRequests,
+    owner: &PluginId,
+    producer: u64,
+    view: crikey_ui::ViewId,
+) -> Option<&'a crikey_app::ActionRequestId> {
+    pending
+        .iter()
+        .find_map(|(id, (target_owner, target_producer, target_view, _))| {
+            (target_owner == owner && *target_producer == producer && *target_view == view).then_some(id)
+        })
+}
+
+fn coalesce_standard_refresh(
+    pending: &PendingViewRequests,
+    latest: &mut Option<(crikey_ui::ViewId, crikey_core::structured_view::ViewRefreshReason)>,
+    view: crikey_ui::ViewId,
+    reason: crikey_core::structured_view::ViewRefreshReason,
+) -> bool {
+    if pending.values().any(|(_, _, target, _)| *target == view) {
+        *latest = Some((view, reason));
+        true
+    } else {
+        false
+    }
+}
+
+fn begin_standard_refresh(
+    search: &SearchService,
+    model: &mut LauncherViewModel,
+    pending: &mut PendingViewRequests,
+    intent: u64,
+    mut request: crikey_core::structured_view::ViewRequest,
+) {
+    let (Some(surface), Some((view, _))) = (model.standard_surface().cloned(), model.view()) else {
+        return;
+    };
+    request.previous_revision = Some(surface.context.revision);
+    model.set_standard_refresh_pending(true);
+    match search.request_view(&surface.owner, surface.producer, request) {
+        Ok(id) => {
+            pending.insert(id, (surface.owner.clone(), surface.producer, view, intent));
+        }
+        Err(_) => {
+            search.retire_view(&surface.owner, surface.context.session);
+            model.standard_unavailable();
+        }
+    }
+}
+
+fn command_advances_activity(command: &crikey_ui::UiCommand) -> bool {
+    !matches!(
+        command,
+        crikey_ui::UiCommand::SetLogicalScroll(_) | crikey_ui::UiCommand::ResizePage { .. }
+    )
+}
+
 fn apply_native_command(
     model: &mut LauncherViewModel,
     retained: &mut RetainedRows,
     hotkey_intent: &mut u64,
     command: crikey_ui::UiCommand,
 ) -> Option<UiEffect> {
-    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+    if command_advances_activity(&command) {
+        *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+    }
     if matches!(
         &command,
         crikey_ui::UiCommand::SetQuery(_)
@@ -7095,5 +7324,413 @@ mod tests {
             .scopes
             .iter()
             .any(|choice| choice.identity == selected.identity));
+    }
+
+    #[test]
+    fn navigation_success_learns_frozen_ordinary_typed_and_hotkey_evidence_after_presentation_is_superseded()
+    {
+        use crikey_core::structured_view::{
+            CollectionView, RouteId, StandardView, StructuredRouteOutcome, ViewDescriptor,
+            ViewExecutionContext, ViewReply, ViewSessionIdentity,
+        };
+        for replace in [false, true] {
+            for mode in 0..5 {
+                let mut search = ranked_service(&["Route command", "Replacement"]);
+                search.submit_query("Route").unwrap();
+                let item = application("Route command");
+                let mut reference = crikey_core::command::builtin_commands().remove(0).reference;
+                reference.provider_id = item.plugin_id.clone();
+                reference.command_id = "open-route".into();
+                let request = crikey_app::ActionRequestId {
+                    plugin: item.plugin_id.clone(),
+                    sequence: 1,
+                };
+                let mut commands = std::collections::BTreeMap::new();
+                let mut ordinary = std::collections::BTreeMap::new();
+                let mut typed_items = std::collections::BTreeMap::new();
+                if mode == 0 {
+                    ordinary.insert(
+                        request.clone(),
+                        search
+                            .selection_learning(&item.plugin_id, &item.stable_id)
+                            .unwrap(),
+                    );
+                } else if mode == 1 {
+                    typed_items.insert(request.clone(), item.clone());
+                } else {
+                    commands.insert(
+                        request.clone(),
+                        crikey_app::CommandLearning {
+                            reference: reference.clone(),
+                            item: item.clone(),
+                            // Typed/password and process-hotkey admissions carry no query text.
+                            query: (mode == 4).then(|| {
+                                search
+                                    .selection_learning(&item.plugin_id, &item.stable_id)
+                                    .unwrap()
+                                    .query
+                            }),
+                        },
+                    );
+                }
+                // The source row is gone; learning has no presentation-eligibility input.
+                search.submit_query("Replacement").unwrap();
+                let route = RouteId("opened".into());
+                let completion = crikey_app::PluginActionCompletion {
+                    request_id: request.clone(),
+                    plugin: item.plugin_id.clone(),
+                    item_id: item.stable_id.clone(),
+                    action_id: None,
+                    outcome: Ok(ActionEffect::Navigate {
+                        outcome: if replace {
+                            StructuredRouteOutcome::Replace(route)
+                        } else {
+                            StructuredRouteOutcome::Push(route)
+                        },
+                        producer: 7,
+                    }),
+                };
+                let learning = take_success_learning(
+                    &completion,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || 100,
+                )
+                .unwrap();
+                let writer = command_history::HistoryWorker::spawn(None, || {}).unwrap();
+                publish_learning(learning, &mut search, &writer, false, &mut Vec::new()).unwrap();
+                let snapshot = search.selection_history_snapshot();
+                assert_eq!(snapshot.selections.len(), 1);
+                assert_eq!(snapshot.selections[0].item, item.stable_id);
+                assert_eq!(snapshot.selections[0].frequency, 1);
+                assert_eq!(snapshot.commands.len(), usize::from(mode >= 2));
+                if mode >= 2 {
+                    assert_eq!(snapshot.commands[0].reference, reference);
+                    assert_eq!(snapshot.commands[0].frequency, 1);
+                }
+                assert_eq!(
+                    snapshot.query_affinities.len(),
+                    usize::from(mode == 0 || mode == 4)
+                );
+                assert!(snapshot
+                    .query_affinities
+                    .iter()
+                    .all(|affinity| affinity.query == "route"));
+                // Re-draining or the separate route-open completion has no admission evidence.
+                assert!(take_success_learning(
+                    &completion,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || panic!("duplicate credit")
+                )
+                .is_none());
+                let opened = crikey_app::PluginActionCompletion {
+                    request_id: crikey_app::ActionRequestId {
+                        sequence: 2,
+                        ..request
+                    },
+                    outcome: Ok(ActionEffect::View(ViewReply {
+                        context: ViewExecutionContext {
+                            route: RouteId("opened".into()),
+                            session: ViewSessionIdentity {
+                                logical_view: std::num::NonZeroU64::new(1).unwrap(),
+                                surface: std::num::NonZeroU64::new(2).unwrap(),
+                            },
+                            revision: std::num::NonZeroU64::new(1).unwrap(),
+                        },
+                        descriptor: Arc::new(ViewDescriptor {
+                            title: "Opened".into(),
+                            definitions: Arc::from([]),
+                            view: StandardView::List(CollectionView {
+                                items: Arc::from([]),
+                                sections: vec![],
+                                scopes: vec![],
+                                initial_selection: None,
+                                initial_scope: None,
+                            }),
+                        }),
+                    })),
+                    ..completion
+                };
+                assert!(take_success_learning(
+                    &opened,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || panic!("route-open credit")
+                )
+                .is_none());
+                assert_eq!(search.selection_history_snapshot(), snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_navigation_invocations_consume_evidence_without_learning() {
+        use crikey_core::structured_arguments::{SubmissionFailureCode, SubmissionOutcome};
+        for outcome in [
+            Err(crikey_core::CoreError::Invalid("failed".into())),
+            Ok(ActionEffect::Typed(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Cancelled,
+            ))),
+            Ok(ActionEffect::Typed(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Failed,
+            ))),
+        ] {
+            let item = application("Route command");
+            let request = crikey_app::ActionRequestId {
+                plugin: item.plugin_id.clone(),
+                sequence: 1,
+            };
+            let completion = crikey_app::PluginActionCompletion {
+                request_id: request.clone(),
+                plugin: item.plugin_id.clone(),
+                item_id: item.stable_id.clone(),
+                action_id: None,
+                outcome,
+            };
+            let mut commands = std::collections::BTreeMap::new();
+            let mut ordinary = std::collections::BTreeMap::new();
+            let mut typed_items = std::collections::BTreeMap::from([(request, item)]);
+            assert!(take_success_learning(
+                &completion,
+                &mut commands,
+                &mut ordinary,
+                &mut typed_items,
+                || panic!("failure advanced learning")
+            )
+            .is_none());
+            assert!(typed_items.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod standard_refresh_coalescing_tests {
+    use super::*;
+    use crikey_core::structured_view::ViewRefreshReason;
+
+    #[test]
+    fn presentation_grace_uses_only_the_exact_owner_producer_and_logical_view() {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let root = model.view().unwrap().0;
+        let owner = PluginId("views".into());
+        model
+            .open_standard_route(
+                owner.clone(),
+                11,
+                crikey_core::structured_view::StructuredRouteOutcome::Push(
+                    crikey_core::structured_view::RouteId("list".into()),
+                ),
+            )
+            .unwrap();
+        let view = model.view().unwrap().0;
+        assert_ne!(root, view);
+        let request = crikey_app::ActionRequestId {
+            plugin: owner.clone(),
+            sequence: 7,
+        };
+        for (target_owner, producer, target_view) in [
+            (PluginId("other".into()), 11, view),
+            (owner.clone(), 12, view),
+            (owner.clone(), 11, root),
+        ] {
+            let pending =
+                PendingViewRequests::from([(request.clone(), (target_owner, producer, target_view, 1))]);
+            assert!(pending_standard_refresh(&pending, &owner, 11, view).is_none());
+        }
+        let pending = PendingViewRequests::from([(request.clone(), (owner.clone(), 11, view, 1))]);
+        assert_eq!(
+            pending_standard_refresh(&pending, &owner, 11, view),
+            Some(&request)
+        );
+    }
+
+    #[test]
+    fn rapid_refresh_intents_keep_one_correlation_and_only_the_latest_reason() {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let view = model.view().unwrap().0;
+        let request = crikey_app::ActionRequestId {
+            plugin: PluginId("views".into()),
+            sequence: 7,
+        };
+        let mut pending = PendingViewRequests::new();
+        pending.insert(request.clone(), (request.plugin.clone(), 11, view, 1));
+        let mut latest = None;
+        for reason in [
+            ViewRefreshReason::Query,
+            ViewRefreshReason::Scope,
+            ViewRefreshReason::Selection,
+        ] {
+            assert!(coalesce_standard_refresh(&pending, &mut latest, view, reason));
+            assert!(pending.contains_key(&request));
+        }
+        assert_eq!(pending.len(), 1);
+        assert_eq!(latest.take(), Some((view, ViewRefreshReason::Selection)));
+        pending.remove(&request);
+        assert!(!coalesce_standard_refresh(
+            &pending,
+            &mut latest,
+            view,
+            ViewRefreshReason::Query
+        ));
+        assert!(latest.is_none());
+    }
+}
+
+#[cfg(test)]
+mod standard_route_resume_tests {
+    use super::*;
+    use crikey_core::structured_arguments::*;
+    use crikey_core::structured_view::*;
+    use crikey_core::ItemId;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn root_revalidation_does_not_retire_nonsecret_route_draft_during_fresh_open() {
+        let search = SearchService::new(App::new());
+        let owner = PluginId("route-resume".into());
+        let target = OwnedItem {
+            owner: owner.clone(),
+            item: ItemId("form".into()),
+        };
+        let key = ExecutableKey {
+            target: target.clone(),
+            action: None,
+        };
+        let descriptor = Arc::new(ViewDescriptor {
+            title: "Form".into(),
+            definitions: vec![RouteItemDefinition {
+                item: crikey_core::Item {
+                    stable_id: target.item.clone(),
+                    plugin_id: owner.clone(),
+                    category: crikey_core::Category::Application,
+                    label: "Form".into(),
+                    description: String::new(),
+                    target: "route-local".into(),
+                    search_terms: vec![],
+                    icon_reference: None,
+                    argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+                    hit_policy: crikey_core::HitPolicy::Ignored,
+                    score_hint: 0,
+                    metadata: Default::default(),
+                    actions: vec![],
+                },
+                actionless_policy: Some(crikey_core::ExecutionPolicy::Plugin),
+                primary_action: None,
+                action_sections: vec![ActionSection {
+                    id: "main".into(),
+                    label: "Actions".into(),
+                    entries: vec![ActionMenuEntry::Action(ExecutablePresentation {
+                        action: None,
+                        shortcut: None,
+                        destructive: false,
+                        schema: Some(Arc::new(ArgumentSchema {
+                            fields: vec![ArgumentField {
+                                id: FieldId("username".into()),
+                                label: "Username".into(),
+                                required: false,
+                                placeholder: None,
+                                validation_message: None,
+                                kind: FieldKind::Text {
+                                    min_bytes: 0,
+                                    max_bytes: 128,
+                                    multiline: false,
+                                    default: None,
+                                },
+                            }],
+                        })),
+                    })],
+                }],
+            }]
+            .into(),
+            view: StandardView::Form(FormView { submit: key }),
+        });
+        let mut model = LauncherViewModel::new();
+        model.set_resume_delay(Duration::from_secs(60));
+        model.activate();
+        let request = model
+            .open_standard_route(
+                owner.clone(),
+                7,
+                StructuredRouteOutcome::Push(RouteId("form".into())),
+            )
+            .unwrap();
+        assert!(model.publish_standard_view(
+            owner.clone(),
+            7,
+            ViewReply {
+                context: ViewExecutionContext {
+                    route: request.route,
+                    session: request.session,
+                    revision: NonZeroU64::new(11).unwrap()
+                },
+                descriptor: descriptor.clone(),
+            }
+        ));
+        let revision = model.inline_arguments().unwrap().revision;
+        let values = [(
+            FieldId("username".into()),
+            NonSecretValue::Text("native-route-user".into()),
+        )]
+        .into_iter()
+        .collect();
+        model.apply(crikey_ui::UiCommand::SetTypedDraft {
+            revision,
+            draft_revision: 1,
+            draft: values,
+        });
+        model.dismiss();
+        model.activate();
+        // An activation and any answer/input turns before the fresh reply must
+        // not send route restoration intent through the root-result resolver.
+        revalidate_root_inline_arguments(&search, &mut model);
+        assert!(model.inline_arguments().is_some());
+        assert!(model.frame().unwrap().navigation.inline_arguments.is_none());
+        let Some(crikey_ui::NavigationRoute::Standard {
+            owner: plugin,
+            producer,
+            route,
+            ..
+        }) = model.take_page_reopen()
+        else {
+            panic!("missing restored form")
+        };
+        let request = model
+            .open_standard_route(plugin, producer, StructuredRouteOutcome::Replace(route))
+            .unwrap();
+        revalidate_root_inline_arguments(&search, &mut model);
+        let input = model.inline_arguments().unwrap();
+        assert!(search.root_inline_binding(input).is_none());
+        assert_eq!(
+            input.draft.values.get(&FieldId("username".into())),
+            Some(&NonSecretValue::Text("native-route-user".into()))
+        );
+        assert!(model.publish_standard_view(
+            owner,
+            7,
+            ViewReply {
+                context: ViewExecutionContext {
+                    route: request.route,
+                    session: request.session,
+                    revision: NonZeroU64::new(12).unwrap()
+                },
+                descriptor,
+            }
+        ));
+        assert_ne!(model.inline_arguments().unwrap().revision, revision);
+        assert_eq!(
+            model
+                .inline_arguments()
+                .unwrap()
+                .draft
+                .values
+                .get(&FieldId("username".into())),
+            Some(&NonSecretValue::Text("native-route-user".into()))
+        );
     }
 }

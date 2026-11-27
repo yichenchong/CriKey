@@ -7,6 +7,8 @@ dependencies declared in the plugin manifest's ``[python]`` section.
 
 from .arguments import *
 from .arguments import __all__ as _argument_exports
+from .views import *
+from .views import __all__ as _view_exports
 from .plugin import (
     Action,
     Command,
@@ -38,5 +40,5 @@ __all__ = [
     "WorkerContext",
     "plugin_defined_category",
     "__version__",
-] + _argument_exports
+] + _argument_exports + _view_exports
 __version__ = "0.1.0"

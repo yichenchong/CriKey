@@ -15,6 +15,7 @@ pub mod path;
 pub mod preview;
 pub mod result_presentation;
 pub mod structured_arguments;
+pub mod structured_view;
 
 pub use action::{Action, ActionId, ExecutionPolicy};
 pub use activation::{ActivationPattern, ActivationPatternError, COMPILED_SIZE_LIMIT, MAX_PATTERN_BYTES};

@@ -223,12 +223,11 @@ authority and permissions. Optional free-form arguments are omitted; Required
 free-form commands open host input without invoking the callback. A typed schema
 opens the shared inline editor instead; aliases and shortcuts do not infer
 positional fields or flatten structured values into text.
-Native `Plugin::execute_outcome` may return
-`ExecuteOutcome::ShowPage`; a hidden callback's page outcome presents only for a
-current, once-consumed deliberate shortcut intent. Late superseded outcomes never
-revive a dismissed launcher. Modern Python execution currently discards callback
-return outcomes, so Modern command shortcuts execute but do not present result
-pages. Outcome propagation for that runtime is not delivered by this phase.
+Native `Plugin::execute_outcome` may return `ExecuteOutcome::ShowPage` or an
+independently negotiated standard-route navigation outcome. Modern Python
+preserves ordinary/typed callback navigation returns as well. A hidden
+callback's presentation requires a current, once-consumed deliberate shortcut
+intent; late superseded outcomes never revive a dismissed launcher.
 
 
 Preference controls submit revision-checked semantic edits to the user-global
@@ -257,12 +256,12 @@ secret, restart, and platform metadata. Secrets are redacted by
 
 ## Typed root arguments and presentation
 
-PR7 extends the existing root list, not the custom-page protocol.
-`typed_arguments_v1` and `result_presentation_v1` are independently negotiated
-optional capabilities. `commands_v1` and `preview_v1` imply neither. Existing
-list-returning callbacks remain supported. Standard grid/detail/form routes
-and structured navigation are separate work; typed execution has no navigation
-outcome.
+Typed root arguments extend the existing root list, not the custom-page
+protocol. `typed_arguments_v1` and `result_presentation_v1` are independently
+negotiated optional capabilities. `commands_v1` and `preview_v1` imply neither.
+Existing list-returning callbacks remain supported. Standard routes additionally
+require independent `structured_view_v1` support; typed execution can now return
+the canonical submission-or-navigation outcome described below.
 
 Shared Core models live in `structured_arguments`, `result_presentation` and
 `content_accounting`. `ResultPresentation` carries sections, scopes, item
@@ -371,11 +370,18 @@ fn suggestion_presentation(
 ) -> crikey_core::Result<crikey_core::result_presentation::ResultPresentation>;
 fn execute_typed(
     &mut self, request: TypedExecuteRequest, context: &dyn PluginContext,
-) -> crikey_core::Result<SubmissionOutcome>;
+) -> crikey_core::Result<crikey_core::structured_view::TypedExecutionOutcome>;
 ```
 
 Both support methods default to false. Presentation callbacks default to empty;
-typed execution defaults to Unsupported. Construct the shared Core structs;
+typed execution defaults to
+`SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported).into()`.
+`TypedExecutionOutcome::Submission(SubmissionOutcome)` carries fixed field/global
+results; `TypedExecutionOutcome::Navigate(StructuredRouteOutcome)` requests
+Push/Replace. Existing Rust callbacks return `SubmissionOutcome::Completed.into()`
+or the corresponding fixed failure `.into()`; the former
+`Result<SubmissionOutcome>` callback signature is replaced, not retained as a
+second method or forwarding shim. Construct the shared Core structs;
 there is no separate typed-schema builder. `TypedExecuteRequest` owns `request`,
 `item`, optional `action`, `expected_fingerprint: [u8; 32]` and move-only `values`.
 `Query.selected_scope_id` is the optional exact scope ID. Presentation metadata
@@ -525,6 +531,212 @@ Name `reject` exercises fixed field refusal, and query `typed-scope-wait`
 holds suggestion work until cancellation. Name `leak` deliberately attempts to
 retain and emit the supplied password across later callbacks/threads to probe
 diagnostic suppression; it is adversarial test code, not an author pattern.
+
+## Standard List, Grid, Detail and Form routes
+
+Standard views use Core's `structured_view` model and optional
+`structured_view_v1` capability, independently of `typed_arguments_v1`,
+`result_presentation_v1`, `commands_v1` and `preview_v1`. A form additionally
+needs typed execution; merely returning a schema does not grant it. Protocol
+version stays 1. Unsupported callbacks/capability absence are explicit refusals,
+not empty successful views or silently completed navigation.
+
+### Descriptor and authority
+
+Return `ViewDescriptor { title, definitions, view }`. `view` is
+`StandardView::{List, Grid, Detail, Form}` in Rust, or the corresponding Python
+`ListView`, `GridView`, `DetailView`, `FormView` instance:
+
+* List/Grid collections carry item presentations, explicit sections/scopes and
+  initial selection/scope hints. Provider order is preserved; hints apply only
+  when first opened, not over the host's selection on refresh. Grid has 1–16
+  columns and uses the existing validated image-pixel representation.
+* Detail uses prepared safe preview content. Rust calls `DetailView::prepare`;
+  Python supplies `DetailView(Preview(...), target_item_id)`. Existing inert
+  markdown, image and deliberate HTTP(S)-link bounds apply. Unsupported content
+  is refused, not interpreted as HTML or fetched as remote assets. Link
+  activation rechecks route/revision and the owner's document-opening permission.
+* Form references one exact executable already in the descriptor definition
+  table: Rust `FormView { submit: ExecutableKey }`, Python
+  `FormView(item_id, action_id=None)`. Its `ExecutablePresentation.schema` is the
+  same schema used by route typed execution, not a second form schema.
+
+Each `RouteItemDefinition` contains the complete local `Item`/actions, explicit
+actionless plugin policy where applicable, optional primary action, and bounded
+`ActionSection`/`ExecutablePresentation` menus. `None` is genuinely actionless,
+not an instruction to search for a root primary action. Worker definitions
+cannot grant host execution authority. SDK descriptors use their own local
+namespace; the host assigns endpoint ownership and rejects foreign references.
+
+Execution is bound to exact owner, actual physical producer, route, host session
+and descriptor revision. Reused item IDs in root or other routes are not
+fallback targets. Refresh validates and atomically replaces presentation,
+definitions, schemas and links; old queued events cannot execute new definitions.
+While Refresh is in flight, the host coalesces newer query/selection/scope
+changes and uses its successful revision for the next request. Do not assume
+every such edit cancels the callback; honor its deadline and cancellation token.
+The old frame may remain visible while the host drains that exact Refresh's
+completion, but it cannot execute or open links against the replacement revision.
+This presentation-only retention never survives producer or session loss.
+Hide, pop and owner loss still retire authority and cancel outstanding work.
+Retained selection, scroll and eligible draft state are bounded host intent, not
+requirements that the next descriptor preserve those items or schemas. The host
+reconciles them after admission; removed targets never gain replacement authority.
+A retained logical entry is restore intent, not executable authority.
+
+### Open, Refresh, execution and outcomes
+
+Rust implements these methods on the existing `Plugin`:
+
+```rust
+fn supports_structured_views(&self) -> bool; // default false
+fn structured_view(
+    &mut self, request: &ViewRequest, context: &dyn PluginContext,
+) -> crikey_core::Result<ViewDescriptor>;
+fn execute_view(
+    &mut self, request: ViewExecuteRequest, context: &dyn PluginContext,
+) -> crikey_core::Result<ExecuteOutcome>;
+fn execute_view_typed(
+    &mut self, request: ViewTypedExecuteRequest, context: &dyn PluginContext,
+) -> crikey_core::Result<TypedExecutionOutcome>;
+```
+
+`ViewRequest` contains `route`, `session`, Open/Refresh `mode`,
+`previous_revision`, optional host `state`, nonsecret `query`, optional `scroll`
+anchor and Explicit/Query/Selection/Scope `reason`. Open has no previous revision;
+Refresh requires it. The successful correlated response request ID becomes the
+descriptor revision, not a root query generation. Back/resume sends Open with a
+fresh surface and optional logical restoration state; it never replays execute.
+Scroll is host-local state, not an RPC on every wheel event.
+
+`ViewExecuteRequest` owns request ID, `view: ViewExecutionContext`, exact frozen
+route `item: Item`, optional action and optional ordinary argument.
+`ViewTypedExecuteRequest` instead owns the expected schema fingerprint and
+move-only typed values. Context carries route/session/revision. These callbacks
+default to Unsupported and never forward to root `execute`/`execute_typed`.
+Root typed execution still uses `TypedExecuteRequest.item: ItemId`; route typed
+execution receives its frozen descriptor item, not a root item-ID lookup.
+
+Ordinary Rust callbacks return `ExecuteOutcome::Navigate(...)`; root and route
+typed callbacks both return canonical `TypedExecutionOutcome::Submission(...)`
+or `TypedExecutionOutcome::Navigate(...)`. Navigation is
+`StructuredRouteOutcome::Push(RouteId)` or `Replace(RouteId)`. The host intercepts
+authorized navigation before sending submission-only field status to the editor.
+There is no parallel legacy typed-return method.
+
+Python overrides one sync/async `structured_view(request, context)` to negotiate
+standard views. It returns `ViewDescriptor(title, definitions, view)`; context
+provides `cancelled` and `log`. Request fields are `route`, `session`,
+`mode` (`"open"`/`"refresh"`), `previous_revision`, `reason`, `state`, `query`
+and `anchor`. Route entrypoints are distinct:
+
+```python
+def execute_view(self, route, item, action_id, argument): ...
+def execute_view_typed(self, route, item, action_id, values): ...
+```
+
+They may be async, receive the frozen route-local `Item` and never fall back to
+root callbacks. Override of root or route typed execution independently
+negotiates `typed_arguments_v1`. Ordinary root/route callbacks return `None`
+for completion or `Push(route)`/`Replace(route)` for navigation. Typed callbacks
+also accept `TypedOutcome` for fixed submission results. These returns survive
+the worker bridge; navigation is not discarded or turned into Completed.
+
+### Lifetime, privacy and bounds
+
+Push adds to the existing P3 stack; Replace replaces its current entry. Cover,
+pop, hide or source death immediately retires presentation/execution authority,
+while physical worker slots remain occupied until callback terminal/reaping.
+An existing route cannot reacquire a healthy replacement worker behind the
+same IDs: producer loss makes it unavailable. Back opens the owner/route anew
+under fresh admission; unavailable routes retain host Back and Settings.
+
+Root, Settings, custom/web pages and standard routes share one 16-entry/8 MiB
+mixed-content retention budget, with actual allocation capacities/shared
+allocations accounted once and renderer copies charged separately. The
+individual descriptor ceiling is 8 MiB, not another allowance. Limits remain
+4,096 items/definitions, 128 sections/scopes, 256 actions per target, menu depth
+four, and the existing schema/preview/image/frame limits (image edges ≤1,024
+and decoded image ≤1 MiB). Neither outgoing sizing nor incoming allocation
+budgets may be relaxed to fit a descriptor.
+
+Forms reuse native typed validation, fixed failures and the same schema
+fingerprint check. Only matching executable/schema nonsecret drafts restore;
+passwords, including editor Undo state, are not navigation snapshots. Cover,
+hide, pop and source loss retire live secret editor storage. Every typed
+submission still permanently latches that physical process's diagnostic
+suppression before writer admission, including later route/background calls.
+No sandbox or cryptographic-erasure guarantee follows.
+
+| Runtime | Standard route API | Boundary |
+| --- | --- | --- |
+| Native/Rust | `supports_structured_views()` plus callbacks above | Negotiated `structured_view_v1`; existing supervised owner/foreground dispatcher |
+| Modern Python | Override `structured_view` plus route callbacks | Independent negotiation; sync/async returns preserved |
+| Older Native/Modern | Explicitly unsupported without capability | Ordinary operations continue; no metadata-inferred routes |
+| Legacy Python | No new callback | Existing callback/scheduling/argument contract unchanged |
+| WASM / restricted C ABI | Not exposed | Shared Native envelopes do not add a guest API/ABI extension |
+
+This describes APIs and bounds, not graphical or cross-platform acceptance.
+
+### Runnable standard-view fixtures
+
+Complete implementations are
+[`structured-view-fixture.rs`](../compatibility/native-conformance/src/bin/structured-view-fixture.rs)
+and [`modern-views`](../compatibility/test-plugins/modern-views/). The Native
+fixture is its own binary: **no conformance mode file or environment mode is
+needed**. Its manifest ID must be `conformance`, matching its `ServeConfig`.
+From the repository root on Linux x86-64:
+
+```sh
+cargo build --manifest-path compatibility/native-conformance/Cargo.toml \
+  --bin structured-view-fixture
+views=$(mktemp -d)
+mkdir -p "$views/native/conformance/bin" "$views/modern"
+cp compatibility/native-conformance/target/debug/structured-view-fixture \
+  "$views/native/conformance/bin/"
+cp -R compatibility/test-plugins/modern-views "$views/modern/"
+cat > "$views/native/conformance/crikey.toml" <<'TOML'
+manifest-version = 1
+[plugin]
+id = "conformance"
+name = "Native Standard Views Fixture"
+version = "1.0.0"
+runtime = "native"
+entrypoint.linux-x86_64 = "bin/structured-view-fixture"
+api = ">=1.0,<2"
+TOML
+CRIKEY_NATIVE_PLUGIN_ROOTS="$views/native" \
+CRIKEY_MODERN_PLUGIN_ROOTS="$views/modern" \
+CRIKEY_CONFIG_DIR="$views/config" CRIKEY_STATE_DIR="$views/state" \
+CRIKEY_DATA_DIR="$views/data" CRIKEY_CACHE_DIR="$views/cache" \
+cargo run -p crikey-cli --bin crikey-launcher
+```
+
+Use the matching binary/platform entrypoint on other targets and a Python
+interpreter satisfying the copied manifest's `>=3.12` requirement. The Modern
+manifest is already complete: ID `views-fixture`, entrypoint
+`views_plugin:ViewsPlugin`. These commands are runnable author instructions,
+not a record that builds or GUI exercises passed.
+
+Native: open **Standard views** → actionless grid item → detail; **Continue**
+replaces detail with list, then Continue pushes form. Enter a username,
+synthetic password `view-secret`, and After submission `complete` or `navigate`.
+Wrong passwords return fixed field refusal; `navigate` replaces form with grid.
+The root **Root schema collision** uses the same item/action IDs with a
+different schema, intentionally checking namespace separation.
+
+Modern: **Open standard view fixture** pushes gallery; Open pushes detail,
+Configure pushes form. Name `reject` returns a fixed Name failure; any other
+nonempty name/password and a region replace form with done. Its actionless item
+replaces done with list, then list with detail. **Typed route opener** exercises
+typed root → gallery. Ordinary root and route items deliberately reuse `shared`.
+Use synthetic values only: the fixture intentionally prints submitted passwords
+to probe diagnostic suppression, not as an author logging pattern.
+
+Both fixtures support nonsecret query `delay` for pending-refresh exercises and
+`source-death` for genuine producer exit. Modern query `oversized-image` exercises
+image refusal. See the separately labeled proposed acceptance procedure in the
+[user guide](user-guide.md#proposed-standard-view-acceptance-procedure).
 
 ## Native/Rust lifecycle
 

@@ -14,6 +14,9 @@ use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::structured_arguments::{
     ArgumentSchema, ArgumentValues, ExecutableKey, OwnedItem, SubmissionOutcome,
 };
+use crikey_core::structured_view::{
+    StructuredRouteOutcome, ViewExecutionContext, ViewReply, ViewRequest, ViewSessionIdentity,
+};
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
@@ -71,6 +74,58 @@ pub struct RootSourceLedger {
 }
 
 impl RootSourceLedger {
+    pub(crate) fn actionless_item(
+        &self,
+        owner: &PluginId,
+        item_id: &ItemId,
+        source: &RootSource,
+    ) -> Option<&Item> {
+        let publication = match source {
+            RootSource::Catalog(_) => self.catalogs.get(owner)?,
+            RootSource::Suggestion { .. } => self.suggestions.get(owner)?,
+        };
+        let item = publication.items.get(item_id)?;
+        if &publication.snapshot.source != source
+            || !item.actions.is_empty()
+            || item.argument_policy == crikey_core::ArgumentPolicy::Required
+        {
+            return None;
+        }
+        if publication.snapshot.presentation.schemas.iter().any(|binding| {
+            binding.executable.target.owner == *owner
+                && binding.executable.target.item == *item_id
+                && binding.executable.action.is_none()
+        }) {
+            return None;
+        }
+        Some(item)
+    }
+    pub(crate) fn actionless_source(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootSource> {
+        let publication = if let Some(canonical) = canonical {
+            self.catalogs.get(owner).filter(
+                |p| matches!(&p.snapshot.source, RootSource::Catalog(source) if source == canonical),
+            )?
+        } else if let Some(publication) = self.suggestions.get(owner).filter(|p| p.items.contains_key(item)) {
+            publication
+        } else {
+            if self.retired_owners.contains(owner)
+                || self
+                    .retired
+                    .iter()
+                    .any(|target| &target.owner == owner && &target.item == item)
+            {
+                return None;
+            }
+            self.catalogs.get(owner)?
+        };
+        self.actionless_item(owner, item, &publication.snapshot.source)?;
+        Some(publication.snapshot.source.clone())
+    }
     pub fn publish(
         &mut self,
         owner: PluginId,
@@ -320,6 +375,9 @@ pub struct DeclaredCommandSource {
 #[derive(Debug)]
 pub(crate) enum AdmittedPluginWork {
     Action(ActionId),
+    Actionless {
+        source: RootSource,
+    },
     Command {
         declaration: crikey_core::command::CommandDeclaration,
         action_id: Option<ActionId>,
@@ -336,6 +394,7 @@ impl AdmittedPluginWork {
         match self {
             Self::Action(id) => Some(id),
             Self::Command { action_id, .. } => action_id.as_ref(),
+            Self::Actionless { .. } => None,
             Self::Typed { binding, .. } => binding.executable.action.as_ref(),
         }
     }
@@ -347,7 +406,7 @@ impl AdmittedPluginWork {
             Self::Command {
                 declaration, source, ..
             } => Some((declaration, source)),
-            Self::Action(_) | Self::Typed { .. } => None,
+            Self::Action(_) | Self::Actionless { .. } | Self::Typed { .. } => None,
         }
     }
 
@@ -367,6 +426,14 @@ impl AdmittedPluginWork {
 
     pub(crate) fn validate(&self, item: &Item, argument: Option<&str>) -> CoreResult<()> {
         match self {
+            Self::Actionless { .. } => {
+                if !item.actions.is_empty()
+                    || argument.is_some()
+                    || item.argument_policy == crikey_core::ArgumentPolicy::Required
+                {
+                    return Err(CoreError::Invalid("actionless root target changed".into()));
+                }
+            }
             Self::Typed { binding, values } => {
                 if argument.is_some()
                     || item.plugin_id != binding.executable.target.owner
@@ -511,16 +578,48 @@ pub struct ActionRequestId {
 /// the completion says so and names the surface. Reporting it as `Ok(())`
 /// would leave the caller guessing from a side channel which action, if any,
 /// wanted the window kept open (spec 32.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ActionEffect {
     /// The action ran and is finished.
     Completed,
     /// Fixed-code typed outcome; values and callback diagnostics never return.
     Typed(SubmissionOutcome),
+    /// Host-correlated descriptor from the exact admitted producer.
+    View(ViewReply),
+    /// Navigation keeps the physical completion source, never a guest owner.
+    Navigate {
+        outcome: StructuredRouteOutcome,
+        producer: u64,
+    },
     /// The action asked the host to open this plugin-drawn page. The owning
     /// plugin is [`PluginActionCompletion::plugin`].
     ShowPage { page_id: String },
 }
+
+impl PartialEq for ActionEffect {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Completed, Self::Completed) => true,
+            (Self::Typed(a), Self::Typed(b)) => a == b,
+            (Self::ShowPage { page_id: a }, Self::ShowPage { page_id: b }) => a == b,
+            (
+                Self::Navigate {
+                    outcome: a,
+                    producer: x,
+                },
+                Self::Navigate {
+                    outcome: b,
+                    producer: y,
+                },
+            ) => a == b && x == y,
+            (Self::View(a), Self::View(b)) => {
+                a.context == b.context && Arc::ptr_eq(&a.descriptor, &b.descriptor)
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for ActionEffect {}
 
 /// Terminal result emitted by a plugin action endpoint.
 ///
@@ -649,6 +748,78 @@ pub(crate) fn resolve_action_item(
 /// terminal completion is emitted, including transport failures, timeout,
 /// cancellation and worker reaping.
 pub trait PluginActionExecutor: Send + Sync {
+    fn request_view(
+        &self,
+        _owner: &PluginId,
+        _producer: u64,
+        _request: ViewRequest,
+    ) -> CoreResult<ActionRequestId> {
+        Err(CoreError::Invalid(
+            "runtime does not support standard views".into(),
+        ))
+    }
+    fn submit_view_action(
+        &self,
+        _owner: &PluginId,
+        _context: &ViewExecutionContext,
+        _state: &crikey_core::structured_view::HostViewState,
+        _executable: &ExecutableKey,
+        _argument: Option<&str>,
+    ) -> CoreResult<ActionRequestId> {
+        Err(CoreError::Invalid(
+            "runtime does not support standard views".into(),
+        ))
+    }
+    fn submit_view_typed(
+        &self,
+        _owner: &PluginId,
+        _context: &ViewExecutionContext,
+        _state: &crikey_core::structured_view::HostViewState,
+        _executable: &ExecutableKey,
+        _values: ArgumentValues,
+    ) -> CoreResult<ActionRequestId> {
+        Err(CoreError::Invalid(
+            "runtime does not support standard views".into(),
+        ))
+    }
+    fn retire_view(&self, _owner: &PluginId, _session: ViewSessionIdentity) {}
+    fn view_current(&self, _owner: &PluginId, _context: &ViewExecutionContext) -> bool {
+        false
+    }
+    fn view_presentation_available(
+        &self,
+        _owner: &PluginId,
+        _context: &ViewExecutionContext,
+        _producer: u64,
+        _pending: Option<&ActionRequestId>,
+    ) -> bool {
+        false
+    }
+    fn submit_actionless(
+        &self,
+        _owner: &PluginId,
+        _item: &ItemId,
+        _source: &RootSource,
+    ) -> CoreResult<ActionRequestId> {
+        Err(CoreError::Invalid("actionless root target unavailable".into()))
+    }
+    fn root_actionless_source(
+        &self,
+        _owner: &PluginId,
+        _item: &ItemId,
+        _canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootSource> {
+        None
+    }
+    fn validate_view_link(
+        &self,
+        _owner: &PluginId,
+        _context: &ViewExecutionContext,
+        _state: &crikey_core::structured_view::HostViewState,
+        _url: &str,
+    ) -> CoreResult<()> {
+        Err(CoreError::Invalid("view link unavailable".into()))
+    }
     fn root_binding(
         &self,
         _key: &ExecutableKey,
@@ -875,6 +1046,97 @@ impl fmt::Debug for PluginActionRouter {
 }
 
 impl PluginActionRouter {
+    pub fn submit_actionless(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        source: &RootSource,
+    ) -> CoreResult<ActionRequestId> {
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid("root owner unavailable".into()))?
+            .submit_actionless(owner, item, source)
+    }
+    pub fn root_actionless_source(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        canonical: Option<&DeclaredCommandSource>,
+    ) -> Option<RootSource> {
+        self.providers
+            .get(owner)?
+            .root_actionless_source(owner, item, canonical)
+    }
+    pub fn request_view(
+        &self,
+        owner: &PluginId,
+        producer: u64,
+        request: ViewRequest,
+    ) -> CoreResult<ActionRequestId> {
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid("view owner unavailable".into()))?
+            .request_view(owner, producer, request)
+    }
+    pub fn submit_view_action(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &ExecutableKey,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionRequestId> {
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid("view owner unavailable".into()))?
+            .submit_view_action(owner, context, state, executable, argument)
+    }
+    pub fn submit_view_typed(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &ExecutableKey,
+        values: ArgumentValues,
+    ) -> CoreResult<ActionRequestId> {
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid("view owner unavailable".into()))?
+            .submit_view_typed(owner, context, state, executable, values)
+    }
+    pub fn retire_view(&self, owner: &PluginId, session: ViewSessionIdentity) {
+        if let Some(endpoint) = self.providers.get(owner) {
+            endpoint.retire_view(owner, session);
+        }
+    }
+    pub fn view_current(&self, owner: &PluginId, context: &ViewExecutionContext) -> bool {
+        self.providers
+            .get(owner)
+            .is_some_and(|endpoint| endpoint.view_current(owner, context))
+    }
+    pub fn view_presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        self.providers
+            .get(owner)
+            .is_some_and(|endpoint| endpoint.view_presentation_available(owner, context, producer, pending))
+    }
+    pub fn validate_view_link(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        url: &str,
+    ) -> CoreResult<()> {
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid("view owner unavailable".into()))?
+            .validate_view_link(owner, context, state, url)
+    }
     /// Registers a legacy endpoint under the legacy compatibility baseline.
     ///
     /// A Keypirinha package has no `crikey.toml` and therefore no author

@@ -48,13 +48,17 @@ use crikey_core::command::{
 };
 use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::structured_arguments::{
-    ArgumentSchema, ArgumentValues, ExecutableKey, NonSecretValue, OwnedItem, StructuredValue,
-    SubmissionFailureCode, SubmissionOutcome,
+    ArgumentSchema, ArgumentValues, ExecutableKey, OwnedItem, SubmissionFailureCode, SubmissionOutcome,
+};
+use crikey_core::structured_view::{
+    RouteAdmission, RouteIdentity, StructuredRouteOutcome, TypedExecutionOutcome, ViewExecutionContext,
+    ViewReply, ViewRequest, ViewRequestMode, STRUCTURED_VIEW_CAPABILITY,
 };
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_sandbox::SandboxPolicy;
+use std::num::NonZeroU64;
 
 use crate::interpreter::sanitize_python_environment;
 use crate::protocol::{
@@ -287,6 +291,8 @@ pub struct Suggestions {
 pub enum ExecuteOutcome {
     /// The action completed.
     Ok,
+    /// A negotiated action requests a fresh owner-local standard route.
+    Navigate(StructuredRouteOutcome),
     /// The plugin raised; the worker is healthy and remains usable.
     Failed(PluginError),
 }
@@ -484,7 +490,11 @@ impl WorkerLink {
     }
 
     fn enqueue_frame(&self, frame: &Value) -> io::Result<Receiver<Result<(), String>>> {
-        let mut encoded = serde_json::to_vec(frame).expect("a frame built from owned JSON values serialises");
+        let mut size = protocol::FrameSize::default();
+        serde_json::to_writer(&mut size, frame).map_err(io::Error::other)?;
+        size.write_all(b"\n")?;
+        let mut encoded = Vec::with_capacity(size.0);
+        serde_json::to_writer(&mut encoded, frame).map_err(io::Error::other)?;
         encoded.push(b'\n');
         self.enqueue_bytes(encoded)
     }
@@ -1091,6 +1101,8 @@ pub struct ModernWorker {
     commands_supported: bool,
     typed_supported: bool,
     presentation_supported: bool,
+    structured_supported: bool,
+    active_view: Option<ViewReply>,
     presentation: ResultPresentation,
     catalog_schemas: BTreeMap<ExecutableKey, Arc<ArgumentSchema>>,
     query_schemas: BTreeMap<ExecutableKey, Arc<ArgumentSchema>>,
@@ -1219,6 +1231,8 @@ impl ModernWorker {
             commands_supported: false,
             typed_supported: false,
             presentation_supported: false,
+            structured_supported: false,
+            active_view: None,
             presentation: ResultPresentation::default(),
             catalog_schemas: BTreeMap::new(),
             query_schemas: BTreeMap::new(),
@@ -1285,6 +1299,164 @@ impl ModernWorker {
         CancelHandle {
             link: Arc::clone(&self.link),
         }
+    }
+    pub fn supports_structured_views(&self) -> bool {
+        self.structured_supported
+    }
+
+    pub fn retire_view(&mut self) {
+        self.active_view = None;
+    }
+
+    /// One bounded Open/Refresh operation on the existing supervised worker.
+    pub fn structured_view(&mut self, request: &ViewRequest) -> Result<ViewReply, HostError> {
+        self.structured_view_with_admission(request, |send| send())
+    }
+
+    /// Revalidate the sole endpoint authority at the existing writer enqueue.
+    pub fn structured_view_with_admission(
+        &mut self,
+        request: &ViewRequest,
+        admission: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    ) -> Result<ViewReply, HostError> {
+        if !self.structured_supported {
+            return Err(HostError::Protocol("structured view unsupported".into()));
+        }
+        if !self.alive {
+            return Err(self.crashed());
+        }
+        if request.mode == ViewRequestMode::Refresh
+            && !self.active_view.as_ref().is_some_and(|v| {
+                v.context.route == request.route
+                    && v.context.session == request.session
+                    && Some(v.context.revision) == request.previous_revision
+            })
+        {
+            return Err(HostError::Protocol("structured view unavailable".into()));
+        }
+        let id = self
+            .link
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| HostError::Protocol("view request counter exhausted".into()))?;
+        let outgoing = crate::views::request(id.get(), request, &self.plugin)
+            .ok_or_else(|| HostError::Protocol("invalid structured view request".into()))?;
+        self.active_view = None;
+        let deadline = deadline_after_millis(self.options.call_timeout_ms);
+        let mut queued = None;
+        let admitted = admission(&mut || {
+            let result = self.link.enqueue_frame(&outgoing);
+            let ok = result.is_ok();
+            queued = Some(result);
+            ok
+        });
+        if !admitted && queued.is_none() {
+            return Err(HostError::Protocol("structured view unavailable".into()));
+        }
+        let Some(completion) = queued.and_then(Result::ok) else {
+            self.fail_and_reap();
+            return Err(self.crashed());
+        };
+        match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                self.fail_and_reap();
+                return Err(HostError::Timeout);
+            }
+            _ => {
+                self.fail_and_reap();
+                return Err(self.crashed());
+            }
+        }
+        let frame = self.recv_frame_until(deadline)?;
+        let frame = self.expect_frame(&frame, id.get(), "structured_view_result")?;
+        if frame.get("route").and_then(Value::as_str) != Some(request.route.0.as_str())
+            || frame.get("session") != outgoing.get("session")
+        {
+            return Err(self.protocol_error("invalid view correlation"));
+        }
+        if frame.get("status").and_then(Value::as_str) != Some("content") {
+            return Err(HostError::Protocol(
+                match frame.get("code").and_then(Value::as_str) {
+                    Some("unsupported") => "structured view unsupported",
+                    Some("cancelled") => "structured view cancelled",
+                    Some("unavailable") => "structured view unavailable",
+                    _ => "structured view failed",
+                }
+                .into(),
+            ));
+        }
+        let descriptor = match frame
+            .get("descriptor")
+            .and_then(|v| crate::views::descriptor(&self.plugin, v))
+        {
+            Some(crate::views::DescriptorDecode::Content(descriptor)) => descriptor,
+            Some(crate::views::DescriptorDecode::Rejected) => {
+                return Err(HostError::Protocol("structured view content rejected".into()))
+            }
+            None => return Err(self.protocol_error("invalid view descriptor")),
+        };
+        let context = ViewExecutionContext {
+            route: request.route.clone(),
+            session: request.session,
+            revision: id,
+        };
+        let admission = RouteAdmission::worker(
+            RouteIdentity {
+                owner: self.plugin.clone(),
+                route: request.route.clone(),
+                incarnation: NonZeroU64::new(self.incarnation).expect("physical incarnation"),
+            },
+            context.surface(),
+        )
+        .map_err(|_| self.protocol_error("invalid view admission"))?;
+        descriptor
+            .validate(&admission)
+            .map_err(|_| HostError::Protocol("structured view content rejected".into()))?;
+        let reply = ViewReply {
+            context,
+            descriptor: Arc::new(descriptor),
+        };
+        self.active_view = Some(reply.clone());
+        Ok(reply)
+    }
+
+    fn view_executable(
+        &self,
+        context: &ViewExecutionContext,
+        item: &Item,
+        action: Option<&str>,
+    ) -> Option<Option<&Arc<ArgumentSchema>>> {
+        if !self.structured_supported || !self.alive {
+            return None;
+        }
+        let view = self.active_view.as_ref()?;
+        if &view.context != context || item.plugin_id != self.plugin {
+            return None;
+        }
+        let definition = view
+            .descriptor
+            .definitions
+            .iter()
+            .find(|d| d.item.stable_id == item.stable_id && d.item.plugin_id == item.plugin_id)?;
+        // Compare complete frozen definitions without allocating a JSON copy.
+        if !crate::views::same_item(&definition.item, item) {
+            return None;
+        }
+        let presentation = match action {
+            Some(id) => {
+                let action = definition.item.actions.iter().find(|a| a.action_id.0 == id)?;
+                definition.presentation(Some(&action.action_id))?
+            }
+            None if definition.item.actions.is_empty() && definition.actionless_policy.is_some() => {
+                definition.presentation(None)?
+            }
+            None => return None,
+        };
+        Some(presentation.schema.as_ref())
     }
     /// Optional capability negotiated independently of ordinary suggestions.
     pub fn supports_preview(&self) -> bool {
@@ -1635,8 +1807,9 @@ impl ModernWorker {
         action_id: Option<&str>,
         schema: &ArgumentSchema,
         values: ArgumentValues,
-    ) -> Result<SubmissionOutcome, HostError> {
-        self.typed_execute_with_admission(item, action_id, schema, values, |send| send())
+        view: Option<&ViewExecutionContext>,
+    ) -> Result<TypedExecutionOutcome, HostError> {
+        self.typed_execute_with_admission(item, action_id, schema, values, view, |send| send())
     }
 
     /// Run `admission(send)` after confirmation/encoding. The caller holds its
@@ -1647,22 +1820,38 @@ impl ModernWorker {
         action_id: Option<&str>,
         schema: &ArgumentSchema,
         values: ArgumentValues,
+        view: Option<&ViewExecutionContext>,
         admission: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
-    ) -> Result<SubmissionOutcome, HostError> {
+    ) -> Result<TypedExecutionOutcome, HostError> {
         if !self.typed_supported {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported));
+            return Ok(TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Unsupported,
+            )));
         }
         if item.plugin_id != self.plugin {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+            return Ok(TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Unavailable,
+            )));
         }
         if !self.alive {
             return Err(self.crashed());
         }
-        if !self.confirm_typed_schema(item, action_id, schema)? {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+        let confirmed = if let Some(context) = view {
+            self.view_executable(context, item, action_id)
+                .flatten()
+                .is_some_and(|current| current.fingerprint().ok() == schema.fingerprint().ok())
+        } else {
+            self.confirm_typed_schema(item, action_id, schema)?
+        };
+        if !confirmed {
+            return Ok(TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Unavailable,
+            )));
         }
         if schema.validate_values(&values).is_err() {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Failed));
+            return Ok(TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Failed,
+            )));
         }
         {
             let mut tail = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
@@ -1682,53 +1871,32 @@ impl ModernWorker {
             .map_err(|_| HostError::Protocol("typed request counter exhausted".into()))?
             .checked_add(1)
             .ok_or_else(|| HostError::Protocol("typed request counter exhausted".into()))?;
-        let mut bytes = Vec::with_capacity(1024);
-        bytes.extend_from_slice(b"{\"kind\":\"typed_execute\",\"id\":");
-        serde_json::to_writer(&mut bytes, &id).expect("integer");
-        bytes.extend_from_slice(b",\"item\":");
-        serde_json::to_writer(&mut bytes, &protocol::encode_item(item)).expect("item");
-        bytes.extend_from_slice(b",\"action_id\":");
-        serde_json::to_writer(&mut bytes, &action_id).expect("action");
-        bytes.extend_from_slice(b",\"schema_fingerprint\":");
-        serde_json::to_writer(
-            &mut bytes,
-            &crate::typed::fingerprint(schema).expect("validated schema"),
+        let frozen = protocol::encode_item(item);
+        let fingerprint = crate::typed::fingerprint(schema).expect("validated schema");
+        let context = view.map(crate::views::context);
+        let mut size = protocol::FrameSize::default();
+        protocol::write_typed(
+            &mut size,
+            id,
+            &frozen,
+            action_id,
+            &fingerprint,
+            &values,
+            context.as_ref(),
         )
-        .expect("fingerprint");
-        bytes.extend_from_slice(b",\"values\":[");
-        let value_capacity: usize = values
-            .0
-            .iter()
-            .map(|(field, value)| {
-                let length = match value {
-                    StructuredValue::NonSecret(NonSecretValue::Text(text)) => text.len(),
-                    StructuredValue::NonSecret(NonSecretValue::Dropdown(option)) => option.0.len(),
-                    StructuredValue::Password(password) => password.expose_plaintext().len(),
-                };
-                6 * (field.0.len() + length) + 128
-            })
-            .sum();
-        bytes.reserve_exact(value_capacity + 4);
-        for (index, (field, value)) in values.0.into_iter().enumerate() {
-            if index != 0 {
-                bytes.push(b',');
-            }
-            bytes.extend_from_slice(b"{\"field_id\":");
-            serde_json::to_writer(&mut bytes, &field.0).expect("field");
-            let (kind, text) = match &value {
-                StructuredValue::NonSecret(NonSecretValue::Text(text)) => ("text", text.as_str()),
-                StructuredValue::NonSecret(NonSecretValue::Dropdown(option)) => {
-                    ("dropdown", option.0.as_str())
-                }
-                StructuredValue::Password(password) => ("password", password.expose_plaintext()),
-            };
-            bytes.extend_from_slice(b",\"kind\":");
-            serde_json::to_writer(&mut bytes, kind).expect("kind");
-            bytes.extend_from_slice(b",\"value\":");
-            serde_json::to_writer(&mut bytes, text).expect("value");
-            bytes.push(b'}');
-        }
-        bytes.extend_from_slice(b"]}\n");
+        .map_err(|_| HostError::Protocol("typed request exceeds frame bound".into()))?;
+        let mut bytes = Vec::with_capacity(size.0);
+        protocol::write_typed(
+            &mut bytes,
+            id,
+            &frozen,
+            action_id,
+            &fingerprint,
+            &values,
+            context.as_ref(),
+        )
+        .expect("preflighted typed frame");
+        drop(values);
         let mut bytes = Some(PipeBytes(bytes));
         let mut queued = None;
         let deadline = deadline_after_millis(self.options.call_timeout_ms);
@@ -1742,7 +1910,9 @@ impl ModernWorker {
             ok
         });
         if !admitted && queued.is_none() {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+            return Ok(TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Unavailable,
+            )));
         }
         let Some(completion) = queued.and_then(Result::ok) else {
             self.fail_and_reap();
@@ -1761,7 +1931,20 @@ impl ModernWorker {
         }
         let line = self.recv_frame_until(deadline)?;
         let frame = self.expect_frame(&line, id, "typed_execute_result")?;
-        crate::typed::outcome(&frame, schema).ok_or_else(|| self.protocol_error("invalid typed outcome"))
+        if frame.get("status").and_then(Value::as_str) == Some("navigate") {
+            if !self.structured_supported {
+                return Err(self.protocol_error("unnegotiated navigation"));
+            }
+            if frame.contains_key("failures") || frame.contains_key("code") || frame_has_error(&frame) {
+                return Err(self.protocol_error("conflicting typed outcome"));
+            }
+            return crate::views::navigation(&frame)
+                .map(TypedExecutionOutcome::Navigate)
+                .ok_or_else(|| self.protocol_error("invalid navigation outcome"));
+        }
+        crate::typed::outcome(&frame, schema)
+            .map(TypedExecutionOutcome::Submission)
+            .ok_or_else(|| self.protocol_error("invalid typed outcome"))
     }
 
     fn suggest_inner(
@@ -1914,11 +2097,30 @@ impl ModernWorker {
         item: &Item,
         action_id: Option<&str>,
         argument: Option<&str>,
+        view: Option<&ViewExecutionContext>,
+    ) -> Result<ExecuteOutcome, HostError> {
+        self.execute_with_admission(item, action_id, argument, view, |send| send())
+    }
+
+    pub fn execute_with_admission(
+        &mut self,
+        item: &Item,
+        action_id: Option<&str>,
+        argument: Option<&str>,
+        view: Option<&ViewExecutionContext>,
+        admission: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
     ) -> Result<ExecuteOutcome, HostError> {
         if !self.alive {
             return Err(self.crashed());
         }
-        if self
+        if let Some(context) = view {
+            if !matches!(self.view_executable(context, item, action_id), Some(None)) {
+                return Ok(ExecuteOutcome::Failed(PluginError {
+                    message: "route executable unavailable".into(),
+                    traceback: String::new(),
+                }));
+            }
+        } else if self
             .catalog_schemas
             .keys()
             .chain(self.query_schemas.keys())
@@ -1934,22 +2136,58 @@ impl ModernWorker {
         }
 
         let id = self.link.next_id();
-        if self
-            .link
-            .write_frame(&encode_execute(id, item, action_id, argument))
-            .is_err()
+        let mut frame = encode_execute(id, item, action_id, argument);
+        if let Some(context) = view {
+            frame["view_context"] = crate::views::context(context);
+        }
+        let deadline = deadline_after_millis(self.options.call_timeout_ms);
+        let mut queued = None;
+        if !admission(&mut || {
+            let result = self.link.enqueue_frame(&frame);
+            let ok = result.is_ok();
+            queued = Some(result);
+            ok
+        }) && queued.is_none()
         {
+            return Ok(ExecuteOutcome::Failed(PluginError {
+                message: "route executable unavailable".into(),
+                traceback: String::new(),
+            }));
+        }
+        let Some(completion) = queued.and_then(Result::ok) else {
             self.fail_and_reap();
             return Err(self.crashed());
+        };
+        match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                self.fail_and_reap();
+                return Err(HostError::Timeout);
+            }
+            _ => {
+                self.fail_and_reap();
+                return Err(self.crashed());
+            }
         }
 
-        let line = self.recv_frame(self.options.call_timeout_ms)?;
+        let line = self.recv_frame_until(deadline)?;
         let frame = self.expect_frame(&line, id, KIND_EXECUTE_RESULT)?;
         if protocol::decode_log(&frame).is_none() {
             return Err(self.protocol_error(&line));
         }
 
         match frame.get("status").and_then(Value::as_str) {
+            Some("navigate") => {
+                if !self.structured_supported {
+                    return Err(self.protocol_error("unnegotiated navigation"));
+                }
+                if frame_has_error(&frame) {
+                    return Err(self.protocol_error("conflicting execute outcome"));
+                }
+                crate::views::navigation(&frame)
+                    .map(ExecuteOutcome::Navigate)
+                    .ok_or_else(|| self.protocol_error("invalid navigation outcome"))
+            }
             Some("ok") => {
                 if frame_has_error(&frame) {
                     return Err(self.protocol_error(&line));
@@ -1990,6 +2228,8 @@ impl ModernWorker {
 
         if acknowledged {
             let capabilities = frame.get("capabilities").and_then(Value::as_array);
+            self.structured_supported = capabilities
+                .is_some_and(|c| c.iter().any(|v| v.as_str() == Some(STRUCTURED_VIEW_CAPABILITY)));
             self.typed_supported =
                 capabilities.is_some_and(|c| c.iter().any(|v| v.as_str() == Some("typed_arguments_v1")));
             self.presentation_supported =
@@ -2602,6 +2842,8 @@ mod tests {
                 commands_supported: false,
                 typed_supported: true,
                 presentation_supported: false,
+                structured_supported: false,
+                active_view: None,
                 presentation: ResultPresentation::default(),
                 catalog_schemas: BTreeMap::new(),
                 query_schemas: BTreeMap::new(),

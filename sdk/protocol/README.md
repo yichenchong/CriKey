@@ -102,8 +102,8 @@ Protocol version 1 adds independent optional `typed_arguments_v1` and
 `result_presentation_v1` capabilities. Envelope tags 47/48 were checked against
 the complete existing 10–46 assignment set before allocation. Catalog/result
 field 5 carries bounded presentation sidecars; suggest field 6 carries an
-optional selected scope ID. No standard routes or navigation outcomes are
-introduced.
+optional selected scope ID. Standard routes negotiate separately as described
+below.
 
 Sidecars declare sections/scopes, per-item memberships and one schema per exact
 item/optional-action executable. Endpoint ownership is host-supplied. Absence
@@ -134,8 +134,8 @@ bounded catalog discovery; dynamic suggestion authority is never regenerated.
 The SDK independently checks its current binding. Mismatches are fixed
 refusals, not fallback to legacy execution.
 
-Responses are Completed, unique current-field failures with fixed codes, or a
-fixed failure code. They carry no callback error message or navigation outcome.
+Submission responses are Completed, unique current-field failures with fixed
+codes, or a fixed failure code. They carry no callback error message.
 Legacy SDK dispatch refuses schema-only targets even when an older host cannot
 consume their metadata. Existing catalog/suggestion callbacks remain compatible
 through optional metadata callbacks.
@@ -152,3 +152,68 @@ callbacks. Diagnostic-aware decoding validates/budgets discarded text without
 copying it. Fixed lifecycle/error codes still reach the host. This is not a
 sandbox against deliberate plugin I/O, nor a cryptographic memory-erasure
 guarantee. Live values are move-only and are not query history or snapshots.
+
+## Standard views
+
+`structured_view_v1` negotiates independently from typed arguments, result
+presentation and custom pages, with protocol version 1 unchanged. Verified-free
+envelope tags 49/50 carry `StructuredViewRequest`/`StructuredViewResponse`.
+One synchronous `Plugin::structured_view` callback handles Open and Refresh;
+the unsupported default is a real refusal, not an empty descriptor. Existing
+worker queues, credits, cancellation, deadlines and supervision carry these
+calls. Only a successful status-1 descriptor response consumes one ordinary
+producer credit. Descriptor-free terminal statuses 2–5 are bounded control
+replies, exempt from credit admission and replenishment even when paused or at
+zero credits. The host still requires the exact awaited request/route/session;
+the refusal route is at most 256 UTF-8 bytes and its encoded envelope and
+decoded control allocation are each at most 1024 bytes. Unknown fields count
+toward those bounds. SDK refusals contain no unknown fields or callback text.
+Descriptor conversion or complete outgoing-envelope budget failure returns a
+descriptor-free status-4 refusal without publishing a new registry. Failed
+Refresh retains the previous table; Open retires the old table before callback
+execution. Cancellation/deadline during a successful reply's credit wait
+returns descriptor-free status 3/5 without consuming a credit.
+
+Requests carry route ID, fresh host logical-view/surface session, Open/Refresh,
+previous revision for Refresh, current nonsecret host state, query, scroll
+anchor and refresh reason. A successful response echoes route/session and its
+envelope request ID becomes the descriptor revision. Transport connection IDs
+are correlation, not proof of physical source. The endpoint binds actual
+producer incarnation and owner; neither owner nor a host-trust flag is decoded.
+Back/resume directly Opens the owner route under fresh session admission and
+never replays the action that originally opened it.
+
+The complete descriptor includes route-local item/action/policy/menu/schema
+definitions and a List, Grid, Detail or Form. Form names one executable in that
+same table; it never duplicates a schema. Detail reuses bounded safe preview
+content. Grid membership wraps the unchanged root membership plus an image-only
+`PreviewResponse`: validated RGBA8 or encoded PNG, never both, under existing
+preview image quotas. No URI fetch pipeline is introduced.
+
+Existing execute request field 4 and typed-execute request field 5 optionally
+carry the exact route/session/revision context. With it, both host and SDK use
+only that descriptor's frozen item and schema, never colliding root or another
+route's definitions. `execute_view` and `execute_view_typed` default to explicit
+unsupported and never forward to root callbacks. Refresh replaces the complete
+presentation and definition table atomically. Retirement revokes authority
+without releasing a busy callback's physical slot; lost producers are never
+reacquired to execute an old route.
+
+Ordinary outcome code 5 and execute-result field 4 carry Push/Replace.
+Typed-response field 4 carries the same navigation, exclusive with submission
+status, failures and failure code. Root and route typed callbacks both return
+Core `TypedExecutionOutcome::{Submission, Navigate}`. Navigation requires the
+negotiated view capability; unsupported peers get a refusal, never Completed.
+All typed values preserve the process-wide diagnostic latch described above.
+
+Before allocating, Native decoding applies the shared 8-MiB frame/allocation
+ceilings and bounds 4096 definitions/items, 128 sections/scopes, 256 action-menu
+entries per target and menu depth four, with existing schema/preview quotas.
+Before expanding any collection PNG, dimension-only preflight bounds cumulative
+compressed input, decoded rasters and decoder/normalization intermediates.
+Producer preflight charges every wire occurrence before cloning shared images
+or schemas; Core `Arc` sharing never discounts serialized copies. Local sizing
+refusals produce bounded descriptor-free Failed replies, not worker exit.
+These are per-message/conversion ceilings, not a second navigation allowance:
+retained standard views share the host's existing mixed-content 16-entry/8-MiB
+budget.

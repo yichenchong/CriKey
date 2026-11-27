@@ -58,6 +58,8 @@ message Envelope {
     CommandsResponse commands_response = 46;
     TypedExecuteRequest typed_execute_request = 47;
     TypedExecuteResponse typed_execute_response = 48;
+    StructuredViewRequest structured_view_request = 49;
+    StructuredViewResponse structured_view_response = 50;
   }
 }
 
@@ -247,6 +249,7 @@ message ExecuteRequest {
   string item_id = 1;
   string action_id = 2;
   string argument = 3;
+  ViewExecutionContext view = 4;
 }
 
 // Independently negotiated typed_arguments_v1 and result_presentation_v1.
@@ -293,6 +296,7 @@ message TypedExecuteRequest {
   optional string action_id = 2;
   bytes expected_fingerprint = 3; // Exactly 32 bytes, canonical Core v1 SHA-256.
   repeated TypedValue values = 4;
+  ViewExecutionContext view = 5;
 }
 message TypedFieldFailure {
   string field_id = 1;
@@ -304,6 +308,7 @@ message TypedExecuteResponse {
   // Unavailable1, Denied2, Cancelled3, Timeout4, Unsupported5, Failed6,
   // SchemaMismatch7, ResourceLimit8, ProtocolViolation9. No plugin text.
   uint32 failure_code = 3;
+  RouteNavigation navigation = 4; // Exclusive with submission status/fields.
 }
 
 message ExecuteResult {
@@ -315,12 +320,99 @@ message ExecuteResult {
     // The action opened a page instead of finishing. `page_id` names it and
     // the host begins asking the plugin to draw (spec 32.2).
     SHOW_PAGE = 4;
+    NAVIGATE = 5;
   }
   Outcome outcome = 1;
   Error error = 2;
   // Set only with SHOW_PAGE. Identifies the page in every later
   // PageRequest, so one plugin may own several distinct pages.
   string page_id = 3;
+  RouteNavigation navigation = 4; // Only when outcome = 5.
+}
+
+// Independently negotiated structured_view_v1. No owner or trust claim is
+// accepted from the producer. The successful Envelope.request_id is revision.
+message ViewExecutionContext {
+  string route_id = 1;
+  uint64 logical_view = 2;
+  uint64 surface = 3;
+  uint64 revision = 4;
+}
+message RouteNavigation {
+  uint32 kind = 1; // Push1, Replace2.
+  string route_id = 2;
+}
+message ViewExecutable {
+  string item_id = 1;
+  optional string action_id = 2;
+}
+message ViewState {
+  optional string selected_item_id = 1;
+  optional string scope_id = 2;
+  ViewExecutable input = 3;
+}
+message StructuredViewRequest {
+  string route_id = 1;
+  uint64 logical_view = 2;
+  uint64 surface = 3;
+  uint32 mode = 4; // Open1, Refresh2.
+  optional uint64 previous_revision = 5;
+  ViewState state = 6;
+  string query = 7;
+  optional string anchor_item_id = 8;
+  uint32 anchor_row_offset = 9;
+  uint32 reason = 10; // Explicit1, Query2, Selection3, Scope4.
+}
+message ViewMenuEntry {
+  uint32 kind = 1; // Action1, Submenu2.
+  optional string action_id = 2; // Actionless when absent and kind=1.
+  ArgumentSchema schema = 3;
+  optional string shortcut = 4;
+  bool destructive = 5;
+  string id = 6;
+  string label = 7;
+  string description = 8;
+  optional string icon_reference = 9;
+  repeated ViewMenuEntry entries = 10;
+}
+message ViewActionSection {
+  string id = 1;
+  string label = 2;
+  repeated ViewMenuEntry entries = 3;
+}
+message ViewItemDefinition {
+  Item item = 1;
+  bool actionless = 2; // Explicit plugin-mediated execution, not a trust flag.
+  optional string primary_action_id = 3;
+  repeated ViewActionSection action_sections = 4;
+}
+message ViewItemPresentation {
+  ItemPresentation item = 1;
+  PreviewResponse image = 2; // Image-only content, bounded RGBA8 or PNG.
+}
+message ViewCollection {
+  repeated ViewItemPresentation items = 1;
+  repeated PresentationDeclaration sections = 2;
+  repeated PresentationDeclaration scopes = 3;
+  optional string initial_selection = 4;
+  optional string initial_scope = 5;
+}
+message ViewDescriptor {
+  string title = 1;
+  repeated ViewItemDefinition definitions = 2;
+  uint32 kind = 3; // List1, Grid2, Detail3, Form4.
+  ViewCollection collection = 4;
+  uint32 columns = 5;
+  PreviewResponse detail = 6; // status=content; existing preview/image bounds.
+  optional string detail_target = 7;
+  ViewExecutable form_submit = 8; // Exact definition/schema reference.
+}
+message StructuredViewResponse {
+  string route_id = 1;
+  uint64 logical_view = 2;
+  uint64 surface = 3;
+  uint32 status = 4; // Descriptor1, Unsupported2, Cancelled3, Failed4, Timeout5.
+  ViewDescriptor descriptor = 5;
 }
 
 // ---------------------------------------------------------------------------

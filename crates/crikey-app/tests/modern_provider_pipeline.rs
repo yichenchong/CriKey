@@ -1918,3 +1918,475 @@ fn a_loaded_plugin_reports_the_default_persistence() {
         "a manifest that says nothing permits persistence"
     );
 }
+
+#[test]
+fn real_modern_standard_routes_keep_frozen_namespaces_and_retire_cancelled_sources() {
+    use crikey_app::ActionEffect;
+    use crikey_core::structured_arguments::*;
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+    use std::time::Instant;
+    require_modern_interpreter();
+    let scratch = Scratch::new("standard-routes");
+    let plugins = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins,
+        "views",
+        "views_plugin",
+        "ViewsPlugin",
+        include_str!("../../../compatibility/test-plugins/modern-views/views_plugin.py"),
+    );
+    let owner = modern_plugin("views");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&owner),
+        "{:?}",
+        provider.unavailable()
+    );
+    provider
+        .request_catalog_build(&owner, 1, Generation::ZERO)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(result) = provider.take_catalog_results().into_iter().next() {
+            assert!(matches!(result, CatalogBuildResult::Complete(_)), "{result:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        sleep(Duration::from_millis(2));
+    }
+    let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+    let executor = driver.action_executor();
+    let wait = |expected: &crikey_app::ActionRequestId| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(completion) = executor.poll_plugin_actions().into_iter().next() {
+                assert_eq!(&completion.request_id, expected);
+                break completion.outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "modern foreground callback did not terminate"
+            );
+            sleep(Duration::from_millis(2));
+        }
+    };
+    let root_source = executor
+        .root_actionless_source(&owner, &ItemId("shared".into()), None)
+        .unwrap();
+    let root = executor
+        .submit_actionless(&owner, &ItemId("shared".into()), &root_source)
+        .unwrap();
+    let producer = match wait(&root).unwrap() {
+        ActionEffect::Navigate {
+            outcome: StructuredRouteOutcome::Push(route),
+            producer,
+        } => {
+            assert_eq!(route.0, "gallery");
+            producer
+        }
+        effect => panic!("root outcome was discarded: {effect:?}"),
+    };
+    let request = |route: &str, surface: u64| ViewRequest {
+        mode: ViewRequestMode::Open,
+        route: RouteId(route.into()),
+        session: ViewSessionIdentity {
+            logical_view: NonZeroU64::new(surface).unwrap(),
+            surface: NonZeroU64::new(surface).unwrap(),
+        },
+        previous_revision: None,
+        state: None,
+        query: String::new(),
+        scroll: None,
+        reason: ViewRefreshReason::Explicit,
+    };
+    let open = |request: ViewRequest| {
+        let id = executor.request_view(&owner, producer, request).unwrap();
+        match wait(&id).unwrap() {
+            ActionEffect::View(reply) => reply,
+            effect => panic!("not a descriptor: {effect:?}"),
+        }
+    };
+    let key = |action: Option<&str>| ExecutableKey {
+        target: OwnedItem {
+            owner: owner.clone(),
+            item: ItemId("shared".into()),
+        },
+        action: action.map(|action| ActionId(action.into())),
+    };
+    let host_state = |reply: &ViewReply| HostViewState {
+        selected: Some(key(None).target),
+        scope: None,
+        input: match &reply.descriptor.view {
+            StandardView::Form(form) => Some(form.submit.clone()),
+            _ => None,
+        },
+    };
+    let gallery = open(request("gallery", 1));
+    let mut refresh = request("gallery", 1);
+    refresh.mode = ViewRequestMode::Refresh;
+    refresh.previous_revision = Some(gallery.context.revision);
+    refresh.state = Some(host_state(&gallery));
+    refresh.query = "coalesce".into();
+    struct ReleaseCoalescingCallback(PathBuf);
+    impl Drop for ReleaseCoalescingCallback {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
+    }
+    let release = ReleaseCoalescingCallback(scratch.path.join("plugins/views/route-coalesce-release"));
+    let pending_refresh = executor.request_view(&owner, producer, refresh).unwrap();
+    let running = scratch.path.join("plugins/views/route-coalesce-running");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !running.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "delayed Refresh never entered the actual worker"
+        );
+        sleep(Duration::from_millis(2));
+    }
+    let mut latest_query = String::new();
+    for intent in ["coalesced-a", "coalesced-b", "coalesced-latest"] {
+        latest_query.clear();
+        latest_query.push_str(intent);
+    }
+    fs::write(&release.0, b"release").unwrap();
+    let replacement = match wait(&pending_refresh).unwrap() {
+        ActionEffect::View(reply) => reply,
+        effect => panic!("uncancelled Refresh lost its actual revision: {effect:?}"),
+    };
+    assert_eq!(replacement.context.session, gallery.context.session);
+    let previous = replacement.context.revision;
+    let mut latest = request("gallery", 1);
+    latest.mode = ViewRequestMode::Refresh;
+    latest.previous_revision = Some(previous);
+    latest.state = Some(host_state(&replacement));
+    latest.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    latest.query = latest_query;
+    latest.reason = ViewRefreshReason::Query;
+    let replacement = open(latest);
+    assert_eq!(replacement.context.session, gallery.context.session);
+    assert_ne!(replacement.context.revision, previous);
+    assert!(replacement.descriptor.title.contains("coalesced-latest"));
+    assert!(!replacement.descriptor.title.contains("coalesced-a"));
+    fs::remove_file(running).unwrap();
+    let mut removal = request("gallery", 1);
+    removal.mode = ViewRequestMode::Refresh;
+    removal.previous_revision = Some(replacement.context.revision);
+    removal.state = Some(host_state(&replacement));
+    removal.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    removal.query = "remove-selected".into();
+    removal.reason = ViewRefreshReason::Query;
+    let removed = open(removal);
+    assert_eq!(removed.context.session, replacement.context.session);
+    assert!(
+        removed.descriptor.definitions.is_empty(),
+        "filter replacement must actually remove the selected executable"
+    );
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &replacement.context,
+                &host_state(&replacement),
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "old revision cannot execute a removed target"
+    );
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &removed.context,
+                &host_state(&replacement),
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "restore intent never authorizes a target absent from the current descriptor"
+    );
+    let mut restore = request("gallery", 1);
+    restore.mode = ViewRequestMode::Refresh;
+    restore.previous_revision = Some(removed.context.revision);
+    restore.state = Some(host_state(&replacement));
+    restore.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    restore.query = "coalesced-latest".into();
+    restore.reason = ViewRefreshReason::Query;
+    let replacement = open(restore);
+    assert_ne!(replacement.context.revision, removed.context.revision);
+    assert_eq!(replacement.context.session, removed.context.session);
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &removed.context,
+                &host_state(&replacement),
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "removed-descriptor events cannot borrow the restored definitions"
+    );
+    let mut unselected = host_state(&replacement);
+    unselected.selected = None;
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &replacement.context,
+                &unselected,
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "unselected definitions must not execute"
+    );
+    let mut outside_scope = host_state(&replacement);
+    outside_scope.scope = Some(crikey_core::result_presentation::ScopeId("empty".into()));
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &replacement.context,
+                &outside_scope,
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "a declared scope cannot borrow a hidden definition"
+    );
+    assert!(!executor.view_current(&owner, &gallery.context));
+    assert!(executor.view_current(&owner, &replacement.context));
+    assert!(executor
+        .submit_view_action(
+            &owner,
+            &gallery.context,
+            &host_state(&gallery),
+            &key(Some("open")),
+            None
+        )
+        .is_err());
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &replacement.context,
+                &host_state(&replacement),
+                &key(None),
+                None
+            )
+            .is_err(),
+        "actionless root item must not override route explicit action"
+    );
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &replacement.context,
+            &host_state(&replacement),
+            &key(Some("open")),
+            None,
+        )
+        .unwrap();
+    assert!(
+        matches!(wait(&id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Push(RouteId(route)), producer: actual } if route == "detail" && actual == producer)
+    );
+    let detail = open(request("detail", 2));
+    executor
+        .validate_view_link(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            "https://example.org/",
+        )
+        .unwrap();
+    assert!(executor
+        .validate_view_link(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            "https://example.org/not-admitted"
+        )
+        .is_err());
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &detail.context,
+                &host_state(&detail),
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "other route action must not resolve after replacement"
+    );
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            &key(Some("configure")),
+            None,
+        )
+        .unwrap();
+    assert!(
+        matches!(wait(&id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Push(RouteId(route)), .. } if route == "form")
+    );
+    let form = open(request("form", 3));
+    let values = |name: &str| {
+        ArgumentValues(std::collections::BTreeMap::from([
+            (
+                FieldId("name".into()),
+                StructuredValue::NonSecret(NonSecretValue::Text(name.into())),
+            ),
+            (
+                FieldId("password".into()),
+                StructuredValue::Password(Password::new("private-route-value".into()).unwrap()),
+            ),
+            (
+                FieldId("region".into()),
+                StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId("local".into()))),
+            ),
+        ]))
+    };
+    let mut unfocused = host_state(&form);
+    unfocused.input = None;
+    assert!(
+        executor
+            .submit_view_typed(&owner, &form.context, &unfocused, &key(None), values("accepted"))
+            .is_err(),
+        "typed submission requires the current P3 input target"
+    );
+    let id = executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(None),
+            values("reject"),
+        )
+        .unwrap();
+    assert!(matches!(
+        wait(&id).unwrap(),
+        ActionEffect::Typed(SubmissionOutcome::InvalidFields(_))
+    ));
+    let id = executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(None),
+            values("accepted"),
+        )
+        .unwrap();
+    assert!(
+        matches!(wait(&id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Replace(RouteId(route)), producer: actual } if route == "done" && actual == producer)
+    );
+    executor.retire_view(&owner, form.context.session);
+    assert!(executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(None),
+            values("accepted")
+        )
+        .is_err());
+    // Back opens directly, even though this route has never been produced by a root action.
+    let list = open(request("list", 4));
+    let id = executor
+        .submit_view_action(&owner, &list.context, &host_state(&list), &key(None), None)
+        .unwrap();
+    assert!(
+        matches!(wait(&id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Replace(RouteId(route)), .. } if route == "detail")
+    );
+    executor.retire_view(&owner, list.context.session);
+    let required = open(request("required", 40));
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &required.context,
+                &host_state(&required),
+                &key(None),
+                None
+            )
+            .is_err(),
+        "required actionless arguments cannot be omitted"
+    );
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &required.context,
+                &host_state(&required),
+                &key(None),
+                Some("")
+            )
+            .is_err(),
+        "required actionless arguments cannot be empty"
+    );
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &required.context,
+            &host_state(&required),
+            &key(None),
+            Some("provided"),
+        )
+        .unwrap();
+    assert!(
+        matches!(wait(&id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Replace(RouteId(route)), producer: actual } if route == "list" && actual == producer)
+    );
+    executor.retire_view(&owner, required.context.session);
+    let mut delayed = request("gallery", 5);
+    delayed.query = "delay".into();
+    let id = executor.request_view(&owner, producer, delayed).unwrap();
+    let running = scratch.path.join("plugins/views/route-running");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !running.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the real structured callback never entered"
+        );
+        sleep(Duration::from_millis(2));
+    }
+    assert!(executor.cancel_plugin_action(&id));
+    assert!(wait(&id).is_err());
+    let root_source = executor
+        .root_actionless_source(&owner, &ItemId("shared".into()), None)
+        .unwrap();
+    let root = executor
+        .submit_actionless(&owner, &ItemId("shared".into()), &root_source)
+        .unwrap();
+    assert!(
+        matches!(wait(&root).unwrap(), ActionEffect::Navigate { producer: actual, .. } if actual == producer)
+    );
+    let mut death = request("gallery", 6);
+    death.query = "source-death".into();
+    let id = executor.request_view(&owner, producer, death).unwrap();
+    assert!(wait(&id).is_err());
+    assert!(
+        executor
+            .request_view(&owner, producer, request("gallery", 7))
+            .is_err(),
+        "owner death must not reacquire a worker for an existing route"
+    );
+}

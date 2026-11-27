@@ -1,0 +1,14 @@
+manifest-version = 1
+
+[plugin]
+id = "views-fixture"
+name = "Modern Standard Views Fixture"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "views_plugin:ViewsPlugin"
+
+[python]
+requires-python = ">=3.12"
+
+[performance]
+suggest-hard-timeout-ms = 10000

@@ -20,6 +20,7 @@ use std::os::windows::process::CommandExt;
 use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::structured_arguments::{ArgumentValues, SubmissionFailureCode, SubmissionOutcome};
 use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+use crikey_core::structured_view::{TypedExecutionOutcome, ViewExecutionContext, ViewReply};
 use crikey_core::{ActionId, Item, ItemId, PageFrame, PluginId};
 
 use crikey_native_protocol::convert::{from_proto_item, from_proto_page_frame, to_proto_page_input};
@@ -45,6 +46,7 @@ const CHILD_REAP_TIMEOUT_MS: u64 = 2_000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ENDPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static INCARNATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Discovery either refuses safely or yields a move-only incarnation-bound token.
 #[derive(Debug)]
@@ -56,9 +58,10 @@ pub enum TypedPreparation {
 /// Opaque confirmation; consuming it never performs discovery or reacquisition.
 #[derive(Debug)]
 pub struct ConfirmedTypedExecution {
-    connection_id: u64,
+    incarnation: u64,
     executable: ExecutableKey,
     fingerprint: [u8; 32],
+    view: Option<ViewExecutionContext>,
 }
 
 /// How a native child process ended (spec 24.1).
@@ -134,6 +137,7 @@ pub struct PluginHandshake {
     pub commands: bool,
     pub typed_arguments: bool,
     pub result_presentation: bool,
+    pub structured_view: bool,
 }
 
 /// Bytes a plugin served in answer to one [`NativeWorker::request_resource`].
@@ -208,6 +212,7 @@ struct ReaderContext {
     mismatch: Arc<Mutex<Option<EchoMismatch>>>,
     privacy: Arc<Mutex<StderrTail>>,
     sensitive: Arc<AtomicBool>,
+    view_request: Arc<AtomicU64>,
     /// Request id of the page frame the host is currently waiting for, or
     /// zero when it is waiting for none. A page frame is a reply and nothing
     /// else; without this the reader could not tell the answer the host asked
@@ -253,6 +258,7 @@ struct WorkerLink {
     sensitive: Arc<AtomicBool>,
     /// Shared with the reader; see [`ReaderContext::page_request`].
     page_request: Arc<AtomicU64>,
+    view_request: Arc<AtomicU64>,
     reader: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -466,6 +472,7 @@ impl CancelHandle {
 #[derive(Debug)]
 pub struct NativeWorker {
     spec: LaunchSpec,
+    incarnation: u64,
     options: WorkerOptions,
     handshake: PluginHandshake,
     link: Arc<WorkerLink>,
@@ -484,11 +491,17 @@ pub struct NativeWorker {
     failure_kind: Option<crikey_plugin_supervisor::FailureKind>,
     catalog_presentation: Option<ResultPresentation>,
     suggestion_presentation: Option<ResultPresentation>,
+    view: Option<ViewReply>,
     #[cfg(windows)]
     job: Option<OwnedJob>,
 }
 
 impl NativeWorker {
+    /// Host-created physical process identity; never taken from plugin bytes.
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
     /// Returns bounded observations of envelopes actually sent or received.
     pub fn observations(&self) -> Vec<ProtocolObservation> {
         self.link.observations()
@@ -538,6 +551,9 @@ impl NativeWorker {
                 detail: "initial_credits must be greater than zero".to_owned(),
             });
         }
+        let incarnation = INCARNATION_COUNTER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| HostError::Spawn("native incarnation space exhausted".into()))?;
         let token = session_token().map_err(HostError::Spawn)?;
         let connection_id = next_connection_id();
         let (endpoint, listener) = make_endpoint(options.transport, &token)?;
@@ -626,6 +642,7 @@ impl NativeWorker {
         let observations = Arc::new(Mutex::new(VecDeque::with_capacity(OBSERVATION_CAPACITY)));
         let mismatch = Arc::new(Mutex::new(None));
         let page_request = Arc::new(AtomicU64::new(0));
+        let view_request = Arc::new(AtomicU64::new(0));
         let writer_pending = Arc::new(AtomicUsize::new(0));
         let (transport, writer, outgoing, writer_thread) = match options.transport {
             TransportKind::Stdio => {
@@ -701,6 +718,7 @@ impl NativeWorker {
             observations: Arc::clone(&observations),
             mismatch: Arc::clone(&mismatch),
             page_request: Arc::clone(&page_request),
+            view_request: Arc::clone(&view_request),
             privacy: Arc::clone(&stderr_tail),
             sensitive: Arc::clone(&sensitive),
         };
@@ -733,6 +751,7 @@ impl NativeWorker {
             observations,
             mismatch,
             page_request,
+            view_request,
             reader: Mutex::new(Some(reader)),
             writer_thread: Mutex::new(writer_thread),
             privacy: Arc::clone(&stderr_tail),
@@ -766,6 +785,7 @@ impl NativeWorker {
             .store(i64::from(options.limits.initial_credits), Ordering::Release);
         Ok(Self {
             spec,
+            incarnation,
             options,
             handshake,
             link,
@@ -781,6 +801,7 @@ impl NativeWorker {
             catalog_initialized: false,
             catalog_presentation: None,
             suggestion_presentation: None,
+            view: None,
             failure_kind: None,
             #[cfg(windows)]
             job: Some(job),
@@ -1341,10 +1362,10 @@ impl NativeWorker {
         action: Option<&ActionId>,
         expected_fingerprint: [u8; 32],
         values: ArgumentValues,
-    ) -> Result<SubmissionOutcome, HostError> {
+    ) -> Result<TypedExecutionOutcome, HostError> {
         match self.prepare_typed_execution(item, action, expected_fingerprint)? {
             TypedPreparation::Ready(confirmed) => self.execute_typed_confirmed(confirmed, values),
-            TypedPreparation::Refused(code) => Ok(SubmissionOutcome::Failed(code)),
+            TypedPreparation::Refused(code) => Ok(SubmissionOutcome::Failed(code).into()),
         }
     }
 
@@ -1384,9 +1405,10 @@ impl NativeWorker {
             return Ok(TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch));
         }
         Ok(TypedPreparation::Ready(ConfirmedTypedExecution {
-            connection_id: self.link.connection_id,
+            incarnation: self.incarnation,
             executable,
             fingerprint: expected_fingerprint,
+            view: None,
         }))
     }
 
@@ -1395,39 +1417,66 @@ impl NativeWorker {
         &mut self,
         confirmed: ConfirmedTypedExecution,
         values: ArgumentValues,
-    ) -> Result<SubmissionOutcome, HostError> {
+    ) -> Result<TypedExecutionOutcome, HostError> {
+        self.execute_typed_confirmed_with_admission(confirmed, values, |send| send())
+    }
+
+    pub fn execute_typed_confirmed_with_admission<F>(
+        &mut self,
+        confirmed: ConfirmedTypedExecution,
+        values: ArgumentValues,
+        admission: F,
+    ) -> Result<TypedExecutionOutcome, HostError>
+    where
+        F: FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    {
         self.ensure_alive()?;
-        if confirmed.connection_id != self.link.connection_id {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
+        if confirmed.incarnation != self.incarnation {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch).into());
         }
-        let schema = [&self.suggestion_presentation, &self.catalog_presentation]
-            .into_iter()
-            .filter_map(|presentation| presentation.as_ref()?.schema_for(&confirmed.executable))
-            .find(|schema| schema.fingerprint().ok() == Some(confirmed.fingerprint))
-            .cloned();
+        let schema = if let Some(view) = &confirmed.view {
+            self.view_schema(view, &confirmed.executable)
+                .filter(|schema| schema.fingerprint().ok() == Some(confirmed.fingerprint))
+        } else {
+            [&self.suggestion_presentation, &self.catalog_presentation]
+                .into_iter()
+                .filter_map(|presentation| presentation.as_ref()?.schema_for(&confirmed.executable))
+                .find(|schema| schema.fingerprint().ok() == Some(confirmed.fingerprint))
+                .cloned()
+        };
         let Some(schema) = schema else {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch).into());
         };
         if schema.validate_values(&values).is_err() {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Denied));
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Denied).into());
         }
         self.mark_sensitive()?;
-        let request = crikey_native_protocol::typed::to_request(
+        let mut request = crikey_native_protocol::typed::to_request(
             &confirmed.executable.target.item,
             confirmed.executable.action.as_ref(),
             confirmed.fingerprint,
             values,
         )
         .map_err(|_| HostError::Protocol("invalid typed execute request".into()))?;
+        request.view = confirmed
+            .view
+            .as_ref()
+            .map(crikey_native_protocol::structured_view::to_context);
         let request_id = self.begin_request(0);
-        self.send_control(Envelope {
-            connection_id: self.link.connection_id,
-            request_id,
-            generation: 0,
-            deadline_ms: self.options.call_timeout_ms,
-            payload: Some(Payload::TypedExecuteRequest(request)),
-            unknown: Default::default(),
-        })?;
+        let admitted = self.send_admitted(
+            Envelope {
+                connection_id: self.link.connection_id,
+                request_id,
+                generation: 0,
+                deadline_ms: self.options.call_timeout_ms,
+                payload: Some(Payload::TypedExecuteRequest(request)),
+                unknown: Default::default(),
+            },
+            admission,
+        )?;
+        if !admitted {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into());
+        }
         let end = deadline(self.options.call_timeout_ms);
         loop {
             let envelope = match self.next_event(end, request_id, 0)? {
@@ -1438,6 +1487,11 @@ impl NativeWorker {
                 Some(Payload::TypedExecuteResponse(response)) => {
                     let outcome = crikey_native_protocol::typed::from_response(response, &schema)
                         .map_err(|_| self.protocol_failure("invalid typed execute response"))?;
+                    if matches!(outcome, TypedExecutionOutcome::Navigate(_))
+                        && !self.handshake.structured_view
+                    {
+                        return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported).into());
+                    }
                     self.mark_call_succeeded();
                     return Ok(outcome);
                 }
@@ -1455,6 +1509,33 @@ impl NativeWorker {
         action: Option<&ActionId>,
         argument: Option<&str>,
     ) -> Result<ExecuteOutcome, HostError> {
+        self.execute_inner(None, item, action, argument, |send| send())
+    }
+
+    pub fn execute_with_admission<F>(
+        &mut self,
+        item: &ItemId,
+        action: Option<&ActionId>,
+        argument: Option<&str>,
+        admission: F,
+    ) -> Result<ExecuteOutcome, HostError>
+    where
+        F: FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    {
+        self.execute_inner(None, item, action, argument, admission)
+    }
+
+    fn execute_inner<F>(
+        &mut self,
+        view: Option<&ViewExecutionContext>,
+        item: &ItemId,
+        action: Option<&ActionId>,
+        argument: Option<&str>,
+        admission: F,
+    ) -> Result<ExecuteOutcome, HostError>
+    where
+        F: FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    {
         self.ensure_alive()?;
         let request_id = self.begin_request(0);
         let envelope = Envelope {
@@ -1466,11 +1547,14 @@ impl NativeWorker {
                 item_id: item.0.clone(),
                 action_id: action.map(|value| value.0.clone()).unwrap_or_default(),
                 argument: argument.unwrap_or_default().to_owned(),
+                view: view.map(crikey_native_protocol::structured_view::to_context),
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
         };
-        self.send_control(envelope)?;
+        if !self.send_admitted(envelope, admission)? {
+            return Ok(ExecuteOutcome::Unsupported);
+        }
         let event = self.next_event(deadline(self.options.call_timeout_ms), request_id, 0)?;
         let envelope = match event {
             ReaderEvent::Envelope(value) => value,
@@ -1485,6 +1569,9 @@ impl NativeWorker {
                 }
                 match execute_outcome(&result) {
                     Ok(outcome) => {
+                        if matches!(outcome, ExecuteOutcome::Navigate(_)) && !self.handshake.structured_view {
+                            return Ok(ExecuteOutcome::Unsupported);
+                        }
                         self.mark_call_succeeded();
                         Ok(outcome)
                     }
@@ -2836,6 +2923,13 @@ fn validate_inbound(envelope: &Envelope, context: &ReaderContext) -> bool {
         );
         return false;
     }
+    if matches!(envelope.payload, Some(Payload::StructuredViewResponse(_))) {
+        return envelope.request_id != 0
+            && context
+                .view_request
+                .compare_exchange(envelope.request_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+    }
     legal_plugin_payload(envelope, context.page_request.load(Ordering::Acquire))
 }
 
@@ -2868,9 +2962,14 @@ fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
 }
 
 fn accept_credit(envelope: &Envelope, credits: &AtomicI64) -> bool {
+    if let Some(Payload::StructuredViewResponse(response)) = &envelope.payload {
+        if response.status != 1 {
+            return crikey_native_protocol::structured_view::bounded_refusal(envelope);
+        }
+    }
     if !matches!(
         envelope.payload,
-        Some(Payload::Results(_)) | Some(Payload::CatalogBatch(_))
+        Some(Payload::Results(_)) | Some(Payload::CatalogBatch(_)) | Some(Payload::StructuredViewResponse(_))
     ) {
         return true;
     }
@@ -2950,6 +3049,7 @@ fn receive_handshake(
             crikey_core::command::COMMANDS_CAPABILITY.to_owned(),
             crikey_core::structured_arguments::TYPED_ARGUMENTS_CAPABILITY.to_owned(),
             crikey_core::result_presentation::RESULT_PRESENTATION_CAPABILITY.to_owned(),
+            crikey_core::structured_view::STRUCTURED_VIEW_CAPABILITY.to_owned(),
         ],
         host_version: env!("CARGO_PKG_VERSION").to_owned(),
         accepted: rejection.is_none(),
@@ -2978,6 +3078,10 @@ fn receive_handshake(
         sdk_version: handshake.sdk_version,
         protocol_version: handshake.protocol_version,
         capabilities: capabilities_from_strings(&handshake.capabilities),
+        structured_view: handshake
+            .capabilities
+            .iter()
+            .any(|s| s == crikey_core::structured_view::STRUCTURED_VIEW_CAPABILITY),
         typed_arguments: handshake
             .capabilities
             .iter()
@@ -3233,6 +3337,9 @@ fn plugin_error(error: &message::StructuredError) -> PluginError {
 /// never be drawn and never be closed by its owner. It is refused here rather
 /// than allowed to become a permanently blank page.
 fn execute_outcome(result: &message::ExecuteResult) -> Result<ExecuteOutcome, &'static str> {
+    if result.navigation.is_some() && result.outcome.as_i32() != 5 {
+        return Err("unexpected route navigation");
+    }
     match result.outcome.as_i32() {
         1 => Ok(ExecuteOutcome::Ok),
         2 => Ok(ExecuteOutcome::Failed(
@@ -3250,6 +3357,15 @@ fn execute_outcome(result: &message::ExecuteResult) -> Result<ExecuteOutcome, &'
         4 => Ok(ExecuteOutcome::ShowPage {
             page_id: result.page_id.clone(),
         }),
+        5 if result.page_id.is_empty() && result.error.is_none() => result
+            .navigation
+            .clone()
+            .ok_or("missing route navigation")
+            .and_then(|n| {
+                crikey_native_protocol::structured_view::from_navigation(n)
+                    .map(ExecuteOutcome::Navigate)
+                    .map_err(|_| "invalid route navigation")
+            }),
         _ => Err("unknown execute outcome"),
     }
 }
@@ -3801,6 +3917,7 @@ mod page_protocol {
             outcome,
             error: None,
             page_id: page_id.to_owned(),
+            navigation: None,
             unknown: Default::default(),
         }
     }
@@ -4033,4 +4150,59 @@ fn presentation_growth<T>(current: &Vec<T>, incoming: usize) -> usize {
 fn reserve_presentation<T>(current: &mut Vec<T>, incoming: usize) {
     let additional = presentation_capacity(current, incoming).saturating_sub(current.len());
     current.reserve_exact(additional);
+}
+
+include!("worker_view.rs");
+
+#[cfg(test)]
+mod view_credit_control {
+    use super::{accept_credit, AtomicI64, Ordering};
+    use crikey_native_protocol::{message as m, Message};
+
+    fn reply(status: u32) -> m::Envelope {
+        m::Envelope {
+            connection_id: 1,
+            request_id: 1,
+            payload: Some(m::Payload::StructuredViewResponse(m::StructuredViewResponse {
+                route_id: "grid".into(),
+                logical_view: 1,
+                surface: 1,
+                status,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn only_bounded_descriptor_free_refusals_are_credit_exempt() {
+        let credits = AtomicI64::new(0);
+        for status in 2..=5 {
+            let envelope = m::Envelope::decode(&reply(status).encode()).unwrap();
+            assert!(accept_credit(&envelope, &credits));
+            assert_eq!(credits.load(Ordering::Acquire), 0);
+        }
+        assert!(!accept_credit(&reply(1), &credits));
+        assert!(!accept_credit(&reply(0), &credits));
+        let mut content = reply(4);
+        let Some(m::Payload::StructuredViewResponse(response)) = &mut content.payload else {
+            unreachable!()
+        };
+        response.descriptor = Some(Box::default());
+        assert!(!accept_credit(&content, &credits));
+        let mut oversized = reply(4).encode();
+        crikey_native_protocol::wire::encode_key(
+            200,
+            crikey_native_protocol::wire::WireType::Length,
+            &mut oversized,
+        );
+        crikey_native_protocol::wire::encode_varint(1024, &mut oversized);
+        oversized.resize(oversized.len() + 1024, 0);
+        assert!(!accept_credit(
+            &m::Envelope::decode(&oversized).unwrap(),
+            &credits
+        ));
+        credits.store(1, Ordering::Release);
+        assert!(accept_credit(&reply(1), &credits));
+        assert_eq!(credits.load(Ordering::Acquire), 0);
+    }
 }

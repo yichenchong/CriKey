@@ -117,6 +117,20 @@ impl NativeSupervisor {
         worker.poll_alive().then(|| worker.connection_id())
     }
 
+    /// Observes the actual process without starting or replacing a worker.
+    pub fn poll_live_incarnation(&mut self, plugin: &PluginId) -> Option<u64> {
+        if self.closed
+            || self
+                .memory
+                .snapshot(plugin)
+                .is_some_and(|s| s.state == WorkerState::Suspended)
+        {
+            return None;
+        }
+        let worker = self.registrations.get_mut(plugin)?.worker.as_mut()?;
+        worker.poll_alive().then(|| worker.incarnation())
+    }
+
     /// Borrows an already running worker without starting or replacing it.
     /// Selection-bound requests must use this path: a fresh process does not
     /// own the item state produced by the original catalog/suggestion call.

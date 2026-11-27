@@ -25,6 +25,7 @@ mod plugin_preview;
 mod preview_action_budget;
 mod query_history_store;
 mod query_pipeline;
+pub(crate) mod standard_view;
 pub use query_history_store::{
     MonotonicQueryHistoryClock, QueryHistoryClock, QueryHistoryMode, QueryHistoryStore,
 };
@@ -938,6 +939,90 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    pub fn request_view(
+        &self,
+        owner: &PluginId,
+        producer: u64,
+        request: crikey_core::structured_view::ViewRequest,
+    ) -> CoreResult<ActionRequestId> {
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("Plugin actions unavailable".into()))?
+            .request_view(owner, producer, request)
+    }
+    pub fn submit_view_action(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &crikey_core::structured_arguments::ExecutableKey,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionRequestId> {
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("Plugin actions unavailable".into()))?
+            .submit_view_action(owner, context, state, executable, argument)
+    }
+    pub fn submit_view_typed(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &crikey_core::structured_arguments::ExecutableKey,
+        values: crikey_core::structured_arguments::ArgumentValues,
+    ) -> CoreResult<ActionRequestId> {
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("Plugin actions unavailable".into()))?
+            .submit_view_typed(owner, context, state, executable, values)
+    }
+    pub fn retire_view(&self, owner: &PluginId, session: crikey_core::structured_view::ViewSessionIdentity) {
+        if let Some(router) = &self.plugin_actions {
+            router.retire_view(owner, session);
+        }
+    }
+    pub fn view_current(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+    ) -> bool {
+        self.plugin_actions
+            .as_ref()
+            .is_some_and(|router| router.view_current(owner, context))
+    }
+    /// Retires an unavailable presentation, allowing only the exact published
+    /// refresh still awaiting its tracked completion to retain the old frame.
+    /// Execution and links continue to require `view_current`.
+    pub fn retire_unavailable_view(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        if self
+            .plugin_actions
+            .as_ref()
+            .is_some_and(|router| router.view_presentation_available(owner, context, producer, pending))
+        {
+            return false;
+        }
+        self.retire_view(owner, context.session);
+        true
+    }
+    pub fn open_view_url(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        url: &str,
+    ) -> CoreResult<()> {
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("Plugin actions unavailable".into()))?
+            .validate_view_link(owner, context, state, url)?;
+        self.open_preview_url(owner, url)
+    }
     /// Wraps an [`App`], sharing its result limits with the aggregator.
     pub fn new(app: App) -> Self {
         let aggregator = MemoryResultAggregator::new(*app.limits());

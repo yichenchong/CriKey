@@ -388,6 +388,9 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         | UiEffect::ClearQueryHistory
         | UiEffect::InputBatch { .. }
         | UiEffect::Execute { .. }
+        | UiEffect::ExecuteStandard { .. }
+        | UiEffect::RefreshStandard(_)
+        | UiEffect::OpenStandardLink { .. }
         | UiEffect::InvokeCommand { .. }
         | UiEffect::MutateCommandPreferences { .. }
         | UiEffect::ResetCommandRanking { .. }

@@ -828,7 +828,7 @@ fn execute_is_ok_for_a_normal_action_and_a_plugin_raise_leaves_the_worker_usable
     let item = core_item("modern.execute", "s-00");
 
     let ok = worker
-        .execute(&item, Some("open"), None)
+        .execute(&item, Some("open"), None, None)
         .expect("execute reaches the plugin");
     assert!(
         matches!(ok, ExecuteOutcome::Ok),
@@ -836,7 +836,7 @@ fn execute_is_ok_for_a_normal_action_and_a_plugin_raise_leaves_the_worker_usable
     );
 
     let failed = worker
-        .execute(&item, Some("raise"), None)
+        .execute(&item, Some("raise"), None, None)
         .expect("a plugin that raises in execute is still the Ok path for the host");
     match failed {
         ExecuteOutcome::Failed(PluginError { message, traceback }) => {
