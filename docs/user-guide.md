@@ -167,6 +167,11 @@ text, not action indexes.
 Escape/Back first clears action search, then leaves a submenu, then closes
 Actions; the launcher query is unchanged. Settings editors, custom pages and
 IME composition retain their own keyboard input.
+Text edits, action navigation and Back are applied in their input order, even
+when delivered together. A retained input suffix follows an intentional host
+view/focus transition, but is retired on focus loss, dismissal or a stale source.
+A query exceeding the UTF-8 byte limit refuses its whole submission, including
+a simultaneous Enter; it never runs the prior selected action instead.
 
 ### Declared commands and home
 
@@ -314,8 +319,9 @@ surface opens. Back opens its saved owner/page route with fresh request and
 surface identities; it does not execute the original action again. Arbitrary
 web-document state, display lists and engine pixels are not snapshots. A missing
 owner yields **Page unavailable** with a working Back rather than an endless
-loading surface. Logical resume applies to Settings and custom pages; arbitrary
-web-document state is not restored.
+loading surface. Root query completion stays inactive on that unavailable route.
+Logical resume applies to Settings and custom pages; arbitrary web-document
+state is not restored.
 
 `launcher.resume-delay-ms` defaults to `0`: dismissal immediately resets to root.
 A positive millisecond value resumes the logical view only if reopened strictly

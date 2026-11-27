@@ -863,6 +863,9 @@ The waiting action uses the original item's worker, never a replacement process.
 Rows carry their exact `PluginId` separately from display names; preview
 selection and dispatch use `(PluginId, ItemId)`. Equal item IDs in different
 plugins must neither redirect callbacks nor suppress another owner's preview.
+Unmarked rows use host-known description/provider/category detail. Republishing
+those fields for the selected row updates its detail without changing selection
+or preview focus; clearing all fields replaces old detail with an empty state.
 
 Content is bounded to 256 KiB aggregate text, 4,096 prepared nodes/events,
 128 labeled values (8 KiB each), and image edges of 1,024 with at most 1 MiB
