@@ -617,8 +617,9 @@ impl ActionInputCheckpoint {
                 .as_ref()
                 .map(|(owner, producer, context)| (owner, *producer, context))
                 == standard.map(|surface| (&surface.owner, surface.producer, &surface.context))
+            // Pending refresh may still coalesce exact-owner navigation/query intent.
+            // Execution and typed submission keep their separate pending-state gates.
             && self.standard_refresh_pending == standard_refresh_pending
-            && !standard_refresh_pending
             && self.primary.as_ref()
                 == row
                     .and_then(|row| row.default_action.as_ref())
