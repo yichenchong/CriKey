@@ -52,6 +52,7 @@ pub struct PreviewService {
     pending: Option<(crikey_ui::PreviewSelection, usize, crikey_core::Item, u64)>,
     active: Option<(PreviewIdentity, usize)>,
     presented: Option<(PreviewIdentity, usize, Arc<crikey_ui::PreparedPreview>)>,
+    metadata: Option<Arc<PreviewContent>>,
     terminal: Arc<std::sync::Mutex<Option<PreviewUpdate>>>,
     publish: PreviewPublish,
     sequence: u64,
@@ -88,6 +89,7 @@ impl PreviewService {
             pending: None,
             active: None,
             presented: None,
+            metadata: None,
             terminal,
             publish,
             sequence: 0,
@@ -114,6 +116,7 @@ impl PreviewService {
             self.selected = selection.clone();
             self.binding = None;
             self.presented = None;
+            self.metadata = None;
             self.pending = None;
             if let Some((identity, endpoint)) = &self.active {
                 self.endpoints[*endpoint].cancel(identity);
@@ -158,6 +161,14 @@ impl PreviewService {
                         self.publish_metadata(model, &selection, item);
                     }
                 }
+            }
+        }
+        // Row text can change without changing the selected owner/item.
+        // Keep host-known detail current without restarting deferred callbacks.
+        if self.metadata.is_some() {
+            if let Some(selection) = self.selected.take() {
+                self.publish_metadata(model, &selection, None);
+                self.selected = Some(selection);
             }
         }
         // Retirement is a lifecycle event, not necessarily a terminal reply.
@@ -320,7 +331,7 @@ impl PreviewService {
     }
 
     fn publish_metadata(
-        &self,
+        &mut self,
         model: &mut crikey_ui::LauncherViewModel,
         selection: &crikey_ui::PreviewSelection,
         _item: Option<&crikey_core::Item>,
@@ -329,6 +340,28 @@ impl PreviewService {
         let Some(row) = model.selected_preview_row() else {
             return;
         };
+        if self.metadata.as_ref().is_some_and(|content| {
+            let text = match &content.text {
+                Some(crikey_core::PreviewText::Plain(text)) => text.as_str(),
+                _ => "",
+            };
+            let mut values = content.values.iter();
+            bounded_metadata_matches(&row.description, text)
+                && [
+                    ("Provider", row.plugin_name.as_str()),
+                    ("Category", row.category.as_str()),
+                ]
+                .into_iter()
+                .filter(|(_, value)| !value.is_empty())
+                .all(|(label, source)| {
+                    values.next().is_some_and(|value| {
+                        value.label == label && bounded_metadata_matches(source, &value.value)
+                    })
+                })
+                && values.next().is_none()
+        }) {
+            return;
+        }
         // Host-known legacy content introduces no new plugin callback.
         let mut values = Vec::new();
         for (label, value) in [
@@ -349,12 +382,20 @@ impl PreviewService {
             image: None,
             values,
         };
+        let had_content = self
+            .metadata
+            .as_ref()
+            .is_some_and(|old| old.text.is_some() || !old.values.is_empty());
+        let content = Arc::new(content);
+        self.metadata = Some(Arc::clone(&content));
         if content.text.is_some() || !content.values.is_empty() {
             let prepared = crikey_ui::PreparedPreview {
-                content: Arc::new(content),
+                content,
                 blocks: Arc::default(),
             };
             model.publish_preview(selection, crikey_ui::PreviewStatus::Content(Arc::new(prepared)));
+        } else if had_content {
+            model.publish_preview(selection, crikey_ui::PreviewStatus::Empty);
         }
     }
 }
@@ -380,6 +421,17 @@ fn bounded_metadata_text(value: &str) -> String {
     bounded.push_str(&value[..end]);
     bounded.push_str(ELLIPSIS);
     bounded
+}
+
+fn bounded_metadata_matches(source: &str, rendered: &str) -> bool {
+    if source.len() <= 8192 {
+        return source == rendered;
+    }
+    let mut end = 8192 - "…".len();
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    rendered.strip_suffix('…') == Some(&source[..end])
 }
 
 #[cfg(test)]
@@ -463,11 +515,55 @@ mod tests {
             pending: None,
             active: Some((identity.clone(), 0)),
             presented: None,
+            metadata: None,
             terminal,
             publish,
             sequence: identity.request,
         };
         (service, model, endpoint, identity)
+    }
+
+    #[test]
+    fn host_metadata_tracks_same_selection_republication_without_resetting_focus() {
+        let (mut service, mut model, _, _) = active_preview();
+        service.active = None;
+        service.selected = None;
+        service.binding = None;
+        let search = crate::SearchService::new(crate::App::new());
+        let initial = model.frame().unwrap();
+        let mut row = initial.rows[0].clone();
+        row.description = "First detail".into();
+        row.plugin_name = "Shared value".into();
+        model.publish(initial.generation, vec![row.clone()], false);
+        service.synchronize(&mut model, &search);
+        let selection = model.preview_selection().unwrap();
+        model.apply(UiCommand::FocusPreview);
+        model.frame().unwrap();
+
+        row.description = "Updated detail".into();
+        row.plugin_name.clear();
+        row.category = "Shared value".into();
+        model.publish(initial.generation, vec![row.clone()], false);
+        service.synchronize(&mut model, &search);
+        assert_eq!(model.preview_selection(), Some(selection));
+        let updated = model.frame().unwrap();
+        assert!(updated.preview.focused);
+        let Some(PreviewStatus::Content(content)) = updated.preview.status else {
+            panic!("updated host metadata must remain visible");
+        };
+        assert_eq!(
+            content.content.text,
+            Some(crikey_core::PreviewText::Plain("Updated detail".into()))
+        );
+        assert_eq!(content.content.values[0].label, "Category");
+        service.synchronize(&mut model, &search);
+        assert!(model.frame().is_none(), "unchanged metadata must not republish");
+
+        row.description.clear();
+        row.category.clear();
+        model.publish(initial.generation, vec![row], false);
+        service.synchronize(&mut model, &search);
+        assert_eq!(model.frame().unwrap().preview.status, Some(PreviewStatus::Empty));
     }
 
     #[test]
