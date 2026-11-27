@@ -414,11 +414,8 @@ fn prepare_action_input(
             && (!model.settings_open
                 || (owner.view != pending.source.view && !pending.focus_ready)
                 || pending.settings_owner.as_ref().is_some_and(|owner| {
-                    crate::settings_management::focused_owner(
-                        context,
-                        &model.navigation.settings_management,
-                    )
-                    .as_ref()
+                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+                        .as_ref()
                         == Some(owner)
                 }))
             && (owner.typed.is_none()
@@ -671,10 +668,7 @@ fn build_launcher_frame_with_transparency(
             let settings_owner = model
                 .settings_open
                 .then(|| {
-                    crate::settings_management::focused_owner(
-                        context,
-                        &model.navigation.settings_management,
-                    )
+                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
                 })
                 .flatten();
             let typed_focus = model

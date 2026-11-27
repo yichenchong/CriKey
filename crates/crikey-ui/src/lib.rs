@@ -567,9 +567,11 @@ impl ActionInputCheckpoint {
                 .map(|action| action.action_id.clone()),
             panel: model.action_panel.clone(),
             preview_focus: (model.preview.focused, model.preview.detail),
-            standard: model.navigation.standard.as_ref().map(|surface| {
-                (surface.owner.clone(), surface.producer, surface.context.clone())
-            }),
+            standard: model
+                .navigation
+                .standard
+                .as_ref()
+                .map(|surface| (surface.owner.clone(), surface.producer, surface.context.clone())),
             standard_refresh_pending: model.navigation.standard_refresh_pending,
             typed: Self::typed_identity(model.navigation.inline_arguments.as_ref()),
         }
@@ -610,7 +612,10 @@ impl ActionInputCheckpoint {
             && self.view == view
             && self.generation == generation
             && self.query == query
-            && self.standard.as_ref().map(|(owner, producer, context)| (owner, *producer, context))
+            && self
+                .standard
+                .as_ref()
+                .map(|(owner, producer, context)| (owner, *producer, context))
                 == standard.map(|surface| (&surface.owner, surface.producer, &surface.context))
             && self.standard_refresh_pending == standard_refresh_pending
             && !standard_refresh_pending
@@ -2106,9 +2111,10 @@ impl LauncherViewModel {
                 .map(|action| action.action_id.clone()),
             panel: self.action_panel.clone(),
             preview_focus: (self.preview.focused, self.preview.detail),
-            standard: self.standard.as_ref().map(|surface| {
-                (surface.owner.clone(), surface.producer, surface.context.clone())
-            }),
+            standard: self
+                .standard
+                .as_ref()
+                .map(|surface| (surface.owner.clone(), surface.producer, surface.context.clone())),
             standard_refresh_pending: self.standard_refresh_pending,
             typed: ActionInputCheckpoint::typed_identity(self.inline_arguments.as_ref()),
         };
