@@ -184,7 +184,10 @@ impl TypedEditor {
             self.clear();
             return None;
         };
-        let fresh = self.revision.as_ref().is_none_or(|identity| !identity.matches(input));
+        let fresh = self
+            .revision
+            .as_ref()
+            .is_none_or(|identity| !identity.matches(input));
         if fresh {
             self.clear();
             self.revision = Some(TypedInputIdentity::of(input));
