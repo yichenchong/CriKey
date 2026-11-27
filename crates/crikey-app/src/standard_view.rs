@@ -466,6 +466,7 @@ pub(crate) fn execution(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enqueue<T>(
     sender: &SyncSender<ForegroundRequest<T>>,
+    admission_gate: &crate::runtime_control::AdmissionGate,
     gates: &BTreeMap<PluginId, Arc<PreviewActionGate>>,
     pending: &Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>,
     in_flight: &AtomicUsize,
@@ -530,7 +531,17 @@ pub(crate) fn enqueue<T>(
         #[cfg(test)]
         before_send: None,
     };
-    if let Err(error) = sender.try_send(ForegroundRequest::View(queued)) {
+    // Return the owned failed message out of the guard scope: its cleanup may
+    // reacquire route authority, whose final-delivery order is authority -> gate.
+    let sent = {
+        match admission_gate.admit() {
+            Ok(_admission) => sender.try_send(ForegroundRequest::View(queued)),
+            Err(_) => Err(std::sync::mpsc::TrySendError::Disconnected(
+                ForegroundRequest::View(queued),
+            )),
+        }
+    };
+    if let Err(error) = sent {
         let queued = match error {
             std::sync::mpsc::TrySendError::Full(v) | std::sync::mpsc::TrySendError::Disconnected(v) => v,
         };
@@ -604,6 +615,104 @@ impl<T> ActionReceiver<T> {
             ForegroundRequest::View(_) => panic!("expected an ordinary action"),
         })
     }
+}
+
+/// Exercises real provider endpoints with a published Refresh awaiting drain.
+#[cfg(test)]
+pub(crate) fn assert_closed_presentation_admission<T>(
+    endpoint: Arc<dyn crate::PluginActionExecutor>,
+    receiver: &ActionReceiver<T>,
+    authority: &Arc<Mutex<ViewAuthority>>,
+    gate: &crate::runtime_control::AdmissionGate,
+    owner: PluginId,
+    terminal: Option<bool>,
+) {
+    use crikey_core::structured_view::*;
+    let producer = 1;
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    let descriptor = Arc::new(ViewDescriptor {
+        title: "Stop grace".into(),
+        definitions: vec![].into(),
+        view: StandardView::List(CollectionView {
+            items: vec![].into(),
+            sections: vec![],
+            scopes: vec![],
+            initial_selection: None,
+            initial_scope: None,
+        }),
+    });
+    let publish = |request: ViewRequest, revision| {
+        let context = ViewExecutionContext {
+            route: request.route.clone(),
+            session: request.session,
+            revision: NonZeroU64::new(revision).unwrap(),
+        };
+        let id = endpoint.request_view(&owner, producer, request).unwrap();
+        let ForegroundRequest::View(queued) = receiver.0.recv().unwrap() else {
+            panic!("expected real view admission");
+        };
+        assert_eq!(queued.request_id, id);
+        let ViewOperation::Request(request) = &queued.operation else {
+            unreachable!()
+        };
+        let effect = authority
+            .lock()
+            .unwrap()
+            .publish(
+                &queued,
+                request,
+                ViewReply {
+                    context,
+                    descriptor: descriptor.clone(),
+                },
+            )
+            .unwrap();
+        queued.completion(queued.finish(Ok(effect)))
+    };
+    let open = model
+        .open_standard_route(
+            owner.clone(),
+            producer,
+            StructuredRouteOutcome::Push(RouteId("list".into())),
+        )
+        .unwrap();
+    let seed = publish(open, 9);
+    let Ok(ActionEffect::View(old)) = seed.outcome else {
+        panic!("Open failed")
+    };
+    assert!(model.publish_standard_view(owner.clone(), producer, old.clone()));
+    let refresh = model
+        .standard_refresh_request(ViewRefreshReason::Explicit)
+        .unwrap();
+    let completion = publish(refresh, 10);
+    let Ok(ActionEffect::View(new)) = completion.outcome else {
+        panic!("Refresh failed")
+    };
+    let pending = Some(&completion.request_id);
+    // Positive proof first: neither an unsupported default nor stale authority
+    // can make the subsequent stopped-admission assertions pass accidentally.
+    assert!(!endpoint.view_current(&owner, &old.context));
+    assert!(endpoint.view_current(&owner, &new.context));
+    assert!(endpoint.view_presentation_available(&owner, &old.context, producer, pending));
+    assert!(endpoint.view_presentation_available(&owner, &new.context, producer, None));
+    let mut router = crate::PluginActionRouter::default();
+    router.register([owner.clone()], endpoint.clone()).unwrap();
+    let mut search = crate::SearchService::new(crate::App::new());
+    search.set_plugin_action_router(Arc::new(router));
+    assert!(!search.retire_unavailable_view(&owner, &old.context, producer, pending));
+    let epoch = NonZeroU64::new(41).unwrap();
+    gate.close(epoch).unwrap();
+    assert!(gate.close(NonZeroU64::new(42).unwrap()).is_err());
+    if let Some(success) = terminal {
+        gate.finish(epoch, success);
+    }
+    assert_ne!(gate.state(), crate::runtime_control::PluginAdmission::Open);
+    assert!(!endpoint.view_presentation_available(&owner, &old.context, producer, pending));
+    assert!(!endpoint.view_presentation_available(&owner, &new.context, producer, None));
+    assert!(!endpoint.view_current(&owner, &new.context));
+    assert!(search.retire_unavailable_view(&owner, &old.context, producer, pending));
+    assert!(!authority.lock().unwrap().current(&owner, &new.context, producer));
 }
 
 #[cfg(test)]

@@ -70,10 +70,6 @@ impl ObservedSilentTransport {
         if matches!(envelope.payload, Some(Payload::Shutdown(_))) {
             fs::write(self.gate.join("shutdown"), std::process::id().to_string())
                 .map_err(|error| ProtocolError::Io(error.to_string()))?;
-            // Older drivers close admission through Drop, not a stop ticket.
-            // Only receipt of the host's actual Shutdown releases the callback.
-            fs::write(self.gate.join("release"), b"real host Shutdown")
-                .map_err(|error| ProtocolError::Io(error.to_string()))?;
         }
         Ok(())
     }
@@ -140,6 +136,9 @@ enum Mode {
     IgnoreCancel(u64),
     GatedIgnoreCancel,
     CrashOnSuggest,
+    ExitOnSuggest {
+        hold_streams: bool,
+    },
     CrashOnStart,
     FailSuggest,
     Sequence,
@@ -181,6 +180,8 @@ fn parse_mode(spec: &str) -> Mode {
         "env-witness" => Mode::EnvWitness,
         "acceptance" => Mode::Acceptance,
         "crash-on-suggest" => Mode::CrashOnSuggest,
+        "exit-on-suggest" => Mode::ExitOnSuggest { hold_streams: false },
+        "exit-with-held-streams" => Mode::ExitOnSuggest { hold_streams: true },
         "crash-on-start" => Mode::CrashOnStart,
         "fail-suggest" => Mode::FailSuggest,
         "sequence" => Mode::Sequence,
@@ -1118,6 +1119,43 @@ impl Plugin for ConformancePlugin {
             Mode::IgnoreCancel(milliseconds) => self.suggest_ignore_cancel(query, milliseconds, sink),
             Mode::GatedIgnoreCancel => self.suggest_gated_ignore_cancel(query, sink),
             Mode::CrashOnSuggest => crash("crash-on-suggest requested"),
+            Mode::ExitOnSuggest { hold_streams } => {
+                let _stream_holder = if hold_streams {
+                    let path = env::var_os("CRIKEY_CONFORMANCE_STREAM_HOLDER_PID")
+                        .ok_or_else(|| invalid("the stream-holder PID witness is required"))?;
+                    let mut witness = fs::File::create(path).map_err(|error| invalid(error.to_string()))?;
+                    let mut child = std::process::Command::new(
+                        env::current_exe().map_err(|error| invalid(error.to_string()))?,
+                    )
+                    .arg("--hold-streams")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .map_err(|error| invalid(error.to_string()))?;
+                    if let Err(error) = writeln!(witness, "{}", child.id()) {
+                        child.kill().map_err(|error| invalid(error.to_string()))?;
+                        let end = Instant::now() + Duration::from_secs(5);
+                        while child
+                            .try_wait()
+                            .map_err(|error| invalid(error.to_string()))?
+                            .is_none()
+                        {
+                            if Instant::now() >= end {
+                                return Err(invalid("the stream holder could not be reaped"));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        return Err(invalid(error.to_string()));
+                    }
+                    Some(child)
+                } else {
+                    None
+                };
+                // No callback terminal or SDK shutdown: the native owner must
+                // observe and reap this real unexpected process termination.
+                std::process::exit(17);
+            }
             Mode::CrashOnStart => Err(invalid("crash-on-start should not receive suggest")),
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
@@ -1264,6 +1302,25 @@ impl Plugin for ConformancePlugin {
                 }
             }
         }
+        if let Some(path) = std::env::var_os("CRIKEY_CONFORMANCE_STOP_FILE") {
+            std::fs::write(&path, b"started").expect("stop witness is writable");
+            if let Some(release) = std::env::var_os("CRIKEY_CONFORMANCE_STOP_RELEASE_FILE") {
+                let end = std::time::Instant::now() + Duration::from_secs(15);
+                while !std::path::Path::new(&release).is_file() {
+                    assert!(std::time::Instant::now() < end, "stop release did not arrive");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            if let Ok(delay) = std::env::var("CRIKEY_CONFORMANCE_STOP_DELAY_MS") {
+                thread::sleep(Duration::from_millis(
+                    delay.parse().expect("stop delay is numeric"),
+                ));
+            }
+            if std::env::var_os("CRIKEY_CONFORMANCE_CRASH_ON_STOP").is_some() {
+                std::process::exit(17);
+            }
+            std::fs::write(&path, b"finished").expect("stop witness is writable");
+        }
         Ok(())
     }
 }
@@ -1350,6 +1407,13 @@ fn run() -> Result<(), SdkError> {
 }
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("--hold-streams") {
+        // An inherited-pipe descendant deliberately outlives the SDK leader.
+        // Its existing host process group/job must settle it; the isolated
+        // harness reaps its exact PID rather than leaving a zombie to init.
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);

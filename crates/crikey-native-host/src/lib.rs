@@ -18,8 +18,10 @@ pub use stream::{
     PluginError, ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS, OBSERVATION_CAPACITY,
     READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
 };
-pub use supervisor::{NativeSupervisor, SupervisorConfig};
+pub use supervisor::{NativeAdmission, NativeSupervisor, SupervisorConfig};
+#[cfg(windows)]
+pub use worker::ContainedChildJob;
 pub use worker::{
-    CancelHandle, ConfirmedTypedExecution, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake,
-    PluginResource, ResourceKind, ResourceOutcome, TypedPreparation,
+    CancelHandle, ConfirmedTypedExecution, ExitKind, ExitRecord, HostError, NativeSpawnFailure, NativeWorker,
+    PluginHandshake, PluginResource, ResourceKind, ResourceOutcome, TypedPreparation,
 };

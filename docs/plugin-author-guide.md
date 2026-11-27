@@ -254,6 +254,18 @@ section when schemas are supported, including type, default, validation,
 secret, restart, and platform metadata. Secrets are redacted by
 `crikey config`; never log them.
 
+Schema-backed fields are browsable in the host Settings surface without running
+your plugin. Host edits write the plugin's user-plugin layer under source and
+schema revision checks; an external edit requires explicit conflict recovery.
+Search excludes values, defaults and secret declarations. Mark secrets in the
+schema; never put them in labels, descriptions or diagnostics. A package
+install/remove permanently stops every third-party runtime in that launcher
+session, so do not assume configuration delivery or another callback after
+package mutation. Restart requirements remain distinct from successful saving.
+
+For an explicit command, the host's **Configure command…** action navigates to
+that exact command's preferences without calling your execution callback.
+
 ## Typed root arguments and presentation
 
 Typed root arguments extend the existing root list, not the custom-page

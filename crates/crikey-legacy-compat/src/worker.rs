@@ -715,7 +715,7 @@ struct WriteQueue {
     wake: Condvar,
 }
 
-fn spawn_stdin_writer(mut stdin: ChildStdin, queue: Arc<WriteQueue>) {
+fn spawn_stdin_writer(mut stdin: ChildStdin, queue: Arc<WriteQueue>) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
         let command = {
             let mut state = queue.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -761,7 +761,7 @@ fn spawn_stdin_writer(mut stdin: ChildStdin, queue: Arc<WriteQueue>) {
             }
         }
         return;
-    });
+    })
 }
 
 /// The parts of a worker that outlive the thread that owns it.
@@ -1002,7 +1002,7 @@ fn read_frame_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<
         }
     }
 }
-fn spawn_stdout_reader(stdout: ChildStdout, sender: mpsc::SyncSender<StdoutEvent>) {
+fn spawn_stdout_reader(stdout: ChildStdout, sender: mpsc::SyncSender<StdoutEvent>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line: Vec<u8> = Vec::new();
@@ -1038,7 +1038,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, sender: mpsc::SyncSender<StdoutEvent
                 return;
             }
         }
-    });
+    })
 }
 
 fn strip_carriage_return(line: &[u8]) -> &[u8] {
@@ -1112,7 +1112,7 @@ impl StderrTail {
     }
 }
 
-fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) {
+fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line: Vec<u8> = Vec::new();
@@ -1146,7 +1146,7 @@ fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) {
                 Ok(LineRead::Eof) | Err(_) => return,
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,19 +1169,59 @@ pub struct LegacyWorker {
     process_id: u32,
     reaped: Option<ExitStatus>,
     hard_stopped: bool,
+    sidework: Vec<thread::JoinHandle<()>>,
+    reap_failed: bool,
+    #[cfg(windows)]
+    job: Option<crikey_native_host::ContainedChildJob>,
+}
+
+/// Startup failure plus any physical owner that could not yet be settled.
+#[derive(Debug)]
+pub struct WorkerSpawnFailure {
+    pub error: WorkerError,
+    /// Actual OS spawn succeeded, even if startup cleanup already settled it.
+    pub process_created: bool,
+    pub worker: Option<LegacyWorker>,
+}
+impl fmt::Display for WorkerSpawnFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("legacy-worker-startup-failed")
+    }
+}
+impl std::error::Error for WorkerSpawnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 impl LegacyWorker {
     /// Starts a child interpreter for `package` and completes its handshake.
     ///
-    /// Returns only once the child has announced itself, so a caller holding a
-    /// `LegacyWorker` holds a process that is running the shim — not merely one
-    /// that was spawned. A child that fails to announce itself is reaped before
-    /// the error is returned; no path out of this function leaks a process.
+    /// Success requires the child's handshake. On failure, bounded cleanup runs
+    /// first; any unconfirmed physical owner is returned in `WorkerSpawnFailure`
+    /// for the caller to retain in its existing closed runtime/command owner.
     pub fn spawn(
         interpreter: &Interpreter,
         package: &LegacyPackage,
         options: WorkerOptions,
+    ) -> Result<Self, WorkerSpawnFailure> {
+        let mut failed = None;
+        let mut process_created = false;
+        Self::spawn_inner(interpreter, package, options, &mut failed, &mut process_created).map_err(|error| {
+            WorkerSpawnFailure {
+                error,
+                process_created,
+                worker: failed,
+            }
+        })
+    }
+
+    fn spawn_inner(
+        interpreter: &Interpreter,
+        package: &LegacyPackage,
+        options: WorkerOptions,
+        failed: &mut Option<Self>,
+        process_created: &mut bool,
     ) -> Result<Self, WorkerError> {
         let entry = options.shim_dir.join(WORKER_ENTRY_FILE);
         if !entry.is_file() {
@@ -1287,12 +1327,30 @@ impl LegacyWorker {
         // (spec 14, 20.2; ADR-0019).
         let sandbox = crikey_sandbox::plugin_policy(options.cache_dir.clone(), false).prepare();
         sandbox.install(&mut command);
+        #[cfg(windows)]
+        crikey_native_host::ContainedChildJob::prepare(&mut command);
 
         let mut child = command.spawn().map_err(|error| WorkerError::PythonUnavailable {
             path: Some(interpreter.path().to_path_buf()),
             reason: format!("the legacy worker process could not be started: {error}"),
         })?;
+        *process_created = true;
         let process_id = child.id();
+        #[cfg(windows)]
+        let (job, containment_error) = match crikey_native_host::ContainedChildJob::assign_suspended(
+            &child,
+            &crikey_native_host::ResourceLimits::default(),
+        ) {
+            Ok(job) => (Some(job), None),
+            Err(message) => (
+                None,
+                Some(WorkerError::Io {
+                    plugin: Some(options.plugin.clone()),
+                    operation: "containing suspended legacy worker in its Windows job".to_owned(),
+                    message,
+                }),
+            ),
+        };
 
         // Piped by construction immediately above, so these are `Some`.
         let stdin = child.stdin.take().expect("worker stdin is piped");
@@ -1300,9 +1358,9 @@ impl LegacyWorker {
         let stderr = child.stderr.take().expect("worker stderr is piped");
 
         let (sender, frames) = mpsc::sync_channel(STDOUT_QUEUE_CAPACITY);
-        spawn_stdout_reader(stdout, sender);
+        let stdout_thread = spawn_stdout_reader(stdout, sender);
         let tail = Arc::new(Mutex::new(StderrTail::default()));
-        spawn_stderr_drain(stderr, Arc::clone(&tail));
+        let stderr_thread = spawn_stderr_drain(stderr, Arc::clone(&tail));
         let queue = Arc::new(WriteQueue {
             state: Mutex::new(WriteQueueState {
                 closed: false,
@@ -1310,7 +1368,7 @@ impl LegacyWorker {
             }),
             wake: Condvar::new(),
         });
-        spawn_stdin_writer(stdin, Arc::clone(&queue));
+        let stdin_thread = spawn_stdin_writer(stdin, Arc::clone(&queue));
 
         let mut worker = Self {
             plugin: options.plugin.clone(),
@@ -1326,10 +1384,42 @@ impl LegacyWorker {
             process_id,
             reaped: None,
             hard_stopped: false,
+            sidework: vec![stdout_thread, stderr_thread, stdin_thread],
+            reap_failed: false,
+            #[cfg(windows)]
+            job,
         };
+        #[cfg(windows)]
+        if let Some(error) = containment_error {
+            worker.reap_failed = true;
+            let _ = worker.reap();
+            *failed = Some(worker);
+            return Err(error);
+        }
+        #[cfg(windows)]
+        if let Err(message) = worker
+            .job
+            .as_ref()
+            .expect("startup job is assigned")
+            .resume(worker.child.as_ref().expect("startup child is owned"))
+        {
+            let error = WorkerError::Io {
+                plugin: Some(worker.plugin.clone()),
+                operation: "resuming the contained legacy worker".to_owned(),
+                message,
+            };
+            // The canonical worker already owns the job, even if resume failed.
+            let _ = worker.reap();
+            if worker.shutdown().is_err() {
+                *failed = Some(worker);
+            }
+            return Err(error);
+        }
 
         if let Err(error) = worker.handshake() {
-            let _ = worker.reap();
+            if worker.shutdown().is_err() {
+                *failed = Some(worker);
+            }
             return Err(error);
         }
 
@@ -1347,29 +1437,22 @@ impl LegacyWorker {
 
     /// Whether the child is still alive.
     ///
-    /// Takes `&mut self` because answering reaps a child that has exited: an
-    /// exited child nobody waited for stays in the process table as a zombie,
-    /// and a launcher that leaks one per plugin reload leaks them forever
-    /// (spec 24.3).
+    /// Observes exit without reaping: the unreaped leader reserves the process
+    /// group identity until teardown has signalled all supervised descendants.
     pub fn is_running(&mut self) -> bool {
         if self.reaped.is_some() {
             return false;
         }
 
-        match self.child.as_mut().map(Child::try_wait) {
-            Some(Ok(None)) => true,
-            Some(Ok(Some(status))) => {
-                self.reaped = Some(status);
+        let Some(child) = self.child.as_ref() else {
+            return false;
+        };
+        match child_exited(child) {
+            Ok(exited) => !exited,
+            Err(_) => {
+                self.reap_failed = true;
                 false
             }
-            // A handle that cannot be asked is not a handle that can be
-            // trusted to be alive; reap it rather than leaving a child
-            // undisposed.
-            Some(Err(_)) => {
-                let _ = self.reap();
-                false
-            }
-            None => false,
         }
     }
 
@@ -1516,12 +1599,35 @@ impl LegacyWorker {
 
     /// Stops the child and reaps it, returning how it ended.
     ///
-    /// Never reports the plugin's misbehaviour as an error: a worker that had to
-    /// be killed is described by [`WorkerExit::hard_stopped`], and shutting down
-    /// a worker that already died is not a failure either. The `Result` is there
-    /// so callers can treat teardown like every other worker operation.
-    pub fn shutdown(mut self) -> Result<WorkerExit, WorkerError> {
-        Ok(self.stop_child())
+    /// Joins pipe workers and refuses to claim teardown when reaping fails.
+    pub fn shutdown(&mut self) -> Result<WorkerExit, WorkerError> {
+        let exit = self.stop_child();
+        self.link.close_stdin();
+        let (_, replacement) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.frames, replacement));
+        let mut failed = self.reap_failed || self.reaped.is_none();
+        failed |= !self.settle_sidework(REAP_GRACE);
+        #[cfg(not(any(unix, windows)))]
+        {
+            failed = true;
+        } // No supervised tree primitive exists on this target.
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            while process_group_exists(self.process_id) && started.elapsed() < REAP_GRACE {
+                thread::sleep(REAP_POLL_INTERVAL);
+            }
+            failed |= process_group_exists(self.process_id);
+        }
+        if failed {
+            Err(WorkerError::Io {
+                plugin: Some(self.plugin.clone()),
+                operation: "physically stopping legacy worker and pipe threads".to_owned(),
+                message: "process group, reap, or pipe-thread shutdown was not confirmed".to_owned(),
+            })
+        } else {
+            Ok(exit)
+        }
     }
 
     /// Waits for the startup handshake (spec 24.1).
@@ -1659,43 +1765,131 @@ impl LegacyWorker {
         }
     }
 
-    /// Ends the child, killing it only if it is still alive.
-    ///
-    /// Checking first is what keeps [`WorkerExit::hard_stopped`] honest: a child
-    /// that already exited was not hard-stopped, and reporting otherwise would
-    /// make every crash look like a host intervention.
+    /// Signal the owned tree before releasing the leader's reserved identity.
+    fn finish_child(&mut self, mut child: Child, exited: io::Result<bool>) -> Option<ExitStatus> {
+        // A failed inspection is not proof of life or death. Only ECHILD
+        // invalidates Unix numeric identity; otherwise still attempt cleanup.
+        #[cfg(unix)]
+        let identity_owned = exited
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.raw_os_error() != Some(libc::ECHILD));
+        #[cfg(not(unix))]
+        let identity_owned = true;
+        match exited {
+            Ok(exited) => self.hard_stopped |= !exited,
+            Err(_) => {
+                self.reap_failed = true;
+                self.hard_stopped = true;
+            }
+        }
+        #[cfg(unix)]
+        let mut apple_zombie_reap = false;
+        let tree_signalled = if identity_owned {
+            #[cfg(unix)]
+            {
+                match kill_process_group(self.process_id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // XNU skips zombies when delivering a group signal and
+                        // returns EPERM for an owned zombie-only group. This is
+                        // permission to reap only our still-held exited leader,
+                        // never evidence that the process group is absent.
+                        if cfg!(target_vendor = "apple")
+                            && error.raw_os_error() == Some(libc::EPERM)
+                            && matches!(child_exited(&child), Ok(true))
+                        {
+                            apple_zombie_reap = true;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                match &self.job {
+                    Some(job) => job.terminate_and_wait().is_ok(),
+                    None => {
+                        // Containment failed before the suspended startup completed.
+                        // Still kill the owned leader, but never clear that failure.
+                        self.reap_failed = true;
+                        child.kill().is_ok()
+                    }
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                false
+            }
+        } else {
+            false
+        };
+        if !tree_signalled || !matches!(wait_exit_observed(&child, REAP_GRACE), Ok(true)) {
+            self.reap_failed = true;
+            self.child = Some(child);
+            return self.reaped;
+        }
+        match child.wait() {
+            Ok(status) => {
+                self.reaped = Some(status);
+                #[cfg(unix)]
+                if apple_zombie_reap && process_group_exists(self.process_id) {
+                    self.reap_failed = true;
+                }
+            }
+            Err(_) => {
+                self.reap_failed = true;
+                self.child = Some(child);
+            }
+        }
+        self.reaped
+    }
+
     fn reap(&mut self) -> Option<ExitStatus> {
         self.link.close_stdin();
-
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return self.reaped;
         };
+        let exited = child_exited(&child);
+        self.finish_child(child, exited)
+    }
 
-        let status = match child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            Ok(None) | Err(_) => {
-                hard_kill(self.process_id, &mut child);
-                self.hard_stopped = true;
-                wait_bounded(&mut child, REAP_GRACE).or_else(|| {
-                    reap_in_background(child);
-                    None
-                })
+    fn settle_sidework(&mut self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            let mut index = 0;
+            while index < self.sidework.len() {
+                if self.sidework[index].is_finished() {
+                    if self.sidework.swap_remove(index).join().is_err() {
+                        self.reap_failed = true;
+                    }
+                } else {
+                    index += 1;
+                }
             }
-        };
-        self.reaped = status;
-        self.reaped
+            if self.sidework.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(REAP_POLL_INTERVAL);
+        }
     }
 
     /// Asks the child to exit, then makes sure it did (spec 24.3).
     fn stop_child(&mut self) -> WorkerExit {
         if let Some(status) = self.reaped {
+            // A previously reaped leader must never be used for group signalling.
             return WorkerExit {
                 code: status.code(),
                 hard_stopped: self.hard_stopped,
             };
         }
 
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return WorkerExit {
                 code: None,
                 hard_stopped: self.hard_stopped,
@@ -1733,32 +1927,16 @@ impl LegacyWorker {
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }
-        let status = if left_voluntarily {
-            wait_bounded(&mut child, REAP_GRACE)
+        // stdout EOF is not exit: allow the existing finalizer grace without
+        // releasing the leader's identity before descendant termination.
+        let exited = if left_voluntarily {
+            wait_exit_observed(&child, REAP_GRACE)
         } else {
-            None
+            child_exited(&child)
         };
-        let status = match status {
-            Some(status) => status,
-            None => {
-                hard_kill(self.process_id, &mut child);
-                self.hard_stopped = true;
-                match wait_bounded(&mut child, REAP_GRACE) {
-                    Some(status) => status,
-                    None => {
-                        reap_in_background(child);
-                        return WorkerExit {
-                            code: None,
-                            hard_stopped: true,
-                        };
-                    }
-                }
-            }
-        };
-
-        self.reaped = Some(status);
+        let status = self.finish_child(child, exited);
         WorkerExit {
-            code: status.code(),
+            code: status.and_then(|status| status.code()),
             hard_stopped: self.hard_stopped,
         }
     }
@@ -1772,46 +1950,29 @@ impl Drop for LegacyWorker {
         if self.child.is_some() {
             let _ = self.reap();
         }
+        self.link.close_stdin();
+        let (_, replacement) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.frames, replacement));
+        let _ = self.settle_sidework(REAP_GRACE);
     }
-}
-
-/// Hard-stops the child, reaching its whole process group on Unix.
-///
-/// On Unix the child is its own group leader (`process_group(0)` at spawn), so
-/// signalling the group kills any grandchildren a plugin forked as well as the
-/// leader (spec 24.3). Off Unix `std::process` offers no portable group kill,
-/// so only the direct child is reached — an honest, documented limit rather
-/// than a false claim of tree-kill. The caller polls for a bounded grace period
-/// and hands any still-exiting child to a background reaper.
-fn hard_kill(process_id: u32, child: &mut Child) {
-    #[cfg(unix)]
-    kill_process_group(process_id);
-    #[cfg(not(unix))]
-    {
-        // Grandchildren are unreachable here; only the leader is killed below.
-        let _ = process_id;
-    }
-    let _ = child.kill();
 }
 
 /// Sends `SIGKILL` to an entire process group (spec 24.3).
 ///
-/// Killing a process *group* needs the `killpg(3)`/`kill(2)` syscall; the
-/// standard library only kills a single child ([`Child::kill`]) and exposes no
-/// safe wrapper for the group case. This is therefore the crate's only
-/// `unsafe`, isolated to this one function and declaring `killpg` directly so
-/// no new dependency is pulled in. Its arguments are a validated pid-as-pgid
-/// (the group was created by `CommandExt::process_group(0)`) and a constant
-/// signal; the call reads and writes no memory.
+/// The caller must still own an unreaped leader, reserving this process group
+/// identity. No signal is permitted after that ownership has been lost.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) {
+fn kill_process_group(pgid: u32) -> io::Result<()> {
     // `killpg(0)` signals the CALLER's process group - this launcher, its shell
     // and its session. Callers pass a live `Child::id()`, and each kill precedes
     // its reap so the pid cannot have been recycled, but a misdirected group
     // kill is unrecoverable: refuse the values that could only mean "myself" or
     // "init".
-    if pgid <= 1 {
-        return;
+    if pgid <= 1 || pgid > i32::MAX as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid owned process group",
+        ));
     }
     // `int killpg(int pgrp, int sig)` — POSIX. SIGKILL is 9 on Linux and macOS.
     extern "C" {
@@ -1822,37 +1983,83 @@ fn kill_process_group(pgid: u32) {
         unsafe_code,
         reason = "no safe std API kills a process group; args are a validated pgid and a constant signal (spec 24.3)"
     )]
-    unsafe {
-        let _ = killpg(pgid as i32, SIGKILL);
+    let result = unsafe { killpg(pgid as i32, SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 }
 
-/// Continues reaping after the caller's bounded grace period expires. The
-/// background poll owns the child handle, so the worker never returns a live
-/// or zombie child while also blocking indefinitely in `wait()`.
-fn reap_in_background(mut child: Child) {
-    thread::spawn(move || loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
-        }
-    });
+#[cfg(unix)]
+fn process_group_exists(pgid: u32) -> bool {
+    extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    #[allow(unsafe_code, reason = "POSIX group existence probe using the owned pgid")]
+    let result = unsafe { killpg(pgid as i32, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() != Some(3)
 }
-/// Waits for an exiting child's status, giving up after `budget`.
-///
-/// Polled because `std` offers no wait-with-timeout, and the alternative — a
-/// blocking `wait` — would let a child that closed its pipes and then hung
-/// block host shutdown forever.
-fn wait_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
+
+/// Observe exit while retaining the waitable leader and its reserved identity.
+#[cfg(unix)]
+#[allow(
+    unsafe_code,
+    reason = "waitid WNOWAIT observes the owned child without releasing its pid"
+)]
+fn child_exited(child: &Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "non-reaping wait on the owned Windows process handle")]
+fn child_exited(child: &Child) -> io::Result<bool> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+    }
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } {
+        0 => Ok(true),
+        258 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn child_exited(_child: &Child) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "non-reaping child observation unavailable",
+    ))
+}
+
+fn wait_exit_observed(child: &Child, budget: Duration) -> io::Result<bool> {
     let started = Instant::now();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {}
-            Err(_) => return None,
+        if child_exited(child)? {
+            return Ok(true);
         }
         if started.elapsed() >= budget {
-            return None;
+            return Ok(false);
         }
         thread::sleep(REAP_POLL_INTERVAL);
     }
@@ -2288,6 +2495,153 @@ fn floor_char_boundary(text: &str, limit: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    fn shutdown_fixture(source: &str, argument: &OsStr) -> LegacyWorker {
+        let interpreter =
+            crate::discover_interpreter(&crikey_python_host::RuntimeProfile::LegacyCompatibility)
+                .expect("shutdown fixtures require the supported Python interpreter");
+        let mut command = Command::new(interpreter.path());
+        command
+            .args(["-u", "-c", source])
+            .arg(argument)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        crikey_native_host::ContainedChildJob::prepare(&mut command);
+        let mut child = command.spawn().expect("spawn shutdown fixture");
+        #[cfg(windows)]
+        let job = crikey_native_host::ContainedChildJob::assign_suspended(
+            &child,
+            &crikey_native_host::ResourceLimits::default(),
+        )
+        .expect("contain shutdown fixture");
+        let process_id = child.id();
+        let (sender, frames) = mpsc::sync_channel(STDOUT_QUEUE_CAPACITY);
+        let stdout = spawn_stdout_reader(child.stdout.take().unwrap(), sender);
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        let stderr_thread = spawn_stderr_drain(child.stderr.take().unwrap(), Arc::clone(&stderr));
+        let queue = Arc::new(WriteQueue {
+            state: Mutex::new(WriteQueueState {
+                closed: false,
+                pending: VecDeque::new(),
+            }),
+            wake: Condvar::new(),
+        });
+        let stdin = spawn_stdin_writer(child.stdin.take().unwrap(), Arc::clone(&queue));
+        let worker = LegacyWorker {
+            plugin: PluginId("legacy.shutdown-fixture".to_owned()),
+            options: WorkerOptions::new(PluginId("legacy.shutdown-fixture".to_owned()), PathBuf::new())
+                .with_shutdown_timeout_ms(500),
+            link: Arc::new(WorkerLink {
+                terminate: AtomicBool::new(false),
+                next_id: AtomicU64::new(0),
+                queue,
+            }),
+            frames,
+            stderr,
+            child: Some(child),
+            process_id,
+            reaped: None,
+            hard_stopped: false,
+            sidework: vec![stdout, stderr_thread, stdin],
+            reap_failed: false,
+            #[cfg(windows)]
+            job: Some(job),
+        };
+        #[cfg(windows)]
+        worker
+            .job
+            .as_ref()
+            .expect("fixture job is assigned")
+            .resume(worker.child.as_ref().expect("fixture child is owned"))
+            .expect("resume contained shutdown fixture");
+        worker
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stdout_close_allows_cooperative_finalizer_before_tree_cleanup() {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let witness = std::env::temp_dir().join(format!(
+            "crikey-legacy-finalizer-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut worker = shutdown_fixture(
+            "import os,sys,time,pathlib\nsys.stdin.buffer.read()\nos.close(1)\ntime.sleep(0.05)\npathlib.Path(sys.argv[1]).write_text('finalized')",
+            witness.as_os_str(),
+        );
+        let exit = worker
+            .shutdown()
+            .expect("cooperative process and pipe workers physically stop");
+        assert_eq!(exit.code, Some(0));
+        assert!(
+            !exit.hard_stopped,
+            "closing stdout is not a reason to kill a finalizer"
+        );
+        assert_eq!(std::fs::read_to_string(&witness).unwrap(), "finalized");
+        std::fs::remove_file(witness).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_leader_stays_waitable_until_its_descendant_group_is_signalled() {
+        let mut worker = shutdown_fixture(
+            "import subprocess,sys\np=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\nprint(p.pid,flush=True)\nsys.stdin.buffer.read()",
+            OsStr::new(""),
+        );
+        let descendant = worker
+            .frames
+            .recv_timeout(Duration::from_secs(5))
+            .expect("descendant witness");
+        assert!(matches!(descendant, StdoutEvent::Frame(_)));
+        let leader = worker.child.as_ref().unwrap();
+        let pid = leader.id();
+        worker.link.close_stdin();
+        assert!(wait_exit_observed(worker.child.as_ref().unwrap(), Duration::from_secs(5)).unwrap());
+        assert!(!worker.is_running());
+        // Repeated observation must not reap; waitid still reports this child.
+        assert!(child_exited(worker.child.as_ref().unwrap()).unwrap());
+        let exit = worker.stop_child();
+        assert_eq!(exit.code, Some(0));
+        assert!(
+            !exit.hard_stopped,
+            "only the remaining descendant required termination"
+        );
+        assert!(
+            matches!(
+                worker.frames.recv_timeout(Duration::from_secs(5)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "the descendant must no longer hold the inherited stdout pipe"
+        );
+        #[allow(
+            unsafe_code,
+            reason = "verify cleanup consumed exactly the owned child wait status"
+        )]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                -1
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        }
+    }
 
     fn selected_item() -> Box<Item> {
         Box::new(Item {

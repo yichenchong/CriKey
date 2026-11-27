@@ -447,6 +447,9 @@ struct NativeCatalogDispatcher {
     /// Canonical targets whose healthy static catalog producer was released.
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     ledger: Arc<Mutex<RootSourceLedger>>,
+    cleanup_failed: bool,
+    crashed: Arc<AtomicBool>,
+    joined: usize,
 }
 
 impl Default for NativeCatalogDispatcher {
@@ -462,6 +465,9 @@ impl Default for NativeCatalogDispatcher {
             items: Arc::new(Mutex::new(BTreeMap::new())),
             static_items: Arc::new(Mutex::new(BTreeMap::new())),
             ledger: Arc::default(),
+            cleanup_failed: false,
+            crashed: Arc::new(AtomicBool::new(false)),
+            joined: 0,
         }
     }
 }
@@ -491,7 +497,8 @@ impl NativeCatalogDispatcher {
                 continue;
             };
             if let Some(join) = task.join.take() {
-                let _ = join.join();
+                self.cleanup_failed |= join.join().is_err();
+                self.joined += 1;
             }
             let mut publications = self.commands.lock().unwrap_or_else(|error| error.into_inner());
             // `latest` is the newest request ever issued for this plugin,
@@ -590,7 +597,8 @@ impl NativeCatalogDispatcher {
     fn shutdown(&mut self) -> Vec<CatalogBuildResult> {
         for task in self.tasks.values_mut() {
             if let Some(join) = task.join.take() {
-                let _ = join.join();
+                self.cleanup_failed |= join.join().is_err();
+                self.joined += 1;
             }
         }
         let results = self.take();
@@ -669,6 +677,40 @@ impl CallControl {
         let _wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
         self.finished.store(true, Ordering::Release);
         self.wake.notify_all();
+    }
+}
+
+/// Retains cancellation-thread ownership even when a callback unwinds.
+struct CallWatcher {
+    control: Arc<CallControl>,
+    worker: Option<JoinHandle<()>>,
+}
+impl CallWatcher {
+    fn spawn(control: Arc<CallControl>, name: String) -> std::io::Result<Self> {
+        let watch = Arc::clone(&control);
+        let worker = thread::Builder::new()
+            .name(name)
+            .spawn(move || watch.watch_cancel())?;
+        Ok(Self {
+            control,
+            worker: Some(worker),
+        })
+    }
+    fn settle(mut self) -> Result<(), ()> {
+        self.control.finish();
+        self.worker
+            .take()
+            .expect("owned cancellation thread")
+            .join()
+            .map_err(|_| ())
+    }
+}
+impl Drop for CallWatcher {
+    fn drop(&mut self) {
+        self.control.finish();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -783,6 +825,16 @@ struct NativeWorkerPool {
     /// the lock a query needs. Registration is lazy, so a plugin whose icons
     /// are never asked for pays for no second process.
     resource_supervisors: BTreeMap<WorkerKey, Arc<Mutex<NativeSupervisor>>>,
+    /// Capture stop capabilities while each supervisor is exclusively owned,
+    /// before callbacks can hold its mutex. Driver handoff moves these exact
+    /// owners without waiting for an already-running callback.
+    stop_owners: Vec<(Arc<Mutex<NativeSupervisor>>, crikey_native_host::NativeAdmission)>,
+    admission: crate::runtime_control::AdmissionGate,
+    resources: crate::runtime_control::PendingWork,
+    cleanup_failed: bool,
+    retirement: crate::runtime_control::RuntimeRetirement,
+    termination: Vec<(PluginId, crikey_native_host::ExitRecord)>,
+    icons: Option<Arc<PluginIconResolver>>,
 }
 
 impl std::fmt::Debug for NativeWorkerPool {
@@ -810,6 +862,13 @@ impl Default for NativeWorkerPool {
             in_flight: BTreeMap::new(),
             cancellation: Arc::new(NativeCancellation::default()),
             resource_supervisors: BTreeMap::new(),
+            stop_owners: Vec::new(),
+            admission: crate::runtime_control::AdmissionGate::default(),
+            resources: crate::runtime_control::PendingWork::default(),
+            cleanup_failed: false,
+            retirement: crate::runtime_control::RuntimeRetirement::default(),
+            termination: Vec::new(),
+            icons: None,
         }
     }
 }
@@ -840,7 +899,8 @@ impl NativeWorkerPool {
         if let Some(mut call) = self.in_flight.remove(&key) {
             self.cancellation.unregister(call.job, &call.plugin);
             if let Some(join) = call.join.take() {
-                let _ = join.join();
+                self.cleanup_failed |= join.join().is_err();
+                self.retirement.query_threads += 1;
             }
         }
     }
@@ -864,7 +924,8 @@ impl NativeWorkerPool {
                 while !join.is_finished() {
                     let _ = self.result_rx.recv_timeout(Duration::from_millis(10));
                 }
-                let _ = join.join();
+                self.cleanup_failed |= join.join().is_err();
+                self.retirement.query_threads += 1;
             }
         }
         for supervisor in self
@@ -872,10 +933,19 @@ impl NativeWorkerPool {
             .values()
             .chain(self.resource_supervisors.values())
         {
-            supervisor
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .shutdown_all();
+            self.cleanup_failed |= NativeSupervisor::shutdown_shared(supervisor).is_err();
+            let supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+            self.termination.extend(supervisor.termination_ledger());
+        }
+        if let Some(icons) = &self.icons {
+            match icons.shutdown() {
+                Ok(joined) => self.retirement.resource_threads = joined,
+                Err(_) => self.cleanup_failed = true,
+            }
+        }
+        match self.resources.settle() {
+            Ok(completed) => self.retirement.resource_calls = completed,
+            Err(_) => self.cleanup_failed = true,
         }
     }
 }
@@ -915,10 +985,17 @@ impl NativeWorkerPool {
 struct NativeResourceSource {
     plugin: PluginId,
     supervisor: Arc<Mutex<NativeSupervisor>>,
+    admission: crate::runtime_control::AdmissionGate,
+    resources: crate::runtime_control::PendingWork,
 }
 
 impl PluginResourceSource for NativeResourceSource {
     fn fetch(&self, reference: &str) -> IconFetch {
+        let Ok(admission) = self.admission.admit() else {
+            return IconFetch::Unavailable;
+        };
+        let _pending = self.resources.begin();
+        drop(admission);
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
         // Starting the child is part of the fetch, and it is the part
         // `PLUGIN_ICON_DEADLINE` does not bound — see the note above this
@@ -1144,6 +1221,7 @@ impl NativeProvider {
         // retains the new supervisors is written.
         let Self { pool, loaded, .. } = self;
         let mut resolver = PluginIconResolver::default();
+        resolver.set_admission(pool.admission.clone());
         for entry in loaded.iter() {
             if !pool.supervisors.contains_key(&entry.key) {
                 continue;
@@ -1158,7 +1236,9 @@ impl NativeProvider {
             // One worker key belongs to one package directory, so this is
             // always a fresh entry and the provider is its only owner besides
             // the resolver it hands to the pipeline.
+            let admission = supervisor.admission();
             let supervisor = Arc::new(Mutex::new(supervisor));
+            pool.stop_owners.push((Arc::clone(&supervisor), admission));
             pool.resource_supervisors
                 .insert(entry.key.clone(), Arc::clone(&supervisor));
             resolver.insert_served(
@@ -1166,10 +1246,14 @@ impl NativeProvider {
                 Arc::new(NativeResourceSource {
                     plugin: entry.plugin.clone(),
                     supervisor,
+                    admission: pool.admission.clone(),
+                    resources: pool.resources.clone(),
                 }),
             );
         }
-        pipeline.set_plugin_icons(Arc::new(resolver));
+        let resolver = Arc::new(resolver);
+        pool.icons = Some(Arc::clone(&resolver));
+        pipeline.set_plugin_icons(resolver);
     }
 
     /// Loads one candidate package, starts its worker, and registers the
@@ -1354,6 +1438,7 @@ impl NativeProvider {
             let _ = pipeline.unregister_plugin(&plugin);
             return;
         }
+        let admission = supervisor.admission();
         // `register` is intentionally lazy. Eager manifests pay the startup
         // handshake here; lazy manifests start on their first query.
         if manifest.performance.startup == Startup::Eager {
@@ -1364,11 +1449,15 @@ impl NativeProvider {
                     format!("native worker did not start: {error}"),
                 );
                 let _ = pipeline.unregister_plugin(&plugin);
+                let supervisor = Arc::new(Mutex::new(supervisor));
+                self.pool.stop_owners.push((Arc::clone(&supervisor), admission));
+                self.pool.supervisors.insert(key, supervisor);
                 return;
             }
         }
         refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
         let supervisor = Arc::new(Mutex::new(supervisor));
+        self.pool.stop_owners.push((Arc::clone(&supervisor), admission));
         self.pool.supervisors.insert(key.clone(), supervisor);
 
         self.plugins.push(plugin.clone());
@@ -1505,6 +1594,13 @@ impl NativeProvider {
         instance: u64,
         generation: Generation,
     ) -> Result<u64, CatalogDispatchError> {
+        let _admission = self
+            .pool
+            .admission
+            .admit()
+            .map_err(|_| CatalogDispatchError::QueueFull {
+                plugin: plugin.clone(),
+            })?;
         let loaded = self
             .loaded
             .iter()
@@ -1544,6 +1640,7 @@ impl NativeProvider {
         let catalog_persist = loaded.catalog_persist;
         let plugin_for_thread = plugin.clone();
         let thread_plugin = plugin.clone();
+        let catalog_crashed = Arc::clone(&self.catalog.crashed);
         let join = thread::Builder::new()
             .name(format!("crikey-native-catalog-{}", plugin.0))
             .spawn(move || {
@@ -1596,6 +1693,9 @@ impl NativeProvider {
                         )
                     })
                 }));
+                if result.is_err() {
+                    catalog_crashed.store(true, Ordering::Release);
+                }
                 let incarnation = result
                     .as_ref()
                     .ok()
@@ -1722,6 +1822,7 @@ impl NativeProvider {
         &mut self,
         queued: &mut crate::standard_view::QueuedView,
     ) -> crikey_core::Result<ActionEffect> {
+        let runtime_admission = self.pool.admission.clone();
         let _guard = queued
             .admission
             .take()
@@ -1761,7 +1862,16 @@ impl NativeProvider {
                 let reply = crate::standard_view::with_cancellation(
                     queued,
                     || cancel.cancel(),
-                    || worker.structured_view_with_admission(request, |send| queued.deliver(send)),
+                    || {
+                        worker.structured_view_with_admission(request, |send| {
+                            queued.deliver(&mut || {
+                                let Ok(_fence) = runtime_admission.admit() else {
+                                    return false;
+                                };
+                                send()
+                            })
+                        })
+                    },
                 )
                 .map_err(|_| crikey_core::CoreError::Invalid("standard view request failed".into()));
                 reply.and_then(|reply| {
@@ -1807,7 +1917,14 @@ impl NativeProvider {
                                 .execute_typed_confirmed_with_admission(
                                     prepared,
                                     values.ok_or(crikey_core::CoreError::Cancelled)?,
-                                    |send| queued.deliver(send),
+                                    |send| {
+                                        queued.deliver(&mut || {
+                                            let Ok(_fence) = runtime_admission.admit() else {
+                                                return false;
+                                            };
+                                            send()
+                                        })
+                                    },
                                 )
                                 .map_err(|_| {
                                     crikey_core::CoreError::Invalid("typed view execution failed".into())
@@ -1826,7 +1943,14 @@ impl NativeProvider {
                                 &executable.target.item,
                                 executable.action.as_ref(),
                                 argument.as_deref(),
-                                |send| queued.deliver(send),
+                                |send| {
+                                    queued.deliver(&mut || {
+                                        let Ok(_fence) = runtime_admission.admit() else {
+                                            return false;
+                                        };
+                                        send()
+                                    })
+                                },
                             )
                             .map_err(|_| crikey_core::CoreError::Invalid("view execution failed".into()))?
                         {
@@ -1944,6 +2068,9 @@ impl NativeProvider {
                     .take_typed_values()
                     .expect("typed work owns submitted values");
                 worker.execute_typed_confirmed_with_admission(confirmed, values, |send| {
+                    let Ok(_fence) = self.pool.admission.admit() else {
+                        return false;
+                    };
                     let ledger = self.catalog.ledger.lock().unwrap_or_else(|e| e.into_inner());
                     ledger.frozen_item(&binding).is_some()
                         && match &binding.source {
@@ -2090,6 +2217,7 @@ impl NativeProvider {
                 request.work.action_id(),
                 request.argument.as_deref(),
                 |send| {
+                    let Ok(_fence) = self.pool.admission.admit() else { return false; };
                     if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline { return false; }
                     if let crate::plugin_action::AdmittedPluginWork::Actionless { source } = &request.work {
                         let ledger = self.catalog.ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -2281,6 +2409,9 @@ impl NativeProvider {
     /// Cancels outstanding calls, joins their dispatch threads, and asks every
     /// registered supervisor to reap its child (spec 24.3).
     pub fn shutdown(&mut self, _now: Millis) {
+        if self.pool.admission.state() == crate::runtime_control::PluginAdmission::Open {
+            let _ = self.pool.admission.close(std::num::NonZeroU64::MIN);
+        }
         for result in self.catalog.shutdown() {
             if let CatalogBuildResult::Failed { plugin, reason, .. } = result {
                 self.pool.record_dispatch_failure(plugin, reason);
@@ -2310,6 +2441,8 @@ impl NativeProvider {
         // are retired and late failures cannot disappear with the provider.
         self.drain_completed_results();
         self.discard_buffered_answers();
+        self.pool.cleanup_failed |= self.catalog.cleanup_failed;
+        self.pool.cleanup_failed |= self.catalog.crashed.load(Ordering::Acquire);
     }
 
     /// Dispatches one independent call per plugin. Results are consumed from
@@ -2401,10 +2534,11 @@ impl NativeProvider {
                                 });
                             }
                             control_for_thread.install(worker.cancel_handle());
-                            let watch_control = Arc::clone(&control_for_thread);
-                            let watcher = thread::Builder::new()
-                                .name(format!("crikey-native-cancel-{}", plugin_for_thread.0))
-                                .spawn(move || watch_control.watch_cancel());
+                            let watcher = CallWatcher::spawn(
+                                Arc::clone(&control_for_thread),
+                                format!("crikey-native-cancel-{}", plugin_for_thread.0),
+                            )
+                            .map_err(|error| HostError::Spawn(error.to_string()))?;
                             let started = Instant::now();
                             let incarnation = worker.connection_id();
                             let result =
@@ -2416,9 +2550,11 @@ impl NativeProvider {
                                         generation: Generation::from_raw(job),
                                     });
                             soft_timeout_elapsed = started.elapsed() > soft_timeout;
-                            control_for_thread.finish();
-                            if let Ok(watcher) = watcher {
-                                let _ = watcher.join();
+                            if watcher.settle().is_err() {
+                                return Err(HostError::PluginFailed {
+                                    plugin: plugin_for_thread.clone(),
+                                    detail: "native cancellation worker panicked".into(),
+                                });
                             }
                             result
                         };
@@ -2810,6 +2946,9 @@ impl std::fmt::Debug for WakeSlot {
 /// Bounded action endpoint retained by the live native driver.
 #[derive(Debug)]
 struct NativeActionEndpoint {
+    admission: crate::runtime_control::AdmissionGate,
+    page_work: crate::runtime_control::PendingWork,
+    page_failed: Arc<AtomicBool>,
     sender: SyncSender<crate::standard_view::ForegroundRequest<NativeActionRequest>>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
@@ -2841,6 +2980,14 @@ struct NativeActionEndpoint {
     action_wake: crate::plugin_action::CompletionWake,
 }
 impl NativeActionEndpoint {
+    fn retire_page(&self) {
+        let session = self.page.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(session) = session {
+            report_page_failure(&session);
+            let closing = session.close().1;
+            *self.page_closing.lock().unwrap_or_else(|e| e.into_inner()) = Some(closing);
+        }
+    }
     fn view_producer(&self, owner: &PluginId) -> Option<u64> {
         self.incarnations
             .lock()
@@ -2857,6 +3004,7 @@ impl NativeActionEndpoint {
     ) -> crikey_core::Result<ActionRequestId> {
         let request_id = crate::standard_view::enqueue(
             &self.sender,
+            &self.admission,
             &self.gates,
             &self.pending,
             &self.in_flight,
@@ -2958,10 +3106,24 @@ impl NativeActionEndpoint {
             cancelled,
             current_generation: Arc::clone(&self.current_generation),
         };
-        if let Err(error) = self
-            .sender
-            .try_send(crate::standard_view::ForegroundRequest::Action(request))
-        {
+        let sent = match self.admission.admit() {
+            Ok(fence) => {
+                let sent = self
+                    .sender
+                    .try_send(crate::standard_view::ForegroundRequest::Action(request));
+                drop(fence);
+                sent
+            }
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id);
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                return Err(crikey_core::CoreError::Cancelled);
+            }
+        };
+        if let Err(error) = sent {
             self.pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2993,6 +3155,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         item: &ItemId,
         canonical: Option<&crate::plugin_action::DeclaredCommandSource>,
     ) -> Option<RootSource> {
+        let _admission = self.admission.admit().ok()?;
         let source = self
             .ledger
             .lock()
@@ -3122,6 +3285,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         owner: &PluginId,
         context: &crikey_core::structured_view::ViewExecutionContext,
     ) -> bool {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return false;
+        }
         let producer = self.view_producer(owner);
         let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
         if producer.is_none() {
@@ -3136,6 +3302,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         producer: u64,
         pending: Option<&ActionRequestId>,
     ) -> bool {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return false;
+        }
         let source = self.view_producer(owner);
         let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
         if source.is_none() {
@@ -3150,6 +3319,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         state: &crikey_core::structured_view::HostViewState,
         url: &str,
     ) -> crikey_core::Result<()> {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
         let producer = self
             .view_producer(owner)
             .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
@@ -3163,6 +3335,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         key: &crikey_core::structured_arguments::ExecutableKey,
         canonical: Option<&crate::plugin_action::DeclaredCommandSource>,
     ) -> Option<RootExecutableBinding> {
+        let _admission = self.admission.admit().ok()?;
         let binding = self
             .ledger
             .lock()
@@ -3186,6 +3359,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn root_presentations(&self) -> Vec<RootPresentationSnapshot> {
+        let Ok(_admission) = self.admission.admit() else {
+            return Vec::new();
+        };
         self.ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -3207,6 +3383,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn root_scope_current(&self, scope: &crate::plugin_action::RootScope) -> bool {
+        let Ok(_admission) = self.admission.admit() else {
+            return false;
+        };
         if !self.page_supervisors.contains_key(&scope.owner) {
             return false;
         }
@@ -3405,9 +3584,12 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         let mut completions = Vec::new();
         let mut mailbox = self.completions.lock().unwrap_or_else(|error| error.into_inner());
         while completions.len() < ACTION_COMPLETION_CAPACITY {
-            let Some(completion) = mailbox.pop_front() else {
+            let Some(mut completion) = mailbox.pop_front() else {
                 break;
             };
+            if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+                completion.outcome = Err(crikey_core::CoreError::Cancelled);
+            }
             self.pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -3430,6 +3612,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn owns_item(&self, plugin: &PluginId, item_id: &ItemId) -> bool {
+        let Ok(_admission) = self.admission.admit() else {
+            return false;
+        };
         let key = (plugin.clone(), item_id.clone());
         self.items
             .lock()
@@ -3481,6 +3666,13 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         height: u32,
         palette: crikey_core::PagePalette,
     ) -> crikey_core::Result<()> {
+        // Settlement precedes admission; no admission lock is held while joining.
+        let admitted = self
+            .admission
+            .admit()
+            .map_err(|_| crikey_core::CoreError::Cancelled)?;
+        let _pending = self.page_work.begin();
+        drop(admitted);
         let supervisor = self.page_supervisors.get(plugin).cloned().ok_or_else(|| {
             crikey_core::CoreError::Invalid(format!("no native worker owns plugin `{}`", plugin.0))
         })?;
@@ -3493,8 +3685,15 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
             .unwrap_or_else(|error| error.into_inner())
             .take();
         if let Some(settling) = settling {
-            settling.settle();
+            if settling.settle_checked().is_err() {
+                self.page_failed.store(true, Ordering::Release);
+                return Err(crikey_core::CoreError::Cancelled);
+            }
         }
+        let _admission = self
+            .admission
+            .admit()
+            .map_err(|_| crikey_core::CoreError::Cancelled)?;
         let mut open = self.page.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(session) = open.as_ref() {
             return Err(crikey_core::CoreError::Invalid(format!(
@@ -3532,6 +3731,10 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn send_plugin_page_input(&self, input: PageInput) -> crikey_core::Result<()> {
+        let _admission = self
+            .admission
+            .admit()
+            .map_err(|_| crikey_core::CoreError::Cancelled)?;
         self.page
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -3542,6 +3745,9 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn resize_plugin_page(&self, width: u32, height: u32) {
+        let Ok(_admission) = self.admission.admit() else {
+            return;
+        };
         if let Some(session) = self
             .page
             .lock()
@@ -3553,18 +3759,14 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn close_plugin_page(&self) {
-        let Some(session) = self.page.lock().unwrap_or_else(|error| error.into_inner()).take() else {
+        let Ok(_admission) = self.admission.admit() else {
             return;
         };
-        report_page_failure(&session);
-        let (_, closing) = session.close();
-        *self
-            .page_closing
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(closing);
+        self.retire_page();
     }
 
     fn poll_plugin_page(&self) -> Option<PageUpdate> {
+        let _admission = self.admission.admit().ok()?;
         let mut open = self.page.lock().unwrap_or_else(|error| error.into_inner());
         let update = open.as_ref()?.poll()?;
         // The session is finished the moment it reports a close, and holding
@@ -3652,7 +3854,8 @@ pub struct NativeDriver {
     replacements: Arc<AtomicU64>,
     busy: Arc<AtomicBool>,
     has_plugins: bool,
-    worker: Option<JoinHandle<()>>,
+    control: crate::runtime_control::DriverControl,
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     preview_endpoint: Arc<native_preview::NativePreviewEndpoint>,
 }
 
@@ -3681,6 +3884,25 @@ impl NativeDriver {
         publish: Box<dyn Fn(&ViewModel) + Send + 'static>,
     ) -> Self {
         let permissions = provider.permissions();
+        let admission = provider.pool.admission.clone();
+        let stopped_owners: Arc<[PluginId]> = provider
+            .catalog_declarations
+            .keys()
+            .cloned()
+            .chain(provider.plugins.iter().cloned())
+            .chain(
+                provider
+                    .unavailable
+                    .iter()
+                    .filter_map(|entry| entry.plugin.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into();
+        let wait_icons = provider.pool.icons.clone();
+        let process_admissions = std::mem::take(&mut provider.pool.stop_owners);
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
         let query_policies = permissions
             .keys()
             .filter_map(|plugin| {
@@ -3711,6 +3933,9 @@ impl NativeDriver {
         let (action_sender, action_receiver) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
         let completion_mailbox = Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_COMPLETION_CAPACITY)));
         let action_endpoint = Arc::new(NativeActionEndpoint {
+            admission: admission.clone(),
+            page_work: crate::runtime_control::PendingWork::default(),
+            page_failed: Arc::new(AtomicBool::new(false)),
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
             gates: provider.action_gates(),
@@ -3747,6 +3972,7 @@ impl NativeDriver {
         let lifecycle_supervisors = provider.page_supervisors();
         let lifecycle_incarnations = Arc::clone(&provider.incarnations);
         let preview_lifecycle_wake = preview_endpoint.lifecycle_wake();
+        let thread_admission = admission.clone();
         let spawned = std::thread::Builder::new()
             .name("crikey-native".to_owned())
             .spawn(move || {
@@ -3835,6 +4061,16 @@ impl NativeDriver {
                                 }
                                 drop(slot);
                                 provider.shutdown(last_now);
+                                let failed = provider.pool.cleanup_failed;
+                                let _ = terminal_tx.send(if failed {
+                                    Err(crate::runtime_control::StopError::new("native-cleanup-failed"))
+                                } else {
+                                    provider.pool.retirement.catalog_threads = provider.catalog.joined;
+                                    Ok((
+                                        std::mem::take(&mut provider.pool.termination),
+                                        provider.pool.retirement,
+                                    ))
+                                });
                                 return;
                             }
                             if let Ok(request) = action_receiver.try_recv() {
@@ -3871,6 +4107,7 @@ impl NativeDriver {
                                 provider.execute_view_request(&mut request)
                             }))
                             .unwrap_or_else(|_| {
+                                provider.pool.cleanup_failed = true;
                                 Err(crikey_core::CoreError::Invalid(
                                     "standard view worker failed".into(),
                                 ))
@@ -3902,10 +4139,13 @@ impl NativeDriver {
                                     provider.execute_action_request(*request)
                                 })) {
                                     Ok(result) => result,
-                                    Err(_) => Err(crikey_core::CoreError::Invalid(format!(
-                                        "native plugin `{}` action worker panicked",
-                                        plugin.0
-                                    ))),
+                                    Err(_) => {
+                                        provider.pool.cleanup_failed = true;
+                                        Err(crikey_core::CoreError::Invalid(format!(
+                                            "native plugin `{}` action worker panicked",
+                                            plugin.0
+                                        )))
+                                    }
                                 }
                             };
                             let result = if cancelled.load(Ordering::Acquire) {
@@ -4017,6 +4257,9 @@ impl NativeDriver {
                                 preview: Default::default(),
                                 navigation: Default::default(),
                             };
+                            let Ok(_admission) = thread_admission.admit() else {
+                                continue;
+                            };
                             let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
                             if slot.stop
                                 || slot.job.is_some()
@@ -4081,6 +4324,10 @@ impl NativeDriver {
                     // single-slot outcome publication. `submit` stores its
                     // newer generation before taking this lock, and a queued
                     // replacement is itself a supersession in flight.
+                    let Ok(_admission) = thread_admission.admit() else {
+                        thread_busy.store(false, Ordering::Release);
+                        continue;
+                    };
                     let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
                     if slot.stop
                         || slot.job.is_some()
@@ -4102,44 +4349,149 @@ impl NativeDriver {
                 }
             });
 
-        match spawned {
-            Ok(worker) => Self {
-                mailbox,
-                action_endpoint,
-                preview_endpoint,
-                permissions,
-                catalog_results,
-                commands,
-                health,
-                outcome,
-                search_summary,
-                query_policies,
-                current,
-                cancellation,
-                replacements,
-                busy,
-                has_plugins,
-                worker: Some(worker),
+        let worker = Arc::new(Mutex::new(spawned.ok()));
+        let wait_worker = Arc::clone(&worker);
+        let signal_mailbox = Arc::clone(&mailbox);
+        let signal_cancellation = Arc::clone(&cancellation);
+        let signal_endpoint = Arc::clone(&action_endpoint);
+        let signal_preview = Arc::clone(&preview_endpoint);
+        let wait_endpoint = Arc::clone(&action_endpoint);
+        let wait_preview = Arc::clone(&preview_endpoint);
+        let control = crate::runtime_control::DriverControl::new(
+            "native",
+            Arc::clone(&stopped_owners),
+            admission,
+            move || {
+                for (_, admission) in &process_admissions {
+                    admission.close();
+                }
+                signal_preview.request_stop();
+                signal_endpoint.retire_page();
+                signal_cancellation.cancel_all();
+                for cancelled in signal_endpoint
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                {
+                    cancelled.store(true, Ordering::Release);
+                }
+                let mut slot = signal_mailbox.0.lock().unwrap_or_else(|e| e.into_inner());
+                slot.stop = true;
+                slot.job = None;
+                slot.configuration = None;
+                drop(slot);
+                signal_mailbox.1.notify_one();
             },
-            Err(_) => Self {
-                mailbox,
-                action_endpoint,
-                preview_endpoint,
-                permissions,
-                catalog_results,
-                commands,
-                health,
-                outcome,
-                search_summary,
-                query_policies,
-                current,
-                cancellation,
-                replacements,
-                busy,
-                has_plugins: false,
-                worker: None,
+            move |epoch| {
+                let page_work_result = wait_endpoint.page_work.settle();
+                let mut retirement = crate::runtime_control::RuntimeRetirement::default();
+                // Close and detach page ownership under locks; physically wait outside them.
+                let page = wait_endpoint
+                    .page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                let closing = wait_endpoint
+                    .page_closing
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                let mut failure = None;
+                if let Err(error) = page_work_result {
+                    failure = Some(error);
+                }
+                if wait_endpoint.page_failed.load(Ordering::Acquire) {
+                    failure = Some(crate::runtime_control::StopError::new(
+                        "native-page-cleanup-failed",
+                    ));
+                }
+                if let Some(page) = page {
+                    retirement.page_threads += 1;
+                    if let Err(error) = page.close().1.settle_checked() {
+                        failure = Some(error);
+                    }
+                }
+                if let Some(closing) = closing {
+                    retirement.page_threads += 1;
+                    if let Err(error) = closing.settle_checked() {
+                        failure = Some(error);
+                    }
+                }
+                match wait_preview.settle() {
+                    Ok(joined) => retirement.preview_threads = joined,
+                    Err(error) => failure = Some(error),
+                }
+                let supervisor = wait_worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+                match supervisor {
+                    Some(worker) => {
+                        if worker.join().is_err() {
+                            failure = Some(crate::runtime_control::StopError::new(
+                                "native-supervisor-panicked",
+                            ));
+                        }
+                    }
+                    None => {
+                        failure = Some(crate::runtime_control::StopError::new(
+                            "native-supervisor-unavailable",
+                        ))
+                    }
+                }
+                if let Some(icons) = &wait_icons {
+                    match icons.shutdown() {
+                        Ok(joined) => retirement.resource_threads = joined,
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                let mut exits = Vec::new();
+                match terminal_rx.recv() {
+                    Ok(Ok((ledger, settled))) => {
+                        exits = ledger;
+                        retirement.catalog_threads = settled.catalog_threads;
+                        retirement.query_threads = settled.query_threads;
+                        retirement.resource_calls = settled.resource_calls;
+                        retirement.resource_threads = settled.resource_threads;
+                    }
+                    Ok(Err(error)) => failure = Some(error),
+                    Err(_) => {
+                        failure = Some(crate::runtime_control::StopError::new("native-stop-disconnected"))
+                    }
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(crate::runtime_control::StoppedRuntime::validated(
+                        "native",
+                        epoch,
+                        stopped_owners,
+                    )
+                    .with_native_exits(exits)
+                    .with_retirement(retirement)),
+                }
             },
+        );
+        Self {
+            control,
+            worker,
+            mailbox,
+            action_endpoint,
+            preview_endpoint,
+            permissions,
+            catalog_results,
+            commands,
+            health,
+            outcome,
+            search_summary,
+            query_policies,
+            current,
+            cancellation,
+            replacements,
+            busy,
+            has_plugins,
         }
+    }
+
+    pub fn control(&self) -> crate::runtime_control::DriverControl {
+        self.control.clone()
     }
 
     pub(crate) fn preview_dispatcher(&self) -> Arc<dyn crate::plugin_preview::PreviewDispatcher> {
@@ -4150,6 +4502,7 @@ impl NativeDriver {
     /// states revoke registry entries even without a successful catalog. Registry
     /// replacement uses `snapshot.revision`, never its preview producer ID.
     pub fn command_snapshot(&self, plugin: &PluginId) -> Option<Arc<NativeCommandSnapshot>> {
+        let _admission = self.action_endpoint.admission.admit().ok()?;
         self.commands
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -4210,6 +4563,11 @@ impl NativeDriver {
         builtin_pending: bool,
         scope: Option<crate::plugin_action::RootScope>,
     ) -> crikey_core::Result<()> {
+        let _admission = self
+            .action_endpoint
+            .admission
+            .admit()
+            .map_err(|_| crikey_core::CoreError::Cancelled)?;
         let ProviderQueryContext {
             generation,
             text: query,
@@ -4263,7 +4621,13 @@ impl NativeDriver {
         self.cancellation.cancel_before(generation_value);
         ledger.retire_suggestions();
         drop(ledger);
-        let state = if self.worker.is_some() {
+        let available = self
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished());
+        let state = if available {
             crate::command_preferences::OrdinaryProviderState::Pending
         } else {
             crate::command_preferences::OrdinaryProviderState::Failed
@@ -4313,6 +4677,9 @@ impl NativeDriver {
     /// coalescing rule the host applied upstream, enforced again here because
     /// the two are separated by a thread boundary.
     pub fn publish_configuration(&self, configuration: crate::PluginConfiguration) {
+        let Ok(_admission) = self.action_endpoint.admission.admit() else {
+            return;
+        };
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
@@ -4325,6 +4692,7 @@ impl NativeDriver {
 
     /// Takes the newest merged frame published by the supervisor, if any.
     pub fn take_outcome(&self) -> Option<ViewModel> {
+        let _admission = self.action_endpoint.admission.admit().ok()?;
         self.outcome
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -4333,6 +4701,7 @@ impl NativeDriver {
 
     /// Terminal evidence is independent of visible rows and optional frames.
     pub fn ordinary_search_summary(&self, view: u64) -> Option<crate::query_pipeline::OrdinarySearchSummary> {
+        let _admission = self.action_endpoint.admission.admit().ok()?;
         let mut summary = self
             .search_summary
             .lock()
@@ -4354,6 +4723,9 @@ impl NativeDriver {
     /// Complete results remain instance/generation tagged for the caller's
     /// stale-safe catalog publication path.
     pub fn take_catalog_results(&self) -> Vec<CatalogBuildResult> {
+        let Ok(_admission) = self.action_endpoint.admission.admit() else {
+            return Vec::new();
+        };
         std::mem::take(
             &mut *self
                 .catalog_results
@@ -4414,28 +4786,14 @@ impl NativeDriver {
 }
 impl Drop for NativeDriver {
     fn drop(&mut self) {
-        for cancelled in self
-            .action_endpoint
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-        {
-            cancelled.store(true, Ordering::Release);
-        }
-        self.preview_endpoint.shutdown();
-        // Cancel in-flight callbacks before joining the supervisor so a
-        // cooperative native worker gets a chance to return promptly.
-        self.cancellation.cancel_all();
-        {
-            let (lock, cvar) = &*self.mailbox;
-            let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
-            slot.stop = true;
-            drop(slot);
-            cvar.notify_one();
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let epoch = match self.control.admission().state() {
+            crate::runtime_control::PluginAdmission::Open => std::num::NonZeroU64::MIN,
+            crate::runtime_control::PluginAdmission::Closing { epoch }
+            | crate::runtime_control::PluginAdmission::Offline { epoch }
+            | crate::runtime_control::PluginAdmission::FailedClosed { epoch } => epoch,
+        };
+        if let Ok(ticket) = self.control.request_stop(epoch) {
+            let _ = ticket.wait();
         }
     }
 }
@@ -4632,6 +4990,34 @@ mod query_history_receipt_tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[test]
+    fn closed_admission_revokes_published_refresh_presentation_grace() {
+        for terminal in [None, Some(true), Some(false)] {
+            let item = item();
+            let owner = item.plugin_id.clone();
+            let (endpoint, receiver) = endpoint(item);
+            // The shared root-action fixture seeds preview connection liveness,
+            // not physical view authority. Match refresh_incarnation's separate
+            // physical publication before admitting any standard-view request.
+            endpoint
+                .incarnations
+                .lock()
+                .unwrap()
+                .physical
+                .insert(owner.clone(), 1);
+            assert_eq!(endpoint.view_producer(&owner), Some(1));
+            let endpoint = Arc::new(endpoint);
+            crate::standard_view::assert_closed_presentation_admission(
+                endpoint.clone(),
+                &receiver,
+                &endpoint.views,
+                &endpoint.admission,
+                owner,
+                terminal,
+            );
+        }
+    }
+
     fn endpoint(
         item: Item,
     ) -> (
@@ -4644,6 +5030,9 @@ mod query_history_receipt_tests {
         incarnations.lock().unwrap().insert(owner.clone(), 1);
         (
             NativeActionEndpoint {
+                admission: crate::runtime_control::AdmissionGate::default(),
+                page_work: crate::runtime_control::PendingWork::default(),
+                page_failed: Arc::new(AtomicBool::new(false)),
                 sender,
                 completions: Arc::default(),
                 gates: BTreeMap::from([(
@@ -4876,9 +5265,11 @@ mod query_history_receipt_tests {
             let pending = Mutex::new(BTreeMap::new());
             let in_flight = AtomicUsize::new(0);
             let next_id = AtomicU64::new(0);
+            let admission = provider.pool.admission.clone();
             let enqueue = |request| {
                 crate::standard_view::enqueue::<NativeActionRequest>(
                     &sender,
+                    &admission,
                     &gates,
                     &pending,
                     &in_flight,

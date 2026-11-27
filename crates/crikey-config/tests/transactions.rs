@@ -351,3 +351,323 @@ fn empty_plugin_directory_remains_a_valid_watched_directory() {
         Err(ConfigError::Conflict)
     ));
 }
+
+fn plugin_owner(fixture: &Fixture) -> crikey_config::DiscoveredSchema {
+    crikey_config::DiscoveredSchema {
+        plugin: PluginId("modern.example".into()),
+        package: fixture.config_dir().join("installed-example"),
+        section: support::schema(
+            "[[configuration.field]]\nname = \"limit\"\ntype = \"integer\"\n\
+             default = 10\nminimum = 1\nmaximum = 100\n",
+        ),
+    }
+}
+
+#[test]
+fn plugin_transaction_writes_the_consumer_file_and_preserves_raw_unrelated_fields() {
+    let fixture = Fixture::new("plugin-transaction-consumer");
+    fixture.user_global("[plugins.modern.example.settings]\nlimit = 2\n");
+    fixture.plugin_settings(
+        "modern.example",
+        "enabled = false\n[settings]\nlimit = 3\nunknown = \"keep\"\n",
+    );
+    fixture.plugin_settings("modern.other", "[settings]\nvalue = \"other\"\n");
+    let global = std::fs::read(fixture.config_dir().join("config.toml")).unwrap();
+    let other = std::fs::read(fixture.config_dir().join("plugins/modern.other.toml")).unwrap();
+    let owner = plugin_owner(&fixture);
+    let mut store = fixture.load().unwrap();
+    store.register_discovered_schema(&owner);
+    store
+        .commit_plugin_user(&owner, "limit", "42", &store.revision())
+        .unwrap();
+    let mut consumer = fixture.load().unwrap();
+    consumer.register_discovered_schema(&owner);
+    let key = "plugins.modern.example.settings.limit";
+    assert_eq!(consumer.get(key), Some("42"));
+    assert_eq!(consumer.layer_of(key), Some(ConfigLayer::UserPlugin));
+    assert_eq!(store.get(key), consumer.get(key));
+    assert_eq!(consumer.get("plugins.modern.example.enabled"), Some("false"));
+    assert_eq!(
+        consumer.get("plugins.modern.example.settings.unknown"),
+        Some("keep")
+    );
+    assert_eq!(
+        std::fs::read(fixture.config_dir().join("config.toml")).unwrap(),
+        global
+    );
+    assert_eq!(
+        std::fs::read(fixture.config_dir().join("plugins/modern.other.toml")).unwrap(),
+        other
+    );
+}
+
+#[test]
+fn plugin_transaction_retains_policy_profile_schema_and_session_shadowing() {
+    let fixture = Fixture::new("plugin-transaction-shadowing");
+    fixture.user_global("[launcher]\nprofile = \"work\"\n");
+    fixture.profile("work", "[launcher]\nvalue = \"profile\"\n");
+    fixture.policy("[launcher]\npolicy-only = \"policy\"\n");
+    let key = "plugins.modern.example.settings.limit";
+    let overrides = vec![(key.to_owned(), "99".to_owned())];
+    let mut store =
+        ConfigStore::load_with_overrides(&fixture.directories(), Some(&fixture.policy_path()), &overrides)
+            .unwrap();
+    let owner = plugin_owner(&fixture);
+    assert!(store.register_discovered_schema(&owner).is_empty());
+    store
+        .commit_plugin_user(&owner, "limit", "42", &store.revision())
+        .unwrap();
+    assert_eq!(store.get(key), Some("99"));
+    assert_eq!(store.layer_of(key), Some(ConfigLayer::SessionOverride));
+    assert_eq!(store.get("launcher.value"), Some("profile"));
+    assert_eq!(store.get("launcher.policy-only"), Some("policy"));
+    let restarted = store.reload_without_session_overrides().unwrap();
+    assert_eq!(restarted.get(key), Some("42"));
+    assert_eq!(restarted.layer_of(key), Some(ConfigLayer::UserPlugin));
+    fixture.profile("work", "[launcher]\nvalue = \"external\"\n");
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "43", &store.revision()),
+        Err(ConfigError::Conflict)
+    ));
+}
+
+#[test]
+fn plugin_writers_share_global_writer_authority() {
+    let fixture = Fixture::new("plugin-transaction-writers");
+    let owner = plugin_owner(&fixture);
+    let mut first = fixture.load().unwrap();
+    let mut second = fixture.load().unwrap();
+    first.register_discovered_schema(&owner);
+    second.register_discovered_schema(&owner);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut store)| {
+            let barrier = barrier.clone();
+            let owner = owner.clone();
+            std::thread::spawn(move || {
+                let expected = store.revision();
+                barrier.wait();
+                if index == 0 {
+                    store.commit_plugin_user(&owner, "limit", "42", &expected)
+                } else {
+                    store.commit_user_global("launcher.writer", "other", &expected)
+                }
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(ConfigError::Conflict)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn plugin_owner_schema_and_validation_are_admission_authority() {
+    let fixture = Fixture::new("plugin-transaction-schema");
+    let mut owner = plugin_owner(&fixture);
+    owner.section.fields[0].secret = true;
+    let mut store = fixture.load().unwrap();
+    store.register_plugin_schema(&owner.plugin, &owner.section);
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "42", &store.revision()),
+        Err(ConfigError::Setting { .. })
+    ));
+    store.register_discovered_schema(&owner);
+    let expected = store.revision();
+    for (field, value) in [("missing", "42"), ("limit", "0"), ("limit", "private-token")] {
+        let error = store
+            .commit_plugin_user(&owner, field, value, &expected)
+            .unwrap_err();
+        assert!(!format!("{error:?}").contains("private-token"));
+        assert!(!error.to_string().contains("private-token"));
+    }
+    let mut replacement = owner.clone();
+    replacement.section =
+        support::schema("[[configuration.field]]\nname = \"limit\"\ntype = \"integer\"\ndefault = 20\n");
+    store.register_discovered_schema(&replacement);
+    assert_ne!(store.revision(), expected);
+    assert!(matches!(
+        store.commit_plugin_user(&replacement, "limit", "42", &expected),
+        Err(ConfigError::Conflict)
+    ));
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "42", &store.revision()),
+        Err(ConfigError::Conflict)
+    ));
+    let mut moved = replacement.clone();
+    moved.package = fixture.config_dir().join("another-package");
+    assert!(matches!(
+        store.commit_plugin_user(&moved, "limit", "42", &store.revision()),
+        Err(ConfigError::Conflict)
+    ));
+    assert!(!fixture.config_dir().join("plugins").exists());
+}
+
+#[test]
+fn plugin_transaction_rejects_portably_unsafe_ids_without_creating_paths() {
+    let fixture = Fixture::new("plugin-transaction-paths");
+    for id in [
+        "../outside",
+        "modern...escape",
+        "modern.a/b",
+        "modern.a\\b",
+        "modern.a:b",
+        "modern.a.",
+        "bare",
+        "CON.example",
+        "lPt1.example",
+    ] {
+        let mut owner = plugin_owner(&fixture);
+        owner.plugin = PluginId(id.into());
+        let mut store = fixture.load().unwrap();
+        store.register_discovered_schema(&owner);
+        assert!(matches!(
+            store.commit_plugin_user(&owner, "limit", "42", &store.revision()),
+            Err(ConfigError::Setting { .. })
+        ));
+    }
+    assert!(!fixture.config_dir().join("plugins").exists());
+}
+
+#[test]
+fn plugin_target_creation_deletion_and_replacement_are_conflicts() {
+    let fixture = Fixture::new("plugin-transaction-external");
+    let owner = plugin_owner(&fixture);
+    for operation in ["create", "delete", "replace"] {
+        if operation == "create" {
+            fixture.remove_plugin_settings("modern.example");
+        } else {
+            fixture.plugin_settings("modern.example", "[settings]\nlimit = 1\n");
+        }
+        let mut store = fixture.load().unwrap();
+        store.register_discovered_schema(&owner);
+        let expected = store.revision();
+        match operation {
+            "create" => fixture.plugin_settings("modern.example", "[settings]\nlimit = 2\n"),
+            "delete" => fixture.remove_plugin_settings("modern.example"),
+            "replace" => {
+                let mut replacement = tempfile::NamedTempFile::new_in(fixture.config_dir()).unwrap();
+                std::io::Write::write_all(&mut replacement, b"[settings]\nlimit = 2\n").unwrap();
+                replacement
+                    .persist(fixture.config_dir().join("plugins/modern.example.toml"))
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            store.commit_plugin_user(&owner, "limit", "42", &expected),
+            Err(ConfigError::Conflict)
+        ));
+        assert_eq!(store.revision(), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_transaction_refuses_symlinks_and_keeps_files_private() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let fixture = Fixture::new("plugin-transaction-symlinks");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("modern.example.toml"),
+        "[settings]\nlimit = 1\n",
+    )
+    .unwrap();
+    symlink(outside.path(), fixture.config_dir().join("plugins")).unwrap();
+    let owner = plugin_owner(&fixture);
+    let mut store = fixture.load().unwrap();
+    store.register_discovered_schema(&owner);
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "42", &store.revision()),
+        Err(ConfigError::Write { .. })
+    ));
+    std::fs::remove_file(fixture.config_dir().join("plugins")).unwrap();
+    std::fs::create_dir(fixture.config_dir().join("plugins")).unwrap();
+    symlink(
+        outside.path().join("modern.example.toml"),
+        fixture.config_dir().join("plugins/modern.example.toml"),
+    )
+    .unwrap();
+    let mut store = fixture.load().unwrap();
+    store.register_discovered_schema(&owner);
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "42", &store.revision()),
+        Err(ConfigError::Write { .. })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("modern.example.toml")).unwrap(),
+        "[settings]\nlimit = 1\n"
+    );
+    std::fs::remove_file(fixture.config_dir().join("plugins/modern.example.toml")).unwrap();
+    let mut store = fixture.load().unwrap();
+    store.register_discovered_schema(&owner);
+    store
+        .commit_plugin_user(&owner, "limit", "42", &store.revision())
+        .unwrap();
+    let path = fixture.config_dir().join("plugins/modern.example.toml");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut store = store.reload().unwrap();
+    store
+        .commit_plugin_user(&owner, "limit", "43", &store.revision())
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn plugin_transaction_rejects_a_declared_but_inapplicable_field() {
+    let fixture = Fixture::new("plugin-transaction-platform");
+    let mut owner = plugin_owner(&fixture);
+    let elsewhere = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    owner.section = support::schema(&format!(
+        "[[configuration.field]]\nname = \"limit\"\nplatforms = [\"{elsewhere}\"]\n",
+    ));
+    let mut store = fixture.load().unwrap();
+    assert!(store.register_discovered_schema(&owner).is_empty());
+    let expected = store.revision();
+    assert!(matches!(
+        store.commit_plugin_user(&owner, "limit", "42", &expected),
+        Err(ConfigError::Setting { .. })
+    ));
+    assert_eq!(store.revision(), expected);
+    assert!(!fixture.config_dir().join("plugins").exists());
+}
+
+#[test]
+fn plugin_enable_transaction_fresh_reads_concurrent_settings_and_retains_session() {
+    let fixture = Fixture::new("plugin-enable-fresh-settings");
+    fixture.user_global("[launcher]\nshow-hints = true\n");
+    let mut package = fixture.load().unwrap();
+    package.set_session_override("launcher.show-hints", "false");
+    let mut settings = fixture.load().unwrap();
+    settings
+        .commit_user_global("launcher.command-home", "favorites", &settings.revision())
+        .unwrap();
+    package
+        .commit_plugin_enabled(&PluginId("modern.example".into()), false)
+        .unwrap();
+    assert_eq!(package.get("launcher.command-home"), Some("favorites"));
+    assert_eq!(package.get("launcher.show-hints"), Some("false"));
+    assert_eq!(package.get("plugins.modern.example.enabled"), Some("false"));
+    let disk = fixture.load().unwrap();
+    assert_eq!(disk.get("launcher.command-home"), Some("favorites"));
+    assert_eq!(disk.get("launcher.show-hints"), Some("true"));
+    assert_eq!(disk.get("plugins.modern.example.enabled"), Some("false"));
+}

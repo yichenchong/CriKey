@@ -65,6 +65,7 @@ pub struct NavigationRestoration {
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NavigationPresentation {
+    pub settings_management: Arc<crate::settings_management::Panel>,
     pub inline_arguments: Option<crate::InlineArguments>,
     pub standard_route: bool,
     pub standard_refresh_pending: bool,

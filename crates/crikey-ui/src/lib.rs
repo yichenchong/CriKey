@@ -17,6 +17,7 @@ use crikey_platform::IconImage;
 pub mod action_panel;
 mod native;
 pub mod navigation;
+pub mod settings_management;
 pub mod standard_view;
 mod typed_input;
 pub use typed_input::{next_inline_input_revision, InlineArguments, TypedInputSubmission};
@@ -661,6 +662,7 @@ pub struct ActionInputReceipt {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    ManageSettings(settings_management::Request),
     StandardSelect {
         context: crikey_core::structured_view::ViewExecutionContext,
         target: crikey_core::structured_arguments::OwnedItem,
@@ -820,6 +822,7 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    ManageSettings(settings_management::Request),
     ExecuteStandard {
         owner: PluginId,
         context: crikey_core::structured_view::ViewExecutionContext,
@@ -1041,6 +1044,7 @@ pub struct LauncherViewModel {
     /// the renderer, which is why this survives `dismiss`.
     settings: Arc<[SettingRow]>,
     setting_edits: Arc<[SettingEditOutcome]>,
+    settings_management: Arc<settings_management::Panel>,
     /// The setting an opening surface should put the keyboard in, by key.
     settings_focus: Option<String>,
     /// The plugin-drawn page the launcher is showing, if any (spec 32).
@@ -1145,6 +1149,7 @@ impl LauncherViewModel {
             settings_open: false,
             settings: Arc::default(),
             setting_edits: Arc::default(),
+            settings_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,
@@ -1622,6 +1627,7 @@ impl LauncherViewModel {
 
     fn navigation_presentation(&self) -> NavigationPresentation {
         NavigationPresentation {
+            settings_management: self.settings_management.clone(),
             standard: self.standard.clone(),
             standard_refresh_pending: self.standard_refresh_pending,
             standard_pointer_source: self.standard_pointer_source.clone(),
@@ -2599,6 +2605,7 @@ impl LauncherViewModel {
                 self.close_page();
                 Some(UiEffect::ClosePage)
             }
+            UiCommand::ManageSettings(request) => Some(UiEffect::ManageSettings(request)),
             UiCommand::SetSetting {
                 request_id,
                 key,
@@ -2793,6 +2800,14 @@ impl LauncherViewModel {
         self.dirty |= self.visible;
     }
 
+    pub fn set_settings_management(&mut self, panel: settings_management::Panel) {
+        if self.settings_management.as_ref() == &panel {
+            return;
+        }
+        self.settings_management = Arc::new(panel);
+        self.dirty |= self.visible;
+    }
+
     /// Replaces what the settings surface lists.
     ///
     /// Accepted while hidden, unlike everything else here, because these rows
@@ -2953,6 +2968,10 @@ impl LauncherViewModel {
 
     pub fn is_settings_open(&self) -> bool {
         self.settings_open
+    }
+
+    pub fn settings_focus(&self) -> Option<&str> {
+        self.settings_focus.as_deref()
     }
 
     /// Shows the settings surface, optionally putting the keyboard in the
@@ -3359,6 +3378,13 @@ impl LauncherViewModel {
             ActionExecution::Host(HostAction::OpenSettings) => {
                 self.open_settings(None).then_some(UiEffect::ClosePage)
             }
+            ActionExecution::Host(HostAction::ConfigureCommand) => {
+                let focus = self.current_action_row().and_then(|row| match &row.target {
+                    ActionTarget::Command(reference) => Some(command_edit_key(reference, false)),
+                    ActionTarget::Result { .. } => None,
+                })?;
+                self.open_settings(Some(&focus)).then_some(UiEffect::ClosePage)
+            }
         }
     }
 
@@ -3495,7 +3521,21 @@ fn action_tree(
         },
         entries: vec![ActionTree::open_settings_entry()],
     };
-    ActionTree::from_flat(row, vec![host]).map(|tree| ActionTree::with_management(tree, row, management))
+    let command = matches!(row.target, ActionTarget::Command(_));
+    let mut entries = Vec::with_capacity(1 + usize::from(command));
+    if command {
+        entries.push(ActionEntry::Host {
+            action: HostAction::ConfigureCommand,
+            presentation: ActionPresentation {
+                label: "Configure command…".into(),
+                description: "Edit this command's aliases, shortcuts and saved preferences.".into(),
+                icon_reference: Some("host:settings".into()),
+                ..Default::default()
+            },
+        });
+    }
+    entries.push(host);
+    ActionTree::from_flat(row, entries).map(|tree| ActionTree::with_management(tree, row, management))
 }
 
 /// Opaque authority to retire one host notice, never a newer unrelated notice.

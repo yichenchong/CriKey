@@ -1328,6 +1328,32 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         "the first resource owner, not a replacement, supplied the decoded icon"
     );
 
+    let proof = driver
+        .control()
+        .request_stop(std::num::NonZeroU64::MIN)
+        .unwrap()
+        .wait()
+        .expect("both real children must be physically settled");
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "exactly the eager query child and first resource child ran; no retry/replacement"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert_eq!(
+        proof.retirement().resource_calls,
+        1,
+        "the first fetch must succeed without a same-worker timeout/retry"
+    );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        1,
+        "exactly one fetch thread must serve the single icon reference"
+    );
+
     // The icon arriving proves a resource child ran; teardown owes the same
     // reaping the query child gets. Both children share this working
     // directory, so its absence covers the pair.
@@ -1386,9 +1412,9 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
 ///
 /// Wire receipt of a distinct retry proves that the serialized first host
 /// fetch has returned without an answer. The original guest callback stays
-/// unanswered until the host sends Shutdown; this does not claim its original
-/// host wait is still pending. Driver teardown and the SDK stop receipt witness
-/// normal settlement, including the latest retry active when teardown began.
+/// unanswered until admission closes; this does not claim its original host
+/// wait is still pending. Checked stop proves final physical settlement,
+/// including any latest retry that was active when admission closed.
 #[test]
 fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
     struct ReleaseSilentOnDrop(PathBuf);
@@ -1503,12 +1529,52 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
         "an icon the guest never answers must never decorate any generation"
     );
 
-    // This version closes admission through driver Drop. The transparent
-    // reader releases the callback only after observing the real Shutdown;
-    // the test must not release it before teardown has actually begun.
+    // Close admission before releasing the callback into the real SDK. Only
+    // then may missing-resource replies drain before its normal Shutdown.
+    let ticket = driver.control().request_stop(std::num::NonZeroU64::MIN).unwrap();
+    drop(release);
+    assert!(gate.join("release").is_file());
+    let proof = ticket
+        .wait()
+        .expect("silent resources and both children must settle");
+    assert_eq!(
+        proof.retirement().resource_calls,
+        3,
+        "exactly the bounded three attempts ran"
+    );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        3,
+        "every admitted fetch thread was joined"
+    );
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "only the query child and original resource child ran"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert!(!gate.join("request-4").exists());
+    assert!(
+        gate.join("answered").is_file(),
+        "release must return through the SDK's real missing-resource response"
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("shutdown")).expect("resource child received real Shutdown"),
+        resource_pid
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("stopped")).expect("resource child ran the SDK stop callback"),
+        resource_pid
+    );
+    assert!(
+        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
+        "responses after admission closes cannot decorate a retired generation"
+    );
     let observable = process_table_contains_working_dir(&package).is_some();
     drop(driver);
-    drop(release);
     let children =
         fs::read_to_string(package.join("icon-child-pids")).expect("physical child receipts are readable");
     let children: Vec<u32> = children
@@ -1537,23 +1603,6 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
                 .iter()
                 .all(|pid| package.join(format!("icon-exit-{pid}")).is_file())
         },
-    );
-    assert!(!gate.join("request-4").exists());
-    assert!(
-        gate.join("answered").is_file(),
-        "release must return through the SDK's real missing-resource response"
-    );
-    assert_eq!(
-        fs::read_to_string(gate.join("shutdown")).expect("resource child received real Shutdown"),
-        resource_pid
-    );
-    assert_eq!(
-        fs::read_to_string(gate.join("stopped")).expect("resource child ran the SDK stop callback"),
-        resource_pid
-    );
-    assert!(
-        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
-        "responses after admission closes cannot decorate a retired generation"
     );
     if observable {
         assert!(
@@ -2539,4 +2588,82 @@ fn real_native_standard_routes_revoke_exact_revision_and_producer_without_root_f
             .is_err(),
         "dead route producer must never be reacquired"
     );
+}
+
+#[test]
+fn checked_native_stop_reaps_processes_and_reuses_the_closed_epoch() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("checked-stop");
+    let root = scratch.subdir("plugins");
+    let package = write_eager_native_plugin(&root, "checked", &conformance, "echo");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load(&mut pipeline, &[root], &DisabledPlugins::default());
+    let owner = native_plugin("checked");
+    assert!(provider.plugins().contains(&owner));
+    if let Some(present) = process_table_contains_working_dir(&package) {
+        assert!(present);
+    }
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| ()));
+    let control = driver.control();
+    let epoch = std::num::NonZeroU64::new(41).unwrap();
+    let ticket = control.request_stop(epoch).unwrap();
+    assert!(!driver.action_executor().owns_item(&owner, &ItemId("echo".into())));
+    let proof = std::thread::spawn(move || ticket.wait()).join().unwrap().unwrap();
+    assert_eq!(proof.epoch(), epoch);
+    assert!(proof.owners().contains(&owner));
+    assert!(!proof.native_exits().is_empty());
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    if process_table_contains_working_dir(&package).is_some() {
+        assert!(wait_for_process_table_absence(&package));
+    }
+    let repeated = control.request_stop(epoch).unwrap().wait().unwrap();
+    assert_eq!(repeated.epoch(), proof.epoch());
+    assert_eq!(repeated.native_exits().len(), proof.native_exits().len());
+    assert!(control
+        .request_stop(std::num::NonZeroU64::new(42).unwrap())
+        .is_err());
+    assert!(driver.command_snapshot(&owner).is_none());
+    assert!(driver.take_outcome().is_none());
+}
+
+#[test]
+fn a_physically_settled_historical_native_crash_does_not_taint_stop() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("checked-crash");
+    let root = scratch.subdir("plugins");
+    // Abort behavior is covered by native-host supervision; this consumer
+    // requires an actual completed nonzero exit, independent of OS reporters.
+    let package = write_native_plugin(&root, "checkedcrash", &conformance, "exit-on-suggest");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    let _ = provider.drive_query(&mut pipeline, "crash", 1);
+    let failures = provider.dispatch_failures().to_vec();
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| ()));
+    let control = driver.control();
+    let epoch = std::num::NonZeroU64::MIN;
+    let proof = control.request_stop(epoch).unwrap().wait().unwrap();
+    assert!(
+        proof
+            .native_exits()
+            .iter()
+            .any(|exit| exit.kind == crikey_native_host::ExitKind::Crashed),
+        "actual exits: {:?}; dispatch failures before stop: {failures:?}",
+        proof.native_exits(),
+    );
+    assert!(control.request_stop(epoch).unwrap().wait().is_ok());
+    assert!(matches!(
+        control.admission().state(),
+        crikey_app::runtime_control::PluginAdmission::Offline { .. }
+    ));
+    if process_table_contains_working_dir(&package).is_some() {
+        assert!(wait_for_process_table_absence(&package));
+    }
 }

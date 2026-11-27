@@ -16,7 +16,10 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Condvar, Mutex, MutexGuard,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -116,6 +119,7 @@ enum IconOrigin {
 
 type ResolvedIcon = Option<Arc<IconImage>>;
 type ResolvedIcons = HashMap<String, HashMap<String, ResolvedIcon>>;
+type IconWorker = ((String, String), thread::JoinHandle<()>);
 
 /// Per-plugin icon resolution with a session memo.
 ///
@@ -133,9 +137,98 @@ pub struct PluginIconResolver {
     /// retryable a bounded number of times. Entries are only created by a
     /// failure, so a healthy launcher never allocates here.
     attempts: Mutex<HashMap<(String, String), u32>>,
+    admission: crate::runtime_control::AdmissionGate,
+    pending: crate::runtime_control::PendingWork,
+    workers: Mutex<Vec<IconWorker>>,
+    failed: AtomicBool,
+    joined: AtomicUsize,
+    shutdown: Mutex<IconShutdown>,
+    shutdown_changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct IconShutdown {
+    waiting: bool,
+    terminal: Option<Result<usize, crate::runtime_control::StopError>>,
 }
 
 impl PluginIconResolver {
+    pub fn set_admission(&mut self, admission: crate::runtime_control::AdmissionGate) {
+        self.admission = admission;
+    }
+
+    pub fn admission(&self) -> crate::runtime_control::AdmissionGate {
+        self.admission.clone()
+    }
+
+    pub fn request_shutdown(
+        &self,
+        epoch: std::num::NonZeroU64,
+    ) -> Result<(), crate::runtime_control::StopError> {
+        self.admission.close(epoch)
+    }
+
+    /// Worker-only physical settlement of this exact resolver's admitted work.
+    pub fn shutdown(&self) -> Result<usize, crate::runtime_control::StopError> {
+        use crate::runtime_control::{PluginAdmission, StopError};
+        if self.admission.state() == PluginAdmission::Open {
+            return Err(StopError::new("resource-admission-open"));
+        }
+        let mut shutdown = lock(&self.shutdown);
+        loop {
+            if let Some(terminal) = &shutdown.terminal {
+                return terminal.clone();
+            }
+            if !shutdown.waiting {
+                shutdown.waiting = true;
+                break;
+            }
+            shutdown = self
+                .shutdown_changed
+                .wait(shutdown)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        drop(shutdown);
+        let settled = self.pending.settle();
+        let workers = std::mem::take(&mut *lock(&self.workers));
+        for (key, worker) in workers {
+            if worker.join().is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
+            self.joined.fetch_add(1, Ordering::AcqRel);
+            lock(&self.inflight).remove(&key);
+        }
+        let result = settled.and_then(|_| {
+            if self.failed.load(Ordering::Acquire) {
+                Err(StopError::new("resource-worker-failed"))
+            } else {
+                Ok(self.joined.load(Ordering::Acquire))
+            }
+        });
+        lock(&self.shutdown).terminal = Some(result.clone());
+        self.shutdown_changed.notify_all();
+        result
+    }
+
+    fn reap_finished(&self) {
+        loop {
+            let ready = {
+                let mut workers = lock(&self.workers);
+                workers
+                    .iter()
+                    .position(|(_, worker)| worker.is_finished())
+                    .map(|index| workers.swap_remove(index))
+            };
+            let Some((key, worker)) = ready else {
+                return;
+            };
+            if worker.join().is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
+            self.joined.fetch_add(1, Ordering::AcqRel);
+            lock(&self.inflight).remove(&key);
+        }
+    }
     /// Records that `plugin` keeps its icons in `directory`.
     ///
     /// This read is host-mediated: the launcher opens a file inside another
@@ -175,6 +268,10 @@ impl PluginIconResolver {
     /// icon and asks again on the next frame, because a frame that is otherwise
     /// ready must not wait on a picture.
     pub fn resolve(self: &Arc<Self>, plugin: &str, reference: &str) -> Option<Arc<IconImage>> {
+        let admission = self.admission.admit().ok()?;
+        let _pending = self.pending.begin();
+        drop(admission);
+        self.reap_finished();
         if let Some(memo) = lock(&self.resolved)
             .get(plugin)
             .and_then(|references| references.get(reference))
@@ -230,9 +327,16 @@ impl PluginIconResolver {
             inflight.insert(key.clone());
         }
         let resolver = Arc::clone(self);
+        let Ok(admission) = self.admission.admit() else {
+            lock(&self.inflight).remove(&(plugin.to_owned(), reference.to_owned()));
+            return;
+        };
+        let pending = self.pending.begin();
+        let worker_key = (plugin.to_owned(), reference.to_owned());
         let spawned = thread::Builder::new()
             .name("crikey-plugin-icon".to_owned())
             .spawn(move || {
+                let _pending = pending;
                 match source.fetch(&key.1) {
                     // Bytes that will not decode are the plugin's answer, not a
                     // failure to reach it: asking again produces the same bytes.
@@ -262,16 +366,21 @@ impl PluginIconResolver {
                         }
                     }
                 }
-                lock(&resolver.inflight).remove(&key);
             });
-        if let Err(error) = spawned {
-            // Nothing will clear the slot if the thread never existed.
-            let _ = error;
-            lock(&self.inflight).remove(&(plugin.to_owned(), reference.to_owned()));
+        match spawned {
+            Ok(worker) => lock(&self.workers).push((worker_key, worker)),
+            Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                lock(&self.inflight).remove(&worker_key);
+            }
         }
+        drop(admission);
     }
 
     fn store(&self, plugin: &str, reference: &str, image: Option<Arc<IconImage>>) {
+        let Ok(_admission) = self.admission.admit() else {
+            return;
+        };
         let mut resolved = lock(&self.resolved);
         if resolved.values().map(HashMap::len).sum::<usize>() >= MAX_RESOLVED_ICONS {
             resolved.clear();
@@ -517,19 +626,11 @@ mod tests {
             references.len(),
             "every silent reference settles, so no fetch slot was kept"
         );
-        // The worker writes the memo and only then gives the slot back, so a
-        // loop that stops the instant the memo is complete can look between
-        // those two steps. On a loaded runner that gap is wide enough to see:
-        // this waits for the release rather than asserting it has already
-        // happened, which is the same contract without the race.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline && !lock(&resolver.inflight).is_empty() {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            lock(&resolver.inflight).is_empty(),
-            "no outstanding request survives its own fetch"
-        );
+        // Shutdown closes new admission and proves physical thread settlement,
+        // not merely that a fetch removed its pending key.
+        resolver.request_shutdown(std::num::NonZeroU64::MIN).unwrap();
+        assert_eq!(resolver.shutdown().unwrap(), references.len());
+        assert!(lock(&resolver.inflight).is_empty());
         assert_eq!(
             source.fetches.load(Ordering::Relaxed) as usize,
             references.len(),
@@ -636,5 +737,65 @@ mod tests {
             spent,
             "a reference that gave up is not asked again"
         );
+    }
+
+    #[test]
+    fn shutdown_joins_an_admitted_fetch_and_refuses_its_late_publication() {
+        #[derive(Debug)]
+        struct BlockedSource {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl PluginResourceSource for BlockedSource {
+            fn fetch(&self, _: &str) -> IconFetch {
+                self.entered.send(()).unwrap();
+                lock(&self.release).recv().unwrap();
+                IconFetch::Absent
+            }
+        }
+        let (entered, observe) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let plugin = PluginId("native.closing".into());
+        let mut resolver = PluginIconResolver::default();
+        resolver.insert_served(
+            &plugin,
+            Arc::new(BlockedSource {
+                entered,
+                release: Mutex::new(wait),
+            }),
+        );
+        let resolver = Arc::new(resolver);
+        assert!(resolver.resolve(&plugin.0, "pending.svg").is_none());
+        observe.recv_timeout(Duration::from_secs(10)).unwrap();
+        resolver.request_shutdown(std::num::NonZeroU64::MIN).unwrap();
+        assert!(resolver.resolve(&plugin.0, "new.svg").is_none());
+        let owner = Arc::clone(&resolver);
+        let shutdown = thread::spawn(move || owner.shutdown());
+        release.send(()).unwrap();
+        assert_eq!(shutdown.join().unwrap().unwrap(), 1);
+        assert!(lock(&resolver.resolved).is_empty());
+        assert!(lock(&resolver.inflight).is_empty());
+        assert_eq!(resolver.shutdown().unwrap(), 1);
+    }
+
+    #[test]
+    fn resource_panic_is_physically_joined_and_retained_as_failure() {
+        #[derive(Debug)]
+        struct PanickingSource;
+        impl PluginResourceSource for PanickingSource {
+            fn fetch(&self, _: &str) -> IconFetch {
+                panic!("untrusted fixture diagnostic");
+            }
+        }
+        let plugin = PluginId("native.panicking".into());
+        let mut resolver = PluginIconResolver::default();
+        resolver.insert_served(&plugin, Arc::new(PanickingSource));
+        let resolver = Arc::new(resolver);
+        resolver.resolve(&plugin.0, "panic.svg");
+        resolver.request_shutdown(std::num::NonZeroU64::MIN).unwrap();
+        let first = resolver.shutdown().unwrap_err();
+        assert_eq!(first, resolver.shutdown().unwrap_err());
+        assert!(!first.code.contains("untrusted"));
+        assert!(lock(&resolver.inflight).is_empty());
     }
 }

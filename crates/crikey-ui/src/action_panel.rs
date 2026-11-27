@@ -51,6 +51,7 @@ impl ActionTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostAction {
     OpenSettings,
+    ConfigureCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

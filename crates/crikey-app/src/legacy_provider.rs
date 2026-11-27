@@ -49,6 +49,12 @@
 //! callback that fails degrades to "that plugin is unavailable" with a recorded
 //! diagnostic. None of them aborts discovery, wedges the pipeline, or takes down
 //! the process.
+//!
+//! Permanent shutdown fences the driver's escaped action endpoint and all host
+//! actions before signalling active callbacks. The existing supervisor retires
+//! queued work, shuts down the provider, and joins every worker pipe thread;
+//! only its successful join can mint the whole-owner stopped ledger. Legacy
+//! configuration remains in its existing compatibility format.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -57,7 +63,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crikey_core::{
@@ -80,6 +86,7 @@ use crikey_python_host::RuntimeProfile;
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::plugin_icons::PluginIconResolver;
+use crate::runtime_control::{AdmissionGate, DriverControl, StopError, StoppedRuntime};
 use crate::{
     ActionRequestId, BatchState, CatalogBuild, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
     HostCapability, PluginActionCompletion, PluginActionRouter, QueryPipeline, ResultBatch,
@@ -183,15 +190,17 @@ impl LegacyCallControl {
 
 #[derive(Debug, Default)]
 struct LegacyCancellation {
+    stopped: AtomicBool,
     calls: Mutex<BTreeMap<PluginId, (LegacyCallback, Arc<LegacyCallControl>)>>,
 }
 
 impl LegacyCancellation {
     fn register(&self, plugin: PluginId, callback: LegacyCallback, control: Arc<LegacyCallControl>) {
-        self.calls
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(plugin, (callback, control));
+        let mut calls = self.calls.lock().unwrap_or_else(|error| error.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            control.signal();
+        }
+        calls.insert(plugin, (callback, control));
     }
 
     fn unregister(&self, plugin: &PluginId) {
@@ -216,6 +225,7 @@ impl LegacyCancellation {
     }
 
     fn signal_all(&self) {
+        self.stopped.store(true, Ordering::Release);
         let controls = self
             .calls
             .lock()
@@ -258,6 +268,7 @@ pub struct LegacyWorkerPool {
     failures: Vec<(PluginId, String)>,
     dead: BTreeSet<PluginId>,
     cancellation: Arc<LegacyCancellation>,
+    stop_error: Option<WorkerError>,
 }
 
 impl LegacyWorkerPool {
@@ -281,6 +292,13 @@ impl LegacyWorkerPool {
 
 impl LegacyWorkerHandle for LegacyWorkerPool {
     fn dispatch(&mut self, _at_ms: Millis, request: &LegacyRequest) -> Result<(), WorkerError> {
+        if self.cancellation.stopped.load(Ordering::Acquire) {
+            return Err(WorkerError::Io {
+                plugin: Some(request.plugin.clone()),
+                operation: "admitting a legacy callback".to_owned(),
+                message: "legacy runtime is stopping".to_owned(),
+            });
+        }
         let Some(worker) = self.workers.get_mut(&request.plugin) else {
             let error = WorkerError::Io {
                 plugin: Some(request.plugin.clone()),
@@ -300,17 +318,34 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
             .name(format!("crikey-legacy-terminate-{}", request.plugin.0))
             .spawn(move || control_for_thread.watch_signal());
         // The callback genuinely runs in the child process here (spec 4.2).
-        let result = worker.call(request.clone());
+        let result = match catch_unwind(AssertUnwindSafe(|| worker.call(request.clone()))) {
+            Ok(result) => result,
+            Err(_) => {
+                let error = WorkerError::Io {
+                    plugin: Some(request.plugin.clone()),
+                    operation: "executing a legacy callback".to_owned(),
+                    message: "legacy callback host panicked".to_owned(),
+                };
+                self.stop_error = Some(error.clone());
+                Err(error)
+            }
+        };
         control.finish();
-        if let Ok(watcher) = watcher {
-            let _ = watcher.join();
+        if !watcher.map(|watcher| watcher.join().is_ok()).unwrap_or(false) {
+            self.stop_error = Some(WorkerError::Io {
+                plugin: Some(request.plugin.clone()),
+                operation: "joining legacy cancellation watcher".to_owned(),
+                message: "cancellation watcher failed".to_owned(),
+            });
         }
         self.cancellation.unregister(&request.plugin);
         if let Err(error) = &result {
+            if self.cancellation.stopped.load(Ordering::Acquire) {
+                self.stop_error.get_or_insert_with(|| error.clone());
+            }
             // A crashed or unresponsive worker is contained: the runtime
             // frees the instance on this `Err`, and the failure is recorded
             // once so a diagnostic can name the plugin (spec 24.1, 26.2).
-            self.workers.remove(&request.plugin);
             self.record_failure(request.plugin.clone(), error.to_string());
         }
         match result {
@@ -359,12 +394,18 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
     }
 
     fn stop(&mut self, _at_ms: Millis, _budget_ms: Millis) -> Result<(), WorkerError> {
-        for (_, worker) in std::mem::take(&mut self.workers) {
-            // A tidy teardown is best effort: the child is reaped on drop even
-            // if the orderly shutdown reports an error, so no worker is leaked.
-            let _ = worker.shutdown();
+        let stop_error = &mut self.stop_error;
+        self.workers.retain(|_, worker| match worker.shutdown() {
+            Ok(_) => false,
+            Err(error) => {
+                stop_error.get_or_insert(error);
+                true
+            }
+        });
+        match &self.stop_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -386,6 +427,7 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
 #[derive(Default)]
 struct LegacyHostActions {
     router: Mutex<Option<Arc<PluginActionRouter>>>,
+    gate: AdmissionGate,
 }
 
 impl fmt::Debug for LegacyHostActions {
@@ -406,6 +448,8 @@ impl LegacyHostActions {
 
 impl LegacyHostService for LegacyHostActions {
     fn execute_default_action(&self, request: &LegacyDefaultAction) -> Result<bool, String> {
+        let admission = self.gate.admit().map_err(|error| error.to_string())?;
+        drop(admission);
         let installed = self
             .router
             .lock()
@@ -476,6 +520,7 @@ fn perform_default_action(item: &Item) -> Result<(), String> {
 pub struct LegacyProvider {
     runtime: LegacyRuntime<LegacyWorkerPool>,
     plugins: Vec<PluginId>,
+    startup_owners: BTreeSet<PluginId>,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     unavailable: Vec<LegacyUnavailable>,
     cancellation: Arc<LegacyCancellation>,
@@ -492,6 +537,7 @@ pub struct LegacyProvider {
     /// Content root of each loaded package, so the icon resolver can read the
     /// files a plugin's `load_icon` named (spec 11.7, 14.4).
     package_dirs: BTreeMap<PluginId, PathBuf>,
+    icons: Option<Arc<PluginIconResolver>>,
     /// Shared by every worker, so one router installation reaches them all.
     host_actions: Arc<LegacyHostActions>,
 }
@@ -557,6 +603,7 @@ impl LegacyProvider {
                 deadlines,
             ),
             plugins: Vec::new(),
+            startup_owners: BTreeSet::new(),
             budgets: BTreeMap::new(),
             unavailable: Vec::new(),
             cancellation,
@@ -566,6 +613,7 @@ impl LegacyProvider {
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
             package_dirs: BTreeMap::new(),
+            icons: None,
             host_actions: Arc::new(LegacyHostActions::default()),
         };
 
@@ -659,6 +707,9 @@ impl LegacyProvider {
         directories: &LegacyDirectories,
         disabled: &DisabledPlugins,
     ) {
+        if self.runtime.worker_mut().stop_error.is_some() {
+            return;
+        }
         let plugin = plugin_of(package);
         // Held back before the child interpreter is spawned: an operator who
         // disabled a plugin must not pay for its process, and the only proof
@@ -688,17 +739,26 @@ impl LegacyProvider {
             options = options.with_installed_package_dir(installed);
         }
 
-        let worker = match LegacyWorker::spawn(interpreter, package, options) {
+        let mut worker = match LegacyWorker::spawn(interpreter, package, options) {
             Ok(worker) => worker,
-            Err(error) => {
+            Err(failure) => {
+                if failure.process_created {
+                    self.startup_owners.insert(plugin.clone());
+                }
+                if let Some(worker) = failure.worker {
+                    self.runtime.worker_mut().stop_error = Some(failure.error);
+                    self.runtime.worker_mut().insert(plugin.clone(), worker);
+                    self.cancellation.signal_all();
+                }
                 self.unavailable.push(LegacyUnavailable {
                     package: package.id.to_string(),
                     plugin: Some(plugin),
-                    reason: format!("the legacy worker did not start: {error}"),
+                    reason: "legacy-worker-startup-failed".to_owned(),
                 });
                 return;
             }
         };
+        self.startup_owners.insert(plugin.clone());
 
         // Reuse the pipeline's own `legacy-strict` policy rather than inventing
         // a second scheduling path: this is exactly what the pipeline derives
@@ -710,12 +770,16 @@ impl LegacyProvider {
         ) {
             self.unavailable.push(LegacyUnavailable {
                 package: package.id.to_string(),
-                plugin: Some(plugin),
+                plugin: Some(plugin.clone()),
                 reason: format!("the query pipeline refused the legacy plugin: {error:?}"),
             });
             // The worker was spawned; reap it rather than leak a child for a
             // plugin the pipeline will never dispatch.
-            let _ = worker.shutdown();
+            if let Err(error) = worker.shutdown() {
+                self.runtime.worker_mut().stop_error = Some(error);
+                self.runtime.worker_mut().insert(plugin, worker);
+                self.cancellation.signal_all();
+            }
             return;
         }
 
@@ -742,13 +806,16 @@ impl LegacyProvider {
     /// it has to be the same value everywhere it is consulted — otherwise
     /// `crikey plugin doctor` would be describing a posture the icon path does
     /// not actually use.
-    fn install_icon_resolver(&self, pipeline: &mut QueryPipeline) {
+    fn install_icon_resolver(&mut self, pipeline: &mut QueryPipeline) {
         let baseline = Permissions::legacy_compatibility_baseline();
         let mut resolver = PluginIconResolver::default();
+        resolver.set_admission(self.host_actions.gate.clone());
         for (plugin, directory) in &self.package_dirs {
             resolver.insert_package(plugin, directory.clone(), &baseline);
         }
-        pipeline.set_plugin_icons(Arc::new(resolver));
+        let resolver = Arc::new(resolver);
+        pipeline.set_plugin_icons(Arc::clone(&resolver));
+        self.icons = Some(resolver);
     }
 
     /// The legacy plugins that loaded and are being served through the pipeline.
@@ -1251,6 +1318,7 @@ enum LegacyWork {
 #[derive(Debug)]
 struct LegacyActionEndpoint {
     sender: SyncSender<LegacyActionRequest>,
+    gate: AdmissionGate,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     action_wake: crate::plugin_action::CompletionWake,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
@@ -1296,6 +1364,7 @@ impl crate::PluginActionExecutor for LegacyActionEndpoint {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> crikey_core::Result<ActionRequestId> {
+        let _admission = self.gate.admit().map_err(|_| crikey_core::CoreError::Cancelled)?;
         // The item is resolved from the provider's own snapshot, never from
         // what the caller echoed back, so a superseded row cannot reach a
         // plugin callback.
@@ -1469,7 +1538,8 @@ pub struct LegacyDriver {
     /// Cloned out of the provider before it moves onto the supervisor thread,
     /// so the router can still be installed after the driver owns everything.
     host_actions: Arc<LegacyHostActions>,
-    worker: Option<JoinHandle<()>>,
+    control: DriverControl,
+    supervisor_alive: bool,
 }
 
 impl LegacyDriver {
@@ -1491,6 +1561,11 @@ impl LegacyDriver {
         P: Fn(&ViewModel) + Send + 'static,
     {
         let has_plugins = !provider.plugins().is_empty();
+        let owners: Arc<[PluginId]> = std::mem::take(&mut provider.startup_owners)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into();
+        let gate = provider.host_actions.gate.clone();
         let mailbox = Arc::new((
             Mutex::new(RequestSlot {
                 job: None,
@@ -1509,6 +1584,7 @@ impl LegacyDriver {
         let completion_mailbox = Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_COMPLETION_CAPACITY)));
         let action_endpoint = Arc::new(LegacyActionEndpoint {
             sender: action_sender,
+            gate: gate.clone(),
             completions: Arc::clone(&completion_mailbox),
             action_wake: crate::plugin_action::CompletionWake::default(),
             budgets: provider.action_budgets(),
@@ -1528,209 +1604,262 @@ impl LegacyDriver {
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let thread_action_wake = action_endpoint.action_wake.clone();
         let thread_in_flight = Arc::clone(&action_endpoint.in_flight);
+        // Failed cleanup stays owned for the entire DriverControl lifetime.
+        let failed_provider = Arc::new(Mutex::new(Some(provider)));
+        let thread_failed_provider = Arc::clone(&failed_provider);
         let spawned = std::thread::Builder::new()
             .name("crikey-legacy".to_owned())
             .spawn(move || {
-                let (lock, cvar) = &*thread_mailbox;
-                let mut last_now: Millis = 0;
-                // Catalog rebuilds admitted before the thread existed run
-                // first: `on_catalog` is a child-interpreter callback and this
-                // is the only thread allowed to make one.
-                let startup_catalogs = provider.drive_catalogs(0);
-                if !startup_catalogs.is_empty() {
-                    thread_catalog_results
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .extend(startup_catalogs);
-                }
-                *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
-                    pipeline.plugin_health_report();
-                loop {
-                    let work = {
-                        let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
-                        loop {
-                            if slot.stop {
-                                // Every admitted action is retired, so no UI
-                                // request is left waiting on a thread that is
-                                // about to exit.
-                                while let Ok(request) = action_receiver.try_recv() {
-                                    thread_in_flight.fetch_sub(1, Ordering::AcqRel);
-                                    enqueue_legacy_completion(
-                                        &thread_completion_mailbox,
-                                        &thread_action_wake,
-                                        PluginActionCompletion {
-                                            request_id: request.request_id.clone(),
-                                            plugin: request.plugin.clone(),
-                                            item_id: request.item_id.clone(),
-                                            action_id: Some(request.action_id.clone()),
-                                            outcome: Err(crikey_core::CoreError::Cancelled),
-                                        },
-                                    );
-                                }
-                                // Cooperative teardown of every child before the
-                                // thread exits, so no worker is leaked (spec 9.6,
-                                // 24.3); dropping `provider` reaps whatever an
-                                // orderly shutdown could not.
-                                drop(slot);
-                                provider.shutdown(last_now);
-                                return;
-                            }
-                            // An action is a user-initiated launch and outranks
-                            // a queued keystroke, which the mailbox will still
-                            // coalesce to the newest query anyway.
-                            if let Ok(request) = action_receiver.try_recv() {
-                                break LegacyWork::Action(Box::new(request));
-                            }
-                            if let Some(job) = slot.job.take() {
-                                break LegacyWork::Query(job);
-                            }
-                            slot = cvar.wait(slot).unwrap_or_else(|error| error.into_inner());
-                        }
-                    };
-
-                    let job = match work {
-                        LegacyWork::Action(request) => {
-                            let request_id = request.request_id.clone();
-                            let plugin = request.plugin.clone();
-                            let item_id = request.item_id.clone();
-                            let action_id = request.action_id.clone();
-                            let expired = Instant::now() >= request.deadline;
-                            let outcome = if expired {
-                                Err(crikey_core::CoreError::Invalid(format!(
-                                    "legacy plugin `{}` action timed out before execution",
-                                    plugin.0
-                                )))
-                            } else {
-                                // `on_execute` runs here, serialized with every
-                                // other callback this thread makes, so no two
-                                // callbacks ever overlap on one instance
-                                // (spec 14.5).
-                                match catch_unwind(AssertUnwindSafe(|| {
-                                    provider.execute_action_request(*request)
-                                })) {
-                                    Ok(result) => result,
-                                    Err(_) => Err(crikey_core::CoreError::Invalid(format!(
-                                        "legacy plugin `{}` action worker panicked",
-                                        plugin.0
-                                    ))),
-                                }
-                            };
-                            thread_in_flight.fetch_sub(1, Ordering::AcqRel);
-                            enqueue_legacy_completion(
-                                &thread_completion_mailbox,
-                                &thread_action_wake,
-                                PluginActionCompletion {
-                                    request_id,
-                                    plugin,
-                                    item_id,
-                                    action_id: Some(action_id),
-                                    outcome: outcome.map(|()| crate::ActionEffect::Completed),
-                                },
-                            );
-                            *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
-                                pipeline.plugin_health_report();
-                            continue;
-                        }
-                        LegacyWork::Query(job) => job,
-                    };
-                    last_now = job.now;
-
-                    // The blocking child interpreter call happens here, on this
-                    // thread — never on the caller's. Stale answers are refused
-                    // at the pipeline's intake boundary inside `drive_query`.
-                    let legacy = provider.drive_query(&mut pipeline, &job.query, job.now);
-                    let catalogs = provider.drive_catalogs(job.now);
-                    if !catalogs.is_empty() {
+                let mut provider = thread_failed_provider
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .expect("legacy supervisor owns its provider");
+                let terminal = catch_unwind(AssertUnwindSafe(|| {
+                    let (lock, cvar) = &*thread_mailbox;
+                    let mut last_now: Millis = 0;
+                    // Catalog rebuilds admitted before the thread existed run
+                    // first: `on_catalog` is a child-interpreter callback and this
+                    // is the only thread allowed to make one.
+                    let startup_catalogs = provider.drive_catalogs(0);
+                    if !startup_catalogs.is_empty() {
                         thread_catalog_results
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .extend(catalogs);
+                            .extend(startup_catalogs);
                     }
                     *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                         pipeline.plugin_health_report();
+                    loop {
+                        let work = {
+                            let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                            loop {
+                                if slot.stop {
+                                    // Every admitted action is retired, so no UI
+                                    // request is left waiting on a thread that is
+                                    // about to exit.
+                                    while let Ok(request) = action_receiver.try_recv() {
+                                        thread_in_flight.fetch_sub(1, Ordering::AcqRel);
+                                        enqueue_legacy_completion(
+                                            &thread_completion_mailbox,
+                                            &thread_action_wake,
+                                            PluginActionCompletion {
+                                                request_id: request.request_id.clone(),
+                                                plugin: request.plugin.clone(),
+                                                item_id: request.item_id.clone(),
+                                                action_id: Some(request.action_id.clone()),
+                                                outcome: Err(crikey_core::CoreError::Cancelled),
+                                            },
+                                        );
+                                    }
+                                    // Cooperative teardown of every child before the
+                                    // thread exits, so no worker is leaked (spec 9.6,
+                                    // 24.3); dropping `provider` reaps whatever an
+                                    // orderly shutdown could not.
+                                    drop(slot);
+                                    provider.shutdown(last_now);
+                                    provider.catalog_requests.clear();
+                                    let icons =
+                                        provider.icons.as_ref().map(|icons| icons.shutdown()).transpose();
+                                    if icons.is_err() {
+                                        return Err(StopError::new("legacy-icon-teardown-failed"));
+                                    }
+                                    return match &provider.runtime.worker_mut().stop_error {
+                                        Some(_) => Err(StopError::new("legacy-worker-teardown-failed")),
+                                        None => Ok(()),
+                                    };
+                                }
+                                // An action is a user-initiated launch and outranks
+                                // a queued keystroke, which the mailbox will still
+                                // coalesce to the newest query anyway.
+                                if let Ok(request) = action_receiver.try_recv() {
+                                    break LegacyWork::Action(Box::new(request));
+                                }
+                                if let Some(job) = slot.job.take() {
+                                    break LegacyWork::Query(job);
+                                }
+                                slot = cvar.wait(slot).unwrap_or_else(|error| error.into_inner());
+                            }
+                        };
 
-                    // Tag the frame with the search generation from the job, not
-                    // the legacy pipeline's own counter: coalesced (superseded)
-                    // queries are dropped at the mailbox, so that counter is not
-                    // in lockstep with the generation the UI published under.
-                    let mut rows = job.builtin_rows;
-                    let mut pending = job.builtin_pending;
-                    if let Some(frame) = legacy {
-                        rows.extend(frame.rows.iter().cloned());
-                        pending |= frame.pending_plugins;
-                    }
-                    let merged = ViewModel {
-                        view: None,
-                        input_receipt: None,
-                        generation: job.generation,
-                        query: job.query,
-                        rows: rows.into(),
-                        selected: job.selected,
-                        root_selection_revision: 0,
-                        pending_plugins: pending,
-                        action_panel: None,
-                        settings_open: false,
-                        settings: Arc::default(),
-                        settings_focus: None,
-                        command_management: Arc::default(),
-                        setting_edits: Arc::default(),
-                        show_hints: true,
-                        rounded_corners: true,
-                        page: None,
-                        preview: Default::default(),
-                        navigation: Default::default(),
-                    };
+                        let job = match work {
+                            LegacyWork::Action(request) => {
+                                let request_id = request.request_id.clone();
+                                let plugin = request.plugin.clone();
+                                let item_id = request.item_id.clone();
+                                let action_id = request.action_id.clone();
+                                let expired = Instant::now() >= request.deadline;
+                                let outcome = if expired {
+                                    Err(crikey_core::CoreError::Invalid(format!(
+                                        "legacy plugin `{}` action timed out before execution",
+                                        plugin.0
+                                    )))
+                                } else {
+                                    // `on_execute` runs here, serialized with every
+                                    // other callback this thread makes, so no two
+                                    // callbacks ever overlap on one instance
+                                    // (spec 14.5).
+                                    match catch_unwind(AssertUnwindSafe(|| {
+                                        provider.execute_action_request(*request)
+                                    })) {
+                                        Ok(result) => result,
+                                        Err(_) => {
+                                            provider.runtime.worker_mut().stop_error =
+                                                Some(WorkerError::Io {
+                                                    plugin: Some(plugin.clone()),
+                                                    operation: "executing a legacy action".to_owned(),
+                                                    message: "action supervisor callback panicked".to_owned(),
+                                                });
+                                            Err(crikey_core::CoreError::Invalid(format!(
+                                                "legacy plugin `{}` action worker panicked",
+                                                plugin.0
+                                            )))
+                                        }
+                                    }
+                                };
+                                thread_in_flight.fetch_sub(1, Ordering::AcqRel);
+                                enqueue_legacy_completion(
+                                    &thread_completion_mailbox,
+                                    &thread_action_wake,
+                                    PluginActionCompletion {
+                                        request_id,
+                                        plugin,
+                                        item_id,
+                                        action_id: Some(action_id),
+                                        outcome: outcome.map(|()| crate::ActionEffect::Completed),
+                                    },
+                                );
+                                *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                                    pipeline.plugin_health_report();
+                                continue;
+                            }
+                            LegacyWork::Query(job) => job,
+                        };
+                        last_now = job.now;
 
-                    // Keep the staleness check, queued-job check, and
-                    // publication atomic with respect to `submit`. Without
-                    // the mailbox lock, a newer submission could arrive after
-                    // the load below but before this frame is published.
-                    let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
-                    if slot.stop
-                        || slot.job.is_some()
-                        || thread_current.load(Ordering::Acquire) != job.generation.get()
-                    {
-                        continue;
+                        // The blocking child interpreter call happens here, on this
+                        // thread — never on the caller's. Stale answers are refused
+                        // at the pipeline's intake boundary inside `drive_query`.
+                        let legacy = provider.drive_query(&mut pipeline, &job.query, job.now);
+                        let catalogs = provider.drive_catalogs(job.now);
+                        if !catalogs.is_empty() {
+                            thread_catalog_results
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .extend(catalogs);
+                        }
+                        *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                            pipeline.plugin_health_report();
+
+                        // Tag the frame with the search generation from the job, not
+                        // the legacy pipeline's own counter: coalesced (superseded)
+                        // queries are dropped at the mailbox, so that counter is not
+                        // in lockstep with the generation the UI published under.
+                        let mut rows = job.builtin_rows;
+                        let mut pending = job.builtin_pending;
+                        if let Some(frame) = legacy {
+                            rows.extend(frame.rows.iter().cloned());
+                            pending |= frame.pending_plugins;
+                        }
+                        let merged = ViewModel {
+                            view: None,
+                            input_receipt: None,
+                            generation: job.generation,
+                            query: job.query,
+                            rows: rows.into(),
+                            selected: job.selected,
+                            root_selection_revision: 0,
+                            pending_plugins: pending,
+                            action_panel: None,
+                            settings_open: false,
+                            settings: Arc::default(),
+                            settings_focus: None,
+                            command_management: Arc::default(),
+                            setting_edits: Arc::default(),
+                            show_hints: true,
+                            rounded_corners: true,
+                            page: None,
+                            preview: Default::default(),
+                            navigation: Default::default(),
+                        };
+
+                        // Keep the staleness check, queued-job check, and
+                        // publication atomic with respect to `submit`. Without
+                        // the mailbox lock, a newer submission could arrive after
+                        // the load below but before this frame is published.
+                        let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                        if slot.stop
+                            || slot.job.is_some()
+                            || thread_current.load(Ordering::Acquire) != job.generation.get()
+                        {
+                            continue;
+                        }
+                        let mut summary = pipeline.ordinary_search_summary(0);
+                        summary.generation = job.generation;
+                        *thread_search_summary
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = Some(summary);
+                        *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some(merged.clone());
+                        publish(&merged);
+                        drop(slot);
                     }
-                    let mut summary = pipeline.ordinary_search_summary(0);
-                    summary.generation = job.generation;
-                    *thread_search_summary
+                }))
+                .unwrap_or_else(|_| Err(StopError::new("legacy-supervisor-panicked")));
+                if terminal.is_err() {
+                    // Retry bounded physical cleanup after a panic as well.
+                    provider.shutdown(0);
+                    *thread_failed_provider
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(summary);
-                    *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
-                    publish(&merged);
-                    drop(slot);
+                        .unwrap_or_else(|error| error.into_inner()) = Some(provider);
                 }
+                terminal
             });
 
-        match spawned {
-            Ok(worker) => Self {
-                mailbox,
-                action_endpoint,
-                catalog_results,
-                health,
-                outcome,
-                search_summary,
-                current,
-                cancellation,
-                has_plugins,
-                host_actions,
-                worker: Some(worker),
+        let supervisor_alive = spawned.is_ok();
+        let signal_mailbox = Arc::clone(&mailbox);
+        let signal_cancellation = Arc::clone(&cancellation);
+        let ledger_owners = Arc::clone(&owners);
+        let control = DriverControl::new(
+            "legacy",
+            owners,
+            gate,
+            move || {
+                let _retained_failure_owner = &failed_provider;
+                signal_cancellation.signal_all();
+                let (lock, wake) = &*signal_mailbox;
+                let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                slot.stop = true;
+                slot.job = None;
+                wake.notify_all();
             },
-            Err(_) => Self {
-                mailbox,
-                action_endpoint,
-                catalog_results,
-                health,
-                outcome,
-                search_summary,
-                current,
-                cancellation,
-                has_plugins: false,
-                host_actions,
-                worker: None,
+            move |epoch| {
+                let worker = spawned.map_err(|_| StopError::new("legacy-supervisor-spawn-failed"))?;
+                worker
+                    .join()
+                    .map_err(|_| StopError::new("legacy-supervisor-panicked"))??;
+                Ok(StoppedRuntime::validated("legacy", epoch, ledger_owners))
             },
+        );
+        Self {
+            mailbox,
+            action_endpoint,
+            catalog_results,
+            health,
+            outcome,
+            search_summary,
+            current,
+            cancellation,
+            has_plugins: has_plugins && supervisor_alive,
+            host_actions,
+            control,
+            supervisor_alive,
         }
+    }
+
+    /// Permanent whole-owner shutdown; wait for the ticket off the UI thread.
+    pub fn control(&self) -> DriverControl {
+        self.control.clone()
     }
 
     /// Installs the terminal action notification independently of result wakes.
@@ -1761,6 +1890,10 @@ impl LegacyDriver {
         builtin_pending: bool,
         selected: usize,
     ) {
+        let admission = self.control.admission();
+        let Ok(_admission) = admission.admit() else {
+            return;
+        };
         // Keep intake monotonic even when a caller hands us a decoded
         // generation from an older request. Rewinding `current` would let an
         // obsolete job pass the publication gate.
@@ -1801,7 +1934,7 @@ impl LegacyDriver {
                     .into_iter()
                     .map(|plugin| crate::query_pipeline::OrdinarySearchProvider {
                         plugin,
-                        state: if self.worker.is_some() {
+                        state: if self.supervisor_alive {
                             crate::command_preferences::OrdinaryProviderState::Pending
                         } else {
                             crate::command_preferences::OrdinaryProviderState::Failed
@@ -1915,20 +2048,15 @@ impl LegacyDriver {
 
 impl Drop for LegacyDriver {
     fn drop(&mut self) {
-        // Raise cooperative termination before joining the supervisor so an
-        // in-flight callback can return instead of delaying teardown.
-        self.cancellation.signal_all();
-        // Signal shutdown and join, so the supervisor thread and every child it
-        // owns are torn down with the launcher — no thread leak.
-        {
-            let (lock, cvar) = &*self.mailbox;
-            let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
-            slot.stop = true;
-            drop(slot);
-            cvar.notify_one();
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        // The shared control retains the exact terminal result for escaped clones.
+        let epoch = match self.control.admission().state() {
+            crate::runtime_control::PluginAdmission::Open => std::num::NonZeroU64::MIN,
+            crate::runtime_control::PluginAdmission::Closing { epoch }
+            | crate::runtime_control::PluginAdmission::Offline { epoch }
+            | crate::runtime_control::PluginAdmission::FailedClosed { epoch } => epoch,
+        };
+        if let Ok(ticket) = self.control.request_stop(epoch) {
+            let _ = ticket.wait();
         }
     }
 }

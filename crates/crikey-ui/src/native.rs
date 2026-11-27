@@ -313,6 +313,7 @@ struct DeferredActionInput {
     token: u64,
     source: Arc<crate::ActionInputCheckpoint>,
     focus_ready: bool,
+    settings_owner: Option<crate::settings_management::FocusOwner>,
     typed_focus: Option<egui::Id>,
     events: Vec<egui::Event>,
 }
@@ -367,6 +368,10 @@ fn prepare_action_input(
         });
         let valid = focused
             && editor_owned
+            && (!model.settings_open
+                || !pending.focus_ready
+                || crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+                    == pending.settings_owner)
             && (owner.typed.is_none()
                 || (owner.typed != pending.source.typed && !pending.focus_ready)
                 || context.memory(|memory| memory.focused() == pending.typed_focus))
@@ -499,6 +504,7 @@ fn prepare_action_input(
                     token,
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
+                    settings_owner: None,
                     typed_focus: model
                         .navigation
                         .inline_arguments
@@ -521,6 +527,7 @@ fn build_launcher_frame_with_transparency(
     editor: &mut crate::typed_input::TypedEditor,
     typed_submissions: &mut Vec<crate::TypedInputSubmission>,
 ) -> NativeUiFrame {
+    crate::settings_management::retire_editors(context, model);
     if !native_web_input
         && model.page.as_ref().is_some_and(|page| {
             page.frame.web.is_some() && page.web_surface_id.is_some_and(|surface_id| surface_id != 0)
@@ -605,14 +612,25 @@ fn build_launcher_frame_with_transparency(
         }
     }
     if waiting_for_input {
-        if model.navigation.inline_arguments.is_some() {
-            let focused = context.memory(|memory| memory.focused());
+        if model.settings_open || model.navigation.inline_arguments.is_some() {
+            let settings_owner = model
+                .settings_open
+                .then(|| {
+                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+                })
+                .flatten();
+            let typed_focus = model
+                .navigation
+                .inline_arguments
+                .as_ref()
+                .and_then(|_| context.memory(|memory| memory.focused()));
             context.data_mut(|data| {
                 if let Some(Some(mut pending)) =
                     data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
                 {
                     if pending.focus_ready {
-                        pending.typed_focus = focused;
+                        pending.settings_owner = settings_owner;
+                        pending.typed_focus = typed_focus;
                     }
                     data.insert_temp(action_input_queue(), Some(pending));
                 }
@@ -1788,6 +1806,11 @@ where
         let Some(session) = self.active_session else {
             return;
         };
+        if matches!(&command, UiCommand::Quit) {
+            if let Some(graphics) = &self.graphics {
+                crate::settings_management::clear_editors(&graphics.egui_context);
+            }
+        }
         if matches!(
             &command,
             UiCommand::Dismiss
@@ -1801,6 +1824,11 @@ where
         (self.on_event)(NativeLauncherEvent::Command { session, command });
         if self.accept_latest_frame(session, false) {
             self.request_redraw();
+        }
+        if self.frame.as_ref().is_none_or(|frame| !frame.settings_open) {
+            if let Some(graphics) = &self.graphics {
+                crate::settings_management::clear_editors(&graphics.egui_context);
+            }
         }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
@@ -2986,6 +3014,7 @@ impl GraphicsState {
 
     fn hide(&mut self) {
         self.typed_editor.clear();
+        crate::settings_management::clear_editors(&self.egui_context);
         clear_action_input(&self.egui_context);
         let _ = self.egui_state.take_egui_input(&self.window);
         self.window.set_ime_allowed(false);
@@ -3694,6 +3723,14 @@ fn deferred_root_key(key: egui::Key, modifiers: egui::Modifiers, model: &ViewMod
         egui::Key::F6 => Key::Named(NamedKey::F6),
         egui::Key::K => Key::Character("k"),
         egui::Key::Comma => Key::Character(","),
+        egui::Key::Space => Key::Named(NamedKey::Space),
+        _ if model
+            .settings_focus
+            .as_deref()
+            .is_some_and(|focus| focus.starts_with("record:")) =>
+        {
+            Key::Character(key.name())
+        }
         _ => return None,
     };
     let mut native = ModifiersState::empty();
@@ -3931,11 +3968,12 @@ fn draw_launcher(
                 // floating over it: the launcher is one column, and a list the
                 // user cannot reach behind a panel is only noise.
                 ui.add_space(theme::SPACE_3);
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-scroll")
-                    .max_height((ui.available_height() - theme::FOOTER_HEIGHT - theme::SPACE_3).max(0.0))
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| draw_settings(ui, model, commands, colors));
+                ui.scope(|ui| {
+                    ui.set_max_height(
+                        (ui.available_height() - theme::FOOTER_HEIGHT - theme::SPACE_3).max(0.0),
+                    );
+                    draw_settings(ui, model, commands, colors);
+                });
             } else if model.navigation.standard_route {
                 standard_render::draw(ui, model, commands, colors);
             } else if shows_results(model)
@@ -5985,6 +6023,19 @@ fn draw_settings(
         .rounding(Rounding::same(theme::RADIUS_MEDIUM))
         .inner_margin(Margin::same(theme::SPACE_3))
         .show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let scope_id = egui::Id::new("crikey-settings-focus-scope");
+            let scope = (
+                model.navigation.settings_management.view.map(crate::ViewId::get),
+                model.navigation.settings_management.query_reset,
+            );
+            if ui.data(|data| data.get_temp::<(Option<u64>, u64)>(scope_id)) != Some(scope) {
+                ui.data_mut(|data| {
+                    data.remove::<String>(egui::Id::new("crikey-settings-honoured-focus"));
+                    data.insert_temp(scope_id, scope);
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Settings")
@@ -5999,88 +6050,163 @@ fn draw_settings(
                 });
             });
             ui.add_space(theme::SPACE_2);
-            if ui.button("Clear query history").clicked() {
-                commands.push(UiCommand::ClearQueryHistory);
-            }
-            let search_id = egui::Id::new("shortcut-settings-search");
-            let mut shortcut_search = ui
-                .data(|data| data.get_temp::<String>(search_id))
-                .unwrap_or_default();
-            ui.add(
-                TextEdit::singleline(&mut shortcut_search)
-                    .hint_text("Search Shortcuts by command, alias, or key"),
-            );
-            ui.data_mut(|data| data.insert_temp(search_id, shortcut_search.clone()));
-            let shortcut_search = shortcut_search.to_lowercase();
-            egui::CollapsingHeader::new("Shortcuts / Configure Commands")
-                .id_salt("configure-commands")
-                .show(ui, |ui| {
-                    if model.command_management.is_empty() {
-                        ui.label("No declared or saved commands.");
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("all-command-management")
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            for row in model.command_management.iter() {
-                                if !shortcut_search.is_empty()
-                                    && !row.label.to_lowercase().contains(&shortcut_search)
-                                    && !row.description.to_lowercase().contains(&shortcut_search)
-                                    && !row.command_state.as_ref().is_some_and(|state| {
-                                        state
-                                            .aliases
-                                            .iter()
-                                            .any(|alias| alias.to_lowercase().contains(&shortcut_search))
-                                            || state.hotkey.as_ref().is_some_and(|hotkey| {
-                                                hotkey.to_lowercase().contains(&shortcut_search)
-                                            })
-                                    })
-                                {
-                                    continue;
-                                }
-                                let crate::ActionTarget::Command(reference) = &row.target else {
-                                    continue;
-                                };
-                                egui::CollapsingHeader::new(format!(
-                                    "{} — {} / {}",
-                                    row.label, reference.provider_id.0, reference.command_id
-                                ))
-                                .id_salt(("configure-command", &row.target))
-                                .show(ui, |ui| {
-                                    action_render::draw_command_controls(ui, row, model, commands, false)
-                                });
-                            }
-                        });
+            let category = model.navigation.settings_management.category;
+            if model.settings_focus.as_deref().is_none_or(|focus| {
+                !focus
+                    .strip_prefix("record:")
+                    .unwrap_or(focus)
+                    .starts_with("command:")
+            }) {
+                ui.data_mut(|data| {
+                    data.remove::<(Option<u64>, String)>(egui::Id::new("settings-command-focus-honoured"))
                 });
-            if model.settings.is_empty() {
-                ui.label(
-                    RichText::new("The launcher host published no settings.")
-                        .size(theme::TEXT_SMALL)
-                        .color(colors.text_muted),
-                );
             }
-            for row in model.settings.iter() {
-                draw_setting_row(
-                    ui,
-                    row,
-                    &model.setting_edits,
-                    model.settings_focus.as_deref(),
-                    commands,
-                    colors,
-                );
-                ui.add_space(theme::SPACE_1);
-            }
-            // The footer of the sheet is set apart by space rather than by a
-            // rule: it is the last thing on a surface that has already ended.
+            crate::settings_management::draw_categories(ui, &model.navigation.settings_management, commands);
+            ui.add_space(theme::SPACE_2);
+            // Only the body scrolls. The Back header and Quit footer remain
+            // reachable regardless of report length or editor content.
+            let quit_height = ui.spacing().interact_size.y + theme::SPACE_2 + theme::SPACE_1;
+            egui::ScrollArea::vertical()
+                .id_salt("settings-scroll")
+                .max_height((ui.available_height() - quit_height).max(0.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    crate::settings_management::draw(
+                        ui,
+                        &model.navigation.settings_management,
+                        &model.setting_edits,
+                        model.settings_focus.as_deref(),
+                        commands,
+                    );
+                    if category.shows(crate::settings_management::Category::PrivacyHistory)
+                        && ui.button("Clear query history").clicked()
+                    {
+                        commands.push(UiCommand::ClearQueryHistory);
+                    }
+                    if category.shows(crate::settings_management::Category::Shortcuts) {
+                        let search_id = egui::Id::new("shortcut-settings-search");
+                        let command_focus = model
+                            .settings_focus
+                            .as_deref()
+                            .map(|focus| focus.strip_prefix("record:").unwrap_or(focus))
+                            .filter(|focus| focus.starts_with("command:"));
+                        let reveal_command = command_focus.is_some_and(|focus| {
+                            let id = egui::Id::new("settings-command-focus-honoured");
+                            let mut honoured = ui
+                                .data_mut(|data| data.remove_temp::<(Option<u64>, String)>(id))
+                                .unwrap_or_default();
+                            let view = model.navigation.settings_management.view.map(crate::ViewId::get);
+                            let changed = honoured.0 != view || honoured.1 != focus;
+                            if changed {
+                                honoured.0 = view;
+                                honoured.1.clear();
+                                honoured.1.push_str(focus);
+                            }
+                            ui.data_mut(|data| data.insert_temp(id, honoured));
+                            changed
+                        });
+                        if reveal_command {
+                            ui.data_mut(|data| data.remove::<String>(search_id));
+                        }
+                        let mut shortcut_search = ui
+                            .data(|data| data.get_temp::<String>(search_id))
+                            .unwrap_or_default();
+                        ui.add(
+                            TextEdit::singleline(&mut shortcut_search)
+                                .hint_text("Search Shortcuts by command, alias, or key"),
+                        );
+                        ui.data_mut(|data| data.insert_temp(search_id, shortcut_search.clone()));
+                        let shortcut_search = shortcut_search.to_lowercase();
+                        let mut command_settings = |ui: &mut egui::Ui| {
+                            if model.command_management.is_empty() {
+                                ui.label("No declared or saved commands.");
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("all-command-management")
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    for row in model.command_management.iter() {
+                                        if !shortcut_search.is_empty()
+                                            && !row.label.to_lowercase().contains(&shortcut_search)
+                                            && !row.description.to_lowercase().contains(&shortcut_search)
+                                            && !row.command_state.as_ref().is_some_and(|state| {
+                                                state.aliases.iter().any(|alias| {
+                                                    alias.to_lowercase().contains(&shortcut_search)
+                                                }) || state.hotkey.as_ref().is_some_and(|hotkey| {
+                                                    hotkey.to_lowercase().contains(&shortcut_search)
+                                                })
+                                            })
+                                        {
+                                            continue;
+                                        }
+                                        let crate::ActionTarget::Command(reference) = &row.target else {
+                                            continue;
+                                        };
+                                        let focused = command_focus.is_some_and(|focus| {
+                                            focus == crate::command_edit_key(reference, false)
+                                                || focus == crate::command_edit_key(reference, true)
+                                        });
+                                        let shown = egui::CollapsingHeader::new(format!(
+                                            "{} — {} / {}",
+                                            row.label, reference.provider_id.0, reference.command_id
+                                        ))
+                                        .id_salt(("configure-command", &row.target))
+                                        .open(focused.then_some(true))
+                                        .show(ui, |ui| {
+                                            action_render::draw_command_controls(
+                                                ui, row, model, commands, false,
+                                            )
+                                        });
+                                        if focused && reveal_command {
+                                            shown.header_response.scroll_to_me(Some(Align::TOP));
+                                        }
+                                    }
+                                });
+                        };
+                        if category == crate::settings_management::Category::Shortcuts {
+                            ui.heading("Shortcuts / Configure Commands");
+                            command_settings(ui);
+                        } else {
+                            egui::CollapsingHeader::new("Shortcuts / Configure Commands")
+                                .id_salt("configure-commands")
+                                .show(ui, command_settings);
+                        }
+                    }
+                    if model.settings.is_empty()
+                        && model.navigation.settings_management.schema == 0
+                        && category == crate::settings_management::Category::All
+                    {
+                        ui.label(
+                            RichText::new("The launcher host published no settings.")
+                                .size(theme::TEXT_SMALL)
+                                .color(colors.text_muted),
+                        );
+                    }
+                    for row in model.settings.iter().filter(|_| {
+                        model.navigation.settings_management.schema == 0
+                            && category == crate::settings_management::Category::All
+                    }) {
+                        draw_setting_row(
+                            ui,
+                            row,
+                            &model.setting_edits,
+                            model.settings_focus.as_deref(),
+                            commands,
+                            colors,
+                        );
+                        ui.add_space(theme::SPACE_1);
+                    }
+                    ui.add_space(theme::SPACE_2);
+                    if let Some(hint) = commit_hint(&model.settings) {
+                        ui.label(
+                            RichText::new(hint)
+                                .size(theme::TEXT_SMALL)
+                                .color(colors.text_muted),
+                        );
+                    }
+                });
             ui.add_space(theme::SPACE_2);
             ui.horizontal(|ui| {
-                if let Some(hint) = commit_hint(&model.settings) {
-                    ui.label(
-                        RichText::new(hint)
-                            .size(theme::TEXT_SMALL)
-                            .color(colors.text_muted),
-                    );
-                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Quit CriKey").clicked() {
                         commands.push(UiCommand::Quit);
@@ -6340,11 +6466,15 @@ fn focus_once(ui: &egui::Ui, response: &egui::Response, row: &SettingRow, focus_
         return;
     }
     let honoured_id = egui::Id::new("crikey-settings-honoured-focus");
-    let honoured = ui.data(|data| data.get_temp::<String>(honoured_id));
-    if honoured.as_deref() != Some(row.key.as_str()) {
+    let mut honoured = ui
+        .data_mut(|data| data.remove_temp::<String>(honoured_id))
+        .unwrap_or_default();
+    if honoured != row.key {
         response.request_focus();
-        ui.data_mut(|data| data.insert_temp(honoured_id, row.key.clone()));
+        honoured.clear();
+        honoured.push_str(&row.key);
     }
+    ui.data_mut(|data| data.insert_temp(honoured_id, honoured));
 }
 
 /// The vertical room [`draw_status`] needs, in logical pixels: one status row,

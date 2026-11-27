@@ -15,9 +15,11 @@ mod command_hotkeys;
 mod command_preferences;
 mod command_registry;
 pub use command_hotkeys::*;
+pub mod launcher_settings;
 mod legacy_provider;
 mod modern_provider;
 mod native_provider;
+pub mod package_jobs;
 mod plugin_action;
 mod plugin_icons;
 mod plugin_page;
@@ -30,7 +32,9 @@ pub use query_history_store::{
     MonotonicQueryHistoryClock, QueryHistoryClock, QueryHistoryMode, QueryHistoryStore,
 };
 mod remote_catalog;
+pub mod runtime_control;
 mod selection_history_store;
+pub mod settings_search;
 mod startup_recovery;
 mod wasm_provider;
 
@@ -939,6 +943,22 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    /// Revokes executable/catalog publication before physical shutdown tickets.
+    /// Saved preferences remain available for inspection and the next launch.
+    pub fn revoke_runtime_owners(&mut self, owners: &[PluginId]) -> Result<(), RegistryError> {
+        for owner in owners {
+            self.set_command_owner_enabled(owner, false)?;
+            self.catalog.invalidate(owner);
+            self.owners.retain(|current| current != owner);
+            self.results.retain(|hit| &hit.item.plugin_id != owner);
+        }
+        self.candidate_cache = None;
+        self.icons
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        Ok(())
+    }
     pub fn request_view(
         &self,
         owner: &PluginId,

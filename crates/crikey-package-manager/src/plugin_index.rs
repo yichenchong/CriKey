@@ -675,6 +675,27 @@ impl PluginIndexClient {
             .collect()
     }
 
+    /// Loads indexes with caller-owned cancellation safe points between each
+    /// complete fetch/verification/cache publication. A checkpoint never
+    /// interrupts an atomic publication and cancellation does not undo indexes
+    /// that were already refreshed. Transport deadlines still bound each fetch.
+    pub fn load_with_checkpoint<E>(
+        &self,
+        refresh: bool,
+        checkpoint: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<Vec<IndexOutcome>, E> {
+        let mut outcomes = Vec::with_capacity(self.urls.len());
+        for url in &self.urls {
+            checkpoint()?;
+            outcomes.push(IndexOutcome {
+                url: url.clone(),
+                snapshot: self.load_one(url, refresh),
+            });
+            checkpoint()?;
+        }
+        Ok(outcomes)
+    }
+
     fn load_one(&self, url: &str, refresh: bool) -> Result<IndexSnapshot, PackageError> {
         let cache = CacheEntry::new(&self.cache_root, url);
         let age = cache.age();

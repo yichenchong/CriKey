@@ -10,8 +10,8 @@ use std::process::ExitCode;
 
 use crikey_core::{Item, PluginId};
 use crikey_native_host::{
-    BatchState, ExitKind, HostError, LaunchSpec, NativeSuggestRequest, NativeWorker, TransportKind,
-    WorkerOptions,
+    BatchState, ExitKind, HostError, LaunchSpec, NativeSpawnFailure, NativeSuggestRequest, NativeWorker,
+    TransportKind, WorkerOptions,
 };
 use crikey_native_protocol::PROTOCOL_VERSION;
 
@@ -92,6 +92,32 @@ struct Report {
     conformant: bool,
 }
 
+/// Keeps failed startup ownership alive through reporting and the actual
+/// command ExitCode boundary.
+struct InvocationError {
+    options: Options,
+    failure: NativeSpawnFailure,
+}
+
+impl InvocationError {
+    fn render(mut self) -> ExitCode {
+        if self.failure.retry_cleanup().is_err() {
+            return refuse("native worker cleanup did not settle");
+        }
+        match self.failure.error() {
+            HostError::Spawn(detail) => refuse(&format!(
+                "native plugin `{}` could not be launched: {detail}",
+                self.options.plugin.display()
+            )),
+            error => {
+                let report = handshake_failure_report(&self.options, error);
+                print_report(&report);
+                ExitCode::from(EX_NOT_CONFORMANT)
+            }
+        }
+    }
+}
+
 /// Runs `crikey dev inspect-protocol`.
 ///
 /// The host owns session authentication, framing, deadlines and credit
@@ -113,7 +139,7 @@ pub(crate) fn inspect_protocol(args: &[String]) -> ExitCode {
                     EX_NOT_CONFORMANT
                 })
             }
-            Err(message) => refuse(&message),
+            Err(error) => error.render(),
         },
     }
 }
@@ -297,7 +323,7 @@ fn help_text() -> String {
         .to_owned()
 }
 
-fn inspect(options: Options) -> Result<Report, String> {
+fn inspect(options: Options) -> Result<Report, InvocationError> {
     let plugin_for_launch = PluginId("inspect-protocol".to_owned());
     let working_dir = options
         .plugin
@@ -321,13 +347,7 @@ fn inspect(options: Options) -> Result<Report, String> {
 
     let mut worker = match NativeWorker::spawn(spec, worker_options) {
         Ok(worker) => worker,
-        Err(HostError::Spawn(detail)) => {
-            return Err(format!(
-                "native plugin `{}` could not be launched: {detail}",
-                options.plugin.display()
-            ));
-        }
-        Err(error) => return Ok(handshake_failure_report(&options, &error)),
+        Err(failure) => return Err(InvocationError { options, failure }),
     };
 
     let plugin = worker.handshake().plugin_id.clone();

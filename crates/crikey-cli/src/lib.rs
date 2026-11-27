@@ -295,7 +295,18 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // would release the lock immediately and prove nothing.
     let directories = StandardDirectories::for_process()
         .map_err(|error| format!("cannot resolve the standard directories: {error}"))?;
-    let _launcher_lock = LauncherLock::acquire(&directories).map_err(|error| error.to_string())?;
+    let launcher_lock = Arc::new(LauncherLock::acquire(&directories).map_err(|error| error.to_string())?);
+    let legacy_roots = discovery_roots(PluginKind::Legacy, legacy_package_roots(), &directories);
+    let modern_roots = discovery_roots(PluginKind::Modern, modern_plugin_roots(), &directories);
+    let native_roots = discovery_roots(PluginKind::Native, native_plugin_roots(), &directories);
+    let package_roots: Vec<_> = [
+        (PluginKind::Legacy, &legacy_roots),
+        (PluginKind::Modern, &modern_roots),
+        (PluginKind::Native, &native_roots),
+    ]
+    .into_iter()
+    .flat_map(|(kind, roots)| roots.iter().cloned().map(move |root| (kind, root)))
+    .collect();
     // The layered configuration (spec 21). Loaded ONCE and retained for the life
     // of the launch: it decides which plugins may load, it bounds the launcher's
     // own result ceiling, and it is the state published to every plugin below.
@@ -485,10 +496,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let legacy_cache_root = legacy_cache_root()?;
     let mut legacy_provider = LegacyProvider::load(
         &mut legacy_pipeline,
-        &admitted_plugin_roots(
-            &startup_mode,
-            &discovery_roots(PluginKind::Legacy, legacy_package_roots(), &directories),
-        ),
+        &admitted_plugin_roots(&startup_mode, &legacy_roots),
         legacy_cache_root,
         crikey_app::LegacyDirectories {
             user_config: Some(directories.config_dir().to_path_buf()),
@@ -554,10 +562,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let cache_root = modern_cache_root()?;
     let mut modern_provider = ModernProvider::load(
         &mut modern_pipeline,
-        &admitted_plugin_roots(
-            &startup_mode,
-            &discovery_roots(PluginKind::Modern, modern_plugin_roots(), &directories),
-        ),
+        &admitted_plugin_roots(&startup_mode, &modern_roots),
         modern_index_root(),
         cache_root,
         &disabled,
@@ -600,10 +605,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let mut native_pipeline = QueryPipeline::new(pipeline_bounds);
     let mut native_provider = NativeProvider::load(
         &mut native_pipeline,
-        &admitted_plugin_roots(
-            &startup_mode,
-            &discovery_roots(PluginKind::Native, native_plugin_roots(), &directories),
-        ),
+        &admitted_plugin_roots(&startup_mode, &native_roots),
         &disabled,
     );
     if let Some(configuration) = configuration.as_ref() {
@@ -755,23 +757,23 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // occasion it opens by itself is a hotkey that could not be bound — and a
     // panel that came up empty on exactly that occasion would be no better than
     // the silence it replaces.
-    view_model.set_settings(settings::rows(
+    view_model.set_settings(crikey_app::launcher_settings::rows(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
     // And the hint line's visibility, from the same store, before the first
     // frame: a launcher that showed the hints once and hid them on the next
     // activation would look like the setting had not taken.
-    view_model.set_show_hints(settings::configured_show_hints(
+    view_model.set_show_hints(crikey_app::launcher_settings::configured_show_hints(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
     // And the window's shape, from that same store, for the same reason: the
     // corners are drawn once per frame, so a launcher that came up round and
     // squared off on the next activation would look like the setting had not
     // taken.
-    view_model.set_rounded_corners(settings::configured_rounded_corners(
+    view_model.set_rounded_corners(crikey_app::launcher_settings::configured_rounded_corners(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
-    view_model.set_preview_ratio(settings::configured_preview_split(
+    view_model.set_preview_ratio(crikey_app::launcher_settings::configured_preview_split(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
     let preview_wake = render_handle.clone();
@@ -779,13 +781,15 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         let _ = preview_wake.request_provider_answer();
     });
     let preference_wake = render_handle.clone();
-    let preference_worker = command_preferences::PreferenceWorker::spawn(
+    let mut preference_worker = command_preferences::PreferenceWorker::spawn(
         search.command_preferences_store(),
         configuration
             .as_ref()
             .map(|configuration| configuration.store.clone()),
         directories.clone(),
         overrides.to_vec(),
+        Some(administrator_policy_path(DirectoryConvention::current())),
+        package_roots.iter().map(|(_, path)| path.clone()).collect(),
         move || {
             let _ = preference_wake.request_action_completion();
         },
@@ -820,6 +824,51 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     };
     #[cfg(not(target_os = "linux"))]
     let mut web_page = WebPageRuntime::new();
+    let controls = vec![
+        native_driver.control(),
+        modern_driver.control(),
+        legacy_driver.control(),
+    ];
+    let owner_wake = render_handle.clone();
+    let (package_owner, owner_requests) = settings::ResidentOwner::new(
+        controls.clone(),
+        Arc::new(move || {
+            let _ = owner_wake.request_action_completion();
+        }),
+    );
+    let jobs_wake = render_handle.clone();
+    let mut package_jobs = Some(
+        crikey_app::package_jobs::PackageJobs::new(
+            directories.clone(),
+            package_roots,
+            Some(crikey_app::package_jobs::ResidentPackageAccess::new(
+                Arc::clone(&launcher_lock),
+                package_owner.clone(),
+            )),
+            preference_worker.package_configuration(),
+            Arc::new(move || {
+                let _ = jobs_wake.request_action_completion();
+            }),
+        )
+        .map_err(|_| "Package worker could not start".to_owned())?,
+    );
+    let mut settings_management = settings::Management::new();
+    let mut settings_revision = configuration
+        .as_ref()
+        .map(|configuration| configuration.store.revision());
+    let mut stop_epochs = crikey_app::runtime_control::StopEpoch::default();
+    let mut closed_epoch = None;
+    let mut shutdown_worker: Option<std::thread::JoinHandle<()>> = None;
+    let (shutdown_done, shutdown_result) = std::sync::mpsc::sync_channel::<Result<(), ()>>(1);
+    let mut configuration_shutdown_started = false;
+    let shutdown_failure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_failure_note = Arc::clone(&shutdown_failure);
+    // Keep the same allocation beyond destruction of every callback-owned service.
+    let _held_launcher_lock = Arc::clone(&launcher_lock);
+    let runtime_owners: Vec<_> = controls
+        .iter()
+        .flat_map(|control| control.startup_owners().iter().cloned())
+        .collect();
     let mut retained = RetainedRows::default();
     let mut action_origins = std::collections::BTreeMap::new();
     let mut typed_requests = std::collections::BTreeMap::new();
@@ -860,6 +909,72 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         std::collections::BTreeMap::new();
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
+            // Service package ownership before admitting any further plugin effects.
+            while let Ok(request) = owner_requests.try_recv() {
+                let epoch = match closed_epoch {
+                    Some(epoch) => epoch,
+                    None => match stop_epochs.advance() {
+                        Ok(epoch) => { closed_epoch = Some(epoch); epoch }
+                        Err(_) => { let _ = request.reply.try_send(Err(crikey_app::package_jobs::JobError::new("stop-epoch", "Runtime shutdown epoch unavailable"))); continue; }
+                    },
+                };
+                if matches!(package_owner.gate.state(), crikey_app::runtime_control::PluginAdmission::FailedClosed { .. }) {
+                    let _ = request.reply.try_send(Err(crikey_app::package_jobs::JobError::new("runtime-failed-closed", "Runtime reconciliation failed; restart the launcher")));
+                    continue;
+                }
+                let mut failed = package_owner.gate.close(epoch).is_err();
+                for control in &controls { failed |= control.admission().close(epoch).is_err(); }
+                hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+                for id in action_origins.keys() { search.cancel_action(id); }
+                action_origins.clear();
+                hotkey_presentations.clear();
+                view_requests.clear();
+                latest_view_refresh = None;
+                if let Some(surface) = view_model.standard_surface().cloned() {
+                    search.retire_view(&surface.owner, surface.context.session);
+                    view_model.standard_unavailable();
+                }
+                view_model.retire_inline_arguments();
+                for owner in &runtime_owners { previews.retire_for_foreground(&mut view_model, owner); }
+                view_model.close_page();
+                search.close_page();
+                web_page.close("package mutation closes all plugin pages");
+                failed |= search.revoke_runtime_owners(&runtime_owners).is_err();
+                command_projection_dirty = true;
+                let mut bundle = package_owner.request_stop(epoch, web_page.request_shutdown(epoch));
+                bundle.failed |= failed;
+                if let Err(std::sync::mpsc::TrySendError::Full(Ok(bundle))
+                    | std::sync::mpsc::TrySendError::Disconnected(Ok(bundle))) = request.reply.try_send(Ok(bundle)) {
+                    let gate = package_owner.gate.clone();
+                    let wake = render_handle.clone();
+                    std::thread::spawn(move || {
+                        let _ = bundle.settle();
+                        // An abandoned owner request has no reconciliation
+                        // lease. Physical settlement never reauthorizes it.
+                        gate.finish(epoch, false);
+                        let _ = wake.request_action_completion();
+                    });
+                }
+            }
+            settings_management.drain(view_model.view(), &preference_worker, package_jobs.as_ref());
+            if let Ok(result) = shutdown_result.try_recv() {
+                if result.is_err() {
+                    shutdown_failure_note.store(true, std::sync::atomic::Ordering::Release);
+                    view_model.set_navigation_notice("Shutdown teardown failed; all plugin admission remains closed".into());
+                }
+                if !configuration_shutdown_started {
+                    configuration_shutdown_started = true;
+                    if let Some(worker) = preference_worker.take_shutdown() {
+                        let done = shutdown_done.clone();
+                        let wake = render_handle.clone();
+                        shutdown_worker = Some(std::thread::spawn(move || {
+                            let _ = done.send(worker.join().map_err(|_| ()));
+                            let _ = wake.request_action_completion();
+                        }));
+                    } else { let _ = render_handle.request_exit(); }
+                } else { let _ = render_handle.request_exit(); }
+            }
+            let event = if quit_after_history_reset { NativeLauncherEvent::ActionCompletion } else { event };
             if matches!(&event, NativeLauncherEvent::Command { command, .. } if command_advances_activity(command))
                 || matches!(&event, NativeLauncherEvent::TypedInput { .. })
                 || matches!(&event, NativeLauncherEvent::Activated) && !prepared_activation
@@ -867,7 +982,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 for id in std::mem::take(&mut view_actions) { search.cancel_action(&id); }
                 hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
             }
-            let hotkey_receipts = hotkeys.drain_events();
+            let mut hotkey_receipts = hotkeys.drain_events();
+            if quit_after_history_reset { hotkey_receipts.clear(); }
             if !hotkey_receipts.is_empty() {
                 view_model.clear_standard_activation();
                 standard_activation_session = None;
@@ -879,6 +995,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     completion.state,
                     command_preferences::CompletionState::Authoritative
                 );
+                if !hotkey_authoritative {
+                    settings_management.panel.notice = "Configuration authority unavailable; displayed values are last known, edits are not authorized".into();
+                    settings_management.panel.authoritative = false;
+                }
                 if let Some(outcome) = completion.command_edit {
                     view_model.command_edit_completed(outcome);
                 }
@@ -900,6 +1020,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     continue;
                 }
                 if let Some(store) = completion.config {
+                    let revision = store.revision();
+                    if settings_revision.as_ref() != Some(&revision) {
+                        settings_revision = Some(revision);
+                        if let Some((view, crikey_ui::ViewKind::Settings)) = view_model.view() {
+                            settings_management.refresh(view, &preference_worker);
+                        }
+                    }
                     if let Some(configuration) = configuration.as_mut() {
                         configuration.store = store;
                     } else {
@@ -972,13 +1099,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
                 if configuration.take_reloaded() {
                     command_projection_dirty |= retained.configure(&configuration.store);
-                    view_model.set_settings(settings::rows(Some(&configuration.store)));
-                    view_model.set_show_hints(settings::configured_show_hints(Some(&configuration.store)));
-                    view_model.set_rounded_corners(settings::configured_rounded_corners(Some(
+                    view_model.set_settings(crikey_app::launcher_settings::rows(Some(&configuration.store)));
+                    view_model.set_show_hints(crikey_app::launcher_settings::configured_show_hints(Some(&configuration.store)));
+                    view_model.set_rounded_corners(crikey_app::launcher_settings::configured_rounded_corners(Some(
                         &configuration.store,
                     )));
                     view_model
-                        .set_preview_ratio(settings::configured_preview_split(Some(&configuration.store)));
+                        .set_preview_ratio(crikey_app::launcher_settings::configured_preview_split(Some(&configuration.store)));
                     settings::apply_navigation_preferences(
                         Some(&configuration.store),
                         &mut view_model,
@@ -995,7 +1122,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // same publication edge the provider catalog results below use.
             // Nothing here is reachable from the query path, and a launcher
             // with no source configured skips it entirely (README invariant 2).
-            if !remote_catalog.is_idle() {
+            if closed_epoch.is_none() && !remote_catalog.is_idle() {
                 let now_ms = u64::try_from(remote_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
                 remote_catalog.poll(now_ms);
                 for report in remote_catalog.apply(&mut search, now_ms) {
@@ -1004,6 +1131,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             // Fold any legacy rows the supervisor produced since the last turn
             for completion in search.poll_action_completions() {
+                if closed_epoch.is_some() {
+                    // Drain physical terminals without reviving UI/navigation effects.
+                    view_actions.remove(&completion.request_id);
+                    typed_requests.remove(&completion.request_id);
+                    view_requests.remove(&completion.request_id);
+                    action_activity.remove(&completion.request_id);
+                    pending_command_learning.remove(&completion.request_id);
+                    pending_ordinary_learning.remove(&completion.request_id);
+                    pending_typed_items.remove(&completion.request_id);
+                    continue;
+                }
                 view_actions.remove(&completion.request_id);
                 if let Some((owner, producer, view, _intent)) = view_requests.remove(&completion.request_id) {
                     if view_model.view().is_some_and(|(current, _)| current == view) {
@@ -1275,7 +1413,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
             // so a late answer can never land under a newer one.
-            if let Some(outcome) = legacy_driver.take_outcome() {
+            if let Some(outcome) = legacy_driver.take_outcome().filter(|_| closed_epoch.is_none()) {
                 retained.absorb(
                     outcome.generation,
                     RowSource::Legacy,
@@ -1287,7 +1425,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             // Each supervisor returns only its own suggestions. The host keeps
             // the canonical ranked answer and all other providers' rows.
-            if let Some(outcome) = modern_driver.take_outcome() {
+            if let Some(outcome) = modern_driver.take_outcome().filter(|_| closed_epoch.is_none()) {
                 retained.absorb(
                     outcome.generation,
                     RowSource::Modern,
@@ -1299,7 +1437,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             // Native rows are folded independently, preserving both existing
             // provider groups and stale-generation rejection.
-            if let Some(outcome) = native_driver.take_outcome() {
+            if let Some(outcome) = native_driver.take_outcome().filter(|_| closed_epoch.is_none()) {
                 retained.absorb(
                     outcome.generation,
                     RowSource::Native,
@@ -1329,7 +1467,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // results are observable but can never replace live state.
             for result in legacy_driver.take_catalog_results() {
                 match result {
-                    crikey_app::CatalogBuildResult::Complete(build) => {
+                    crikey_app::CatalogBuildResult::Complete(build) if closed_epoch.is_none() => {
                         if let Err(error) = build.publish(&mut search) {
                             eprintln!("crikey: legacy catalog publication refused: {error}");
                         }
@@ -1338,11 +1476,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         eprintln!("crikey: legacy catalog build failed: {reason}");
                     }
                     crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                    crikey_app::CatalogBuildResult::Complete(_) => {}
                 }
             }
             for result in modern_driver.take_catalog_results() {
                 match result {
-                    crikey_app::CatalogBuildResult::Complete(build) => {
+                    crikey_app::CatalogBuildResult::Complete(build) if closed_epoch.is_none() => {
                         if let Err(error) = build.publish(&mut search) {
                             eprintln!("crikey: modern catalog publication refused: {error}");
                         }
@@ -1351,11 +1490,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         eprintln!("crikey: modern catalog build failed: {reason}");
                     }
                     crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                    crikey_app::CatalogBuildResult::Complete(_) => {}
                 }
             }
             for result in native_driver.take_catalog_results() {
                 match result {
-                    crikey_app::CatalogBuildResult::Complete(build) => {
+                    crikey_app::CatalogBuildResult::Complete(build) if closed_epoch.is_none() => {
                         if let Err(error) = build.publish(&mut search) {
                             eprintln!("crikey: native catalog publication refused: {error}");
                         }
@@ -1364,13 +1504,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         eprintln!("crikey: native catalog build failed: {reason}");
                     }
                     crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                    crikey_app::CatalogBuildResult::Complete(_) => {}
                 }
             }
             let registry_before = search.command_snapshot().revision;
             if let Some(configuration) = configuration.as_ref() {
                 let disabled = DisabledPlugins::from_ids(configuration.store.disabled_plugins());
                 for owner in native_driver.plugins().into_iter().chain(modern_driver.plugins()) {
-                    if let Err(error) = search.set_command_owner_enabled(&owner, !disabled.blocks(&owner)) {
+                    if let Err(error) = search.set_command_owner_enabled(&owner, closed_epoch.is_none() && !disabled.blocks(&owner)) {
                         eprintln!("crikey: command owner policy intake refused: {error:?}");
                     }
                     if disabled.blocks(&owner) {
@@ -1398,7 +1539,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             command_projection_dirty |= registry_before != search.command_snapshot().revision;
             let registry = search.command_snapshot();
             let preferences = search.command_preferences_snapshot();
-            let activation = settings::configured_hotkey(configuration.as_ref().map(|config| &config.store));
+            let activation = crikey_app::launcher_settings::configured_hotkey(configuration.as_ref().map(|config| &config.store));
             let inputs = (registry.revision, preferences.revision, activation.clone());
             if hotkey_authoritative && hotkey_inputs.as_ref() != Some(&inputs) {
                 hotkeys.reconcile(Arc::clone(&registry), Arc::clone(&preferences), Some(activation));
@@ -1431,7 +1572,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         failure.accelerator, failure.error
                     ));
                 }
-                let mut rows = settings::rows(configuration.as_ref().map(|config| &config.store));
+                let mut rows = crikey_app::launcher_settings::rows(configuration.as_ref().map(|config| &config.store));
                 if let Some(row) = rows
                     .iter_mut()
                     .find(|row| row.key == crikey_config::KEY_ACTIVATION_HOTKEY)
@@ -1446,6 +1587,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     );
                 }
                 view_model.set_settings(rows);
+                settings_management.panel.activation = report.bindings.get(&crikey_app::BindingOwner::Launcher)
+                    .and_then(|status| status.active.as_deref()).unwrap_or("none").into();
                 hotkey_report = report;
                 command_management_revision = None;
             }
@@ -1734,10 +1877,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let mut input_commands = Vec::new().into_iter();
             let mut input_continuation = None;
             loop {
+                if closed_epoch.is_some() && effect.as_ref().is_some_and(|effect| settings::closed_runtime_effect(effect, &runtime_owners)) {
+                    view_model.set_navigation_notice("Third-party runtime admission is closed until next launch".into());
+                    effect = None;
+                }
                 if let Some(next) = effect.as_ref().and_then(settings::residency) {
                     disposition = Some(next);
                 }
                 match effect {
+                    Some(UiEffect::ManageSettings(request)) => {
+                        if let (Some((view, crikey_ui::ViewKind::Settings)), Some(jobs)) = (view_model.view(), package_jobs.as_ref()) {
+                            settings_management.request(request, view, &preference_worker, jobs);
+                        }
+                    }
                     Some(UiEffect::OpenStandardLink { owner, context, url }) => {
                         if search.open_view_url(&owner, &context, &view_model.standard_host_state(), &url).is_err() {
                             view_model.set_navigation_notice("Link unavailable".into());
@@ -2407,10 +2559,46 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
                 None => {}
             }
-            if quit_after_history_reset && !ranking_reset_pending {
-                let _ = render_handle.request_exit();
+            if quit_after_history_reset && !ranking_reset_pending && shutdown_worker.is_none() {
+                if let Ok(epoch) = closed_epoch.map(Ok).unwrap_or_else(|| stop_epochs.advance()) {
+                    closed_epoch = Some(epoch);
+                    let _ = package_owner.gate.close(epoch);
+                    for control in &controls { let _ = control.admission().close(epoch); }
+                    action_origins.clear();
+                    hotkey_presentations.clear();
+                    view_requests.clear();
+                    let _ = search.revoke_runtime_owners(&runtime_owners);
+                    view_model.close_page();
+                    search.close_page();
+                    let bundle = package_owner.request_stop(epoch, web_page.request_shutdown(epoch));
+                    if let Some(mut jobs) = package_jobs.take() {
+                        let done = shutdown_done.clone();
+                        let wake = render_handle.clone();
+                        let lock = Arc::clone(&launcher_lock);
+                        shutdown_worker = Some(std::thread::spawn(move || {
+                            let jobs_result = jobs.shutdown();
+                            let stop_result = bundle.settle();
+                            drop(jobs);
+                            drop(lock);
+                            let _ = done.send(if jobs_result.is_ok() && stop_result.is_ok() { Ok(()) } else { Err(()) });
+                            let _ = wake.request_action_completion();
+                        }));
+                    }
+                } else {
+                    view_model.set_navigation_notice("Shutdown epoch exhausted; plugin mutation unavailable".into());
+                }
             }
 
+            if closed_epoch.is_some() {
+                retained.legacy.clear();
+                retained.modern.clear();
+                retained.native.clear();
+                if controls.iter().all(|control| matches!(control.admission().state(), crikey_app::runtime_control::PluginAdmission::Offline { .. })) {
+                    retained.legacy_pending = false;
+                    retained.modern_pending = false;
+                    retained.native_pending = false;
+                }
+            }
             command_projection_dirty |= command_projection_revision != search.command_snapshot().revision;
             let management_revision = (
                 search.command_snapshot().revision,
@@ -2485,6 +2673,25 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     command_projection_dirty = false;
                 }
             }
+            if let Some((view, crikey_ui::ViewKind::Settings)) = view_model.view() {
+                let entering = settings_management.panel.view != Some(view);
+                let routed = package_jobs.is_some() && settings_management.route_focus(view, view_model.settings_focus(), &preference_worker);
+                if entering && package_jobs.is_some() {
+                    if !routed {
+                        settings_management.search(view, command_preferences::SettingsOperation::Search { text: String::new() }, &preference_worker, None);
+                    }
+                    if let Some(jobs) = package_jobs.as_ref() {
+                        settings_management.request(crikey_ui::settings_management::Request::Packages, view, &preference_worker, jobs);
+                    }
+                }
+            }
+            settings_management.panel.runtime_state = match package_owner.gate.state() {
+                crikey_app::runtime_control::PluginAdmission::Open => crikey_ui::settings_management::RuntimeState::Open,
+                crikey_app::runtime_control::PluginAdmission::Closing { .. } => crikey_ui::settings_management::RuntimeState::Closing,
+                crikey_app::runtime_control::PluginAdmission::Offline { .. } => crikey_ui::settings_management::RuntimeState::Offline,
+                crikey_app::runtime_control::PluginAdmission::FailedClosed { .. } => crikey_ui::settings_management::RuntimeState::FailedClosed,
+            };
+            view_model.set_settings_management(settings_management.panel.clone());
             previews.synchronize(&mut view_model, &search);
             if let Some(frame) = view_model.frame() {
                 let _ = render_handle.submit_frame(&frame);
@@ -2493,6 +2700,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         .map_err(|error| error.to_string());
     // Only a deliberate exit clears the record; a run that ended in an error
     // leaves its plugin set on disk for the next launch to read.
+    if shutdown_failure.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Launcher shutdown could not prove complete service teardown".into());
+    }
     if outcome.is_ok() {
         ledger.borrow_mut().mark_clean_shutdown();
     }
@@ -2507,6 +2717,7 @@ struct ActiveWebSurface {
 }
 
 struct WebPageRuntime {
+    shutdown_epoch: Option<std::num::NonZeroU64>,
     #[cfg(target_os = "linux")]
     supervisor: Option<WebHostSupervisor>,
     #[cfg(target_os = "linux")]
@@ -2520,9 +2731,33 @@ struct WebPageRuntime {
 }
 
 impl WebPageRuntime {
+    fn request_shutdown(
+        &mut self,
+        epoch: std::num::NonZeroU64,
+    ) -> Result<settings::WebSettlement, crikey_app::package_jobs::JobError> {
+        if self.shutdown_epoch.is_some_and(|previous| previous != epoch) {
+            return Err(crikey_app::package_jobs::JobError::new(
+                "web-epoch",
+                "Web owner shutdown epoch changed",
+            ));
+        }
+        self.shutdown_epoch = Some(epoch);
+        self.close("plugin admission permanently closed");
+        #[cfg(target_os = "linux")]
+        if let Some(supervisor) = &self.supervisor {
+            return supervisor
+                .request_shutdown(epoch)
+                .map(settings::WebSettlement::Owned)
+                .map_err(|_| {
+                    crikey_app::package_jobs::JobError::new("web-stop", "Web owner teardown request failed")
+                });
+        }
+        Ok(settings::WebSettlement::NoOwner)
+    }
     #[cfg(target_os = "linux")]
     fn new(storage_root: std::path::PathBuf, wake: WebWake, viewport: (u32, u32)) -> Self {
         Self {
+            shutdown_epoch: None,
             supervisor: None,
             storage_root,
             wake,
@@ -2533,7 +2768,7 @@ impl WebPageRuntime {
 
     #[cfg(not(target_os = "linux"))]
     fn new() -> Self {
-        Self {}
+        Self { shutdown_epoch: None }
     }
 
     #[cfg(target_os = "linux")]
@@ -2553,6 +2788,9 @@ impl WebPageRuntime {
         plugin: &PluginId,
         declaration: &PageWebSurface,
     ) -> Result<(), String> {
+        if self.shutdown_epoch.is_some() {
+            return Err("Web plugin admission is closed until next launch".into());
+        }
         search
             .admit_web_surface(
                 plugin,

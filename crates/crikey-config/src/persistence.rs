@@ -14,12 +14,13 @@ use std::{
     time::SystemTime,
 };
 
-/// Exact source contents/identity plus session overrides, not a process counter.
-/// Debug deliberately reveals neither source contents nor session values.
+/// Exact source contents/identity, session overrides and registered discovered
+/// owner/schema declarations, not a process counter. Debug reveals no values.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConfigRevision {
     pub(crate) sources: BTreeMap<PathBuf, SourceState>,
     pub(crate) session: BTreeMap<String, String>,
+    pub(crate) schema_owners: BTreeMap<String, (PathBuf, String)>,
 }
 impl std::fmt::Debug for ConfigRevision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,7 +43,7 @@ impl ConfigRevision {
 pub(crate) struct SourceState {
     pub(crate) bytes: Option<Vec<u8>>,
     pub(crate) is_directory: bool,
-    entries: Vec<PathBuf>,
+    pub(crate) entries: Vec<PathBuf>,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
     #[cfg(unix)]
@@ -127,14 +128,33 @@ pub(crate) fn writer_lock(path: &Path) -> Result<File, ConfigError> {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], expected: &ConfigRevision) -> Result<(), ConfigError> {
+    let parent = path.parent().expect("configuration has a parent directory");
+    atomic_write_in(path, bytes, expected, parent, false)
+}
+
+pub(crate) fn atomic_write_in(
+    path: &Path,
+    bytes: &[u8],
+    expected: &ConfigRevision,
+    staging_directory: &Path,
+    private: bool,
+) -> Result<(), ConfigError> {
     let prepare = || -> std::io::Result<tempfile::NamedTempFile> {
-        let parent = path.parent().expect("configuration has a parent directory");
-        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+        let mut staging = tempfile::NamedTempFile::new_in(staging_directory)?;
         match fs::metadata(path) {
             Ok(metadata) => staging.as_file().set_permissions(metadata.permissions())?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::PermissionsExt;
+            staging
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        let _ = private;
         staging.write_all(bytes)?;
         staging.as_file().sync_all()?;
         Ok(staging)
@@ -149,4 +169,28 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], expected: &ConfigRevision)
         source: error.error,
     })?;
     Ok(())
+}
+
+/// Refuses symlinks below the configured root; never follows an edit target.
+pub(crate) fn check_plugin_path(path: &Path, directory: bool) -> Result<(), ConfigError> {
+    let check = || -> std::io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || (directory && !metadata.is_dir())
+                    || (!directory && !metadata.is_file()) =>
+            {
+                Err(std::io::Error::other(
+                    "plugin configuration path is not a direct regular file or directory",
+                ))
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    };
+    check().map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }

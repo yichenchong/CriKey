@@ -402,10 +402,36 @@ pub fn install_native_with_policy(
     retention: Option<&Path>,
     policy: &SignaturePolicy,
 ) -> Result<NativeInstall, PackageError> {
+    install_native_checked(
+        archive,
+        install_root,
+        os,
+        arch,
+        stop_running,
+        retention,
+        (policy, None),
+    )
+}
+
+pub(crate) fn install_native_checked(
+    archive: &Path,
+    install_root: &Path,
+    os: &str,
+    arch: &str,
+    stop_running: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    retention: Option<&Path>,
+    validation: (&SignaturePolicy, Option<(&str, crikey_plugin_model::Runtime)>),
+) -> Result<NativeInstall, PackageError> {
+    let (policy, expected_identity) = validation;
     let package = load_package(archive)?;
     ensure_compatible(&package.manifest, os, arch)?;
     validate_integrity(&package)?;
     let signature = evaluate_package_signature(archive, &package, policy)?;
+    crate::installer::require_identity(
+        expected_identity,
+        &package.manifest.plugin.id,
+        package.manifest.plugin.runtime,
+    )?;
 
     stop_running(&package.manifest.plugin.id)?;
 

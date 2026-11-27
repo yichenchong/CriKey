@@ -938,6 +938,50 @@ fn the_interpreter_on_this_host_is_discovered_and_meets_the_minimum_supported_ve
 // ---------------------------------------------------------------------------
 
 #[test]
+fn startup_refusal_before_child_creation_has_no_retained_physical_owner() {
+    let scratch = Scratch::new("startup-no-child");
+    let package = legacy_package(&scratch, "pidfixture", &source(PID_WITNESS));
+    let failure = LegacyWorker::spawn(
+        &host_interpreter(),
+        &package,
+        WorkerOptions::new(
+            PluginId("legacy.no-child".to_owned()),
+            scratch.join("absent-shim"),
+        ),
+    )
+    .expect_err("a missing shim refuses startup before spawning");
+    assert!(!failure.process_created);
+    assert!(matches!(failure.error, WorkerError::Io { .. }));
+    assert!(failure.worker.is_none(), "no dummy worker owner may be invented");
+}
+
+#[test]
+fn created_child_remains_in_startup_census_after_its_failed_handshake_is_reaped() {
+    let scratch = Scratch::new("startup-created-child");
+    let package = legacy_package(&scratch, "pidfixture", &source(PID_WITNESS));
+    let shim = scratch.subdir("bad-handshake-shim");
+    fs::write(
+        shim.join(WORKER_ENTRY_FILE),
+        "print('not-a-handshake', flush=True)\n",
+    )
+    .expect("write real child startup fixture");
+    let failure = LegacyWorker::spawn(
+        &host_interpreter(),
+        &package,
+        WorkerOptions::new(PluginId("legacy.partial-startup".to_owned()), shim)
+            .with_startup_timeout_ms(2_000)
+            .with_shutdown_timeout_ms(250),
+    )
+    .expect_err("an invalid child handshake cannot become a usable worker");
+    assert!(failure.process_created, "the census records the actual OS spawn");
+    assert!(matches!(failure.error, WorkerError::Protocol { .. }));
+    assert!(
+        failure.worker.is_none(),
+        "confirmed cleanup needs no retained physical owner"
+    );
+}
+
+#[test]
 fn a_spawned_worker_runs_in_a_separate_operating_system_process() {
     let scratch = Scratch::new("separate-process");
     let package = legacy_package(&scratch, "pidfixture", &source(PID_WITNESS));
