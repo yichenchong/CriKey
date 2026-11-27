@@ -830,7 +830,11 @@ impl FrameMailbox {
                 }
                 // Reconciliation is sticky under the mailbox lock. A later
                 // publication cannot revive an already retired host panel.
-                crate::reconcile_action_panel(&mut self.overlay.action_panel, &model.rows);
+                crate::reconcile_action_panel(
+                    &mut self.overlay.action_panel,
+                    &model.rows,
+                    &self.overlay.command_management,
+                );
                 with_overlay(self, session, model)
             }
         };
@@ -7214,7 +7218,12 @@ mod window_geometry_tests {
             if mutation != "unchanged" {
                 let mut row = provider.rows[0].clone();
                 if mutation == "target" {
-                    row.item = crikey_core::ItemId("replacement".into());
+                    let source = row.source.as_mut().unwrap();
+                    source.item = crikey_core::ItemId("replacement".into());
+                    row.target = crate::ActionTarget::Result {
+                        owner: source.owner.clone(),
+                        item: source.item.clone(),
+                    };
                 } else {
                     row.alternate_actions
                         .retain(|action| action.action_id.0 != "reveal");
