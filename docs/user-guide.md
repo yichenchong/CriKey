@@ -310,8 +310,9 @@ guidance and fixed codes, not exception text or rejected values. Re-enter
 passwords after submission.
 While inline input is open its editor owns keyboard input; Escape closes the
 editor before query clearing, Back or dismissal. Covering/hiding root or changing
-view, generation or input revision clears the live native editor. Only the
-separate nonsecret logical draft is eligible for restoration.
+view, generation, input revision, schema or exact source clears the live native
+editor. Retained native input cannot edit or submit a replacement typed context.
+Only the separate nonsecret logical draft is eligible for restoration.
 
 The schema belongs to the exact plugin/item/action. Commands sharing that
 executable, actions, aliases and global shortcuts use the same schema; none
@@ -426,6 +427,9 @@ retains logical query, selection, scope, scroll anchor and eligible nonsecret
 drafts, not plugin processes or rendered snapshots. Refresh replaces content
 and executable definitions together; late clicks/results from an older
 revision cannot invoke replacement definitions, even when item labels/IDs match.
+Ordered Actions input is pinned to the visible route, revision and local selection.
+A refresh also retires queued text and keys from the replaced route definitions;
+new input still goes through the current native editor.
 Rapid query, selection and scope changes are coalesced while a refresh is
 pending; the latest intent wins without restoring an earlier input state.
 If the selected item disappears, the host does not execute a replacement item.
