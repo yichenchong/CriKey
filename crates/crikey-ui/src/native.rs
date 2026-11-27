@@ -2322,7 +2322,10 @@ where
                             self.modifiers,
                             self.frame.as_ref(),
                             matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                                && self.graphics.as_ref().is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
+                                && self
+                                    .graphics
+                                    .as_ref()
+                                    .is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
                         )
                     }
                 }
