@@ -522,6 +522,17 @@ pub struct ActionInputCheckpoint {
     pub(crate) typed: Option<typed_input::TypedInputIdentity>,
 }
 
+/// Borrowed current input authority, used only while checking a continuation.
+pub(crate) struct CurrentInputState<'a> {
+    pub(crate) view: Option<ViewId>,
+    pub(crate) generation: Generation,
+    pub(crate) query: &'a str,
+    pub(crate) row: Option<&'a ResultRow>,
+    pub(crate) panel: Option<&'a Arc<ActionPanel>>,
+    pub(crate) preview_focus: (bool, bool),
+    pub(crate) typed: Option<&'a InlineArguments>,
+}
+
 impl ActionInputCheckpoint {
     pub(crate) fn of(model: &ViewModel) -> Self {
         Self {
@@ -559,16 +570,16 @@ impl ActionInputCheckpoint {
         }
     }
 
-    pub(crate) fn matches(
-        &self,
-        view: Option<ViewId>,
-        generation: Generation,
-        query: &str,
-        row: Option<&ResultRow>,
-        panel: Option<&Arc<ActionPanel>>,
-        preview_focus: (bool, bool),
-        typed: Option<&InlineArguments>,
-    ) -> bool {
+    pub(crate) fn matches(&self, current: CurrentInputState<'_>) -> bool {
+        let CurrentInputState {
+            view,
+            generation,
+            query,
+            row,
+            panel,
+            preview_focus,
+            typed,
+        } = current;
         self.view.is_some()
             && self.view == view
             && self.generation == generation
@@ -2091,15 +2102,15 @@ impl LauncherViewModel {
                 source,
                 commands,
             } => {
-                let source_valid = source.matches(
-                    Some(self.view_id),
-                    self.active.unwrap_or(Generation::ZERO),
-                    &self.query,
-                    self.rows.get(self.selected),
-                    self.action_panel.as_ref(),
-                    (self.preview.focused, self.preview.detail),
-                    self.inline_arguments.as_ref(),
-                );
+                let source_valid = source.matches(CurrentInputState {
+                    view: Some(self.view_id),
+                    generation: self.active.unwrap_or(Generation::ZERO),
+                    query: &self.query,
+                    row: self.rows.get(self.selected),
+                    panel: self.action_panel.as_ref(),
+                    preview_focus: (self.preview.focused, self.preview.detail),
+                    typed: self.inline_arguments.as_ref(),
+                });
                 let query_refused = source_valid
                     && commands.iter().any(|command| {
                         matches!(command, UiCommand::SetActionQuery(query)

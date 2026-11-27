@@ -145,12 +145,14 @@ fn ordered_native_input_cannot_cancel_a_replacement_typed_context() {
                 input.schema = Arc::new(schema);
             }
             2 => input.executable.target.item = ItemId("replacement".into()),
-            _ => input.source = PublicationIdentity::Catalog {
-                instance: 1,
-                generation: Generation::from_raw(1),
-                producer: 1,
-                publication: 2,
-            },
+            _ => {
+                input.source = PublicationIdentity::Catalog {
+                    instance: 1,
+                    generation: Generation::from_raw(1),
+                    producer: 1,
+                    publication: 2,
+                }
+            }
         }
         assert!(model.open_inline_arguments(
             input.revision,
@@ -161,11 +163,13 @@ fn ordered_native_input_cannot_cancel_a_replacement_typed_context() {
         ));
         editor.retire_unless(model.inline_arguments());
         assert!(editor.values.0.is_empty(), "replacement retires live passwords");
-        assert!(model.apply(UiCommand::ApplyInputBatch {
-            continuation: Some(41),
-            source,
-            commands: vec![UiCommand::Cancel],
-        }).is_none());
+        assert!(model
+            .apply(UiCommand::ApplyInputBatch {
+                continuation: Some(41),
+                source,
+                commands: vec![UiCommand::Cancel],
+            })
+            .is_none());
         assert!(model.inline_arguments().is_some());
         let current = model.frame().unwrap();
         assert!(!current.input_receipt.as_ref().unwrap().accepted);
